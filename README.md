@@ -8,6 +8,8 @@ It is an extension of the [Agentic AI Sandbox Security Evaluation](https://githu
 - backup and restore support
 - an interactive AI CLI for guided analysis and remediation
 
+For a sandbox-by-sandbox explanation of `CUA`, `gVisor`, `Kata`, and how the files in `generated_outputs/` are produced, see [SANDBOX_ARCHITECTURE_AND_RESULTS.md](SANDBOX_ARCHITECTURE_AND_RESULTS.md).
+
 ## Why this app matters
 
 Modern agentic AI workloads often run in Kubernetes sandboxes that are intentionally more dynamic than traditional applications. They may need browsers, writable workspace volumes, temporary artifacts, or interactive runtime components. That makes them useful for research and experimentation, but it also creates a bigger gap between:
@@ -313,6 +315,8 @@ Generated files are written to:
 generated_outputs/
 ```
 
+A deeper explanation of how these outputs are created and how to interpret them across `CUA`, `gVisor`, and `Kata` is available in [SANDBOX_ARCHITECTURE_AND_RESULTS.md](SANDBOX_ARCHITECTURE_AND_RESULTS.md).
+
 Common artifacts:
 
 | Artifact | Purpose |
@@ -386,6 +390,7 @@ Check:
 
 - `agentfence.py`
 - `README.md`
+- `SANDBOX_ARCHITECTURE_AND_RESULTS.md`
 
 ## Portability
 

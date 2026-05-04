@@ -1,0 +1,78 @@
+{
+  "meta": {
+    "namespace": "sandbox-kata",
+    "workload": "target-kata",
+    "kind": "deployment",
+    "executed_at": "2026-05-04T16:55:02.826811+00:00"
+  },
+  "selected_issue_ids": [],
+  "per_issue": [],
+  "apply_result": null,
+  "status": "no_change",
+  "fix_profile": "baseline-safe",
+  "approval_required": [],
+  "manual_only": [
+    {
+      "issue_id": "NO_ACTIONABLE_FAILURES",
+      "severity": "info",
+      "title": "No failed checks were mapped to a built-in remediation rule",
+      "rationale": "The remediation engine did not find a failed check it recognizes in this audit result.",
+      "actions": [
+        "Review raw evidence manually.",
+        "Extend remediation_from_audit() with environment-specific rules.",
+        "Keep the audit JSON for traceability."
+      ],
+      "snippet": "",
+      "refs": [],
+      "risk_level": "info",
+      "auto_applicable": false,
+      "fix_group": "manual_only",
+      "risk_note": "",
+      "manual_recommendation": "Review the raw findings manually.",
+      "simulation_hint": "Review the raw findings manually.",
+      "base_auto_applicable": false,
+      "confidence": {
+        "finding_confidence": 0.55,
+        "fix_confidence": 0.52,
+        "safety_confidence": 0.5,
+        "reasons": []
+      },
+      "pre_fix_model": {
+        "safe_to_autofix": true,
+        "predicted_risks": [],
+        "predicted_breakage": false
+      },
+      "automation_decision": "manual-only",
+      "decision_reasoning": [
+        "Fix requires workload redesign, image changes, or environment-specific validation beyond safe automatic patching."
+      ],
+      "priority_score": 2.75,
+      "policy_reasoning": [
+        "Dependency graph was used to avoid patching the pod in isolation when workload-scoped resources depend on it."
+      ],
+      "why_not_auto_fixed": [
+        "Fix requires workload redesign, image changes, or environment-specific validation beyond safe automatic patching."
+      ],
+      "manual_runbook": {
+        "issue_id": "NO_ACTIONABLE_FAILURES",
+        "title": "No failed checks were mapped to a built-in remediation rule",
+        "steps": [
+          "Review the generated remediation recommendation and compatibility notes.",
+          "Apply the fix in a staging-safe manner and re-run the audit."
+        ],
+        "rollback": [
+          "Use the generated rollback artifacts or restore the prior manifest revision."
+        ],
+        "validation_commands": [
+          "kubectl -n sandbox-kata get all",
+          "kubectl -n sandbox-kata describe deploy/target-kata"
+        ]
+      }
+    }
+  ],
+  "aggressive_execute": true,
+  "post_fix_health": {
+    "checks": [],
+    "status": "not_run"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "bundle_dir": "generated_outputs/rollback_bundle_sandbox-gvisor_target-gvisor_20260503T232103Z",
+  "manifest": "generated_outputs/rollback_bundle_sandbox-gvisor_target-gvisor_20260503T232103Z/backup_manifest.json",
+  "results": [
+    {
+      "kind": "deployment",
+      "name": "target-gvisor",
+      "namespace": "sandbox-gvisor",
+      "snapshot_file": "generated_outputs/rollback_bundle_sandbox-gvisor_target-gvisor_20260503T232103Z/snapshot_deployment_target-gvisor.json",
+      "restore_rc": 0,
+      "restore_output": "deployment.apps/target-gvisor replaced",
+      "normalized_equal": true,
+      "normalized_diff": ""
+    },
+    {
+      "kind": "serviceaccount",
+      "name": "default",
+      "namespace": "sandbox-gvisor",
+      "snapshot_file": "generated_outputs/rollback_bundle_sandbox-gvisor_target-gvisor_20260503T232103Z/snapshot_serviceaccount_default.json",
+      "restore_rc": 0,
+      "restore_output": "serviceaccount/default replaced",
+      "normalized_equal": true,
+      "normalized_diff": ""
+    }
+  ],
+  "status": "restored",
+  "cluster": "kubernetes",
+  "bundle_selection_reason": "user supplied"
+}

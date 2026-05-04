@@ -1,0 +1,141 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "annotations": {
+      "deployment.kubernetes.io/revision": "31",
+      "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"annotations\":{\"deployment.kubernetes.io/revision\":\"19\"},\"name\":\"target-kata\",\"namespace\":\"sandbox-kata\",\"resourceVersion\":\"259133\"},\"spec\":{\"progressDeadlineSeconds\":600,\"replicas\":1,\"revisionHistoryLimit\":10,\"selector\":{\"matchLabels\":{\"app\":\"target-kata\",\"role\":\"target\"}},\"strategy\":{\"rollingUpdate\":{\"maxSurge\":\"25%\",\"maxUnavailable\":\"25%\"},\"type\":\"RollingUpdate\"},\"template\":{\"metadata\":{\"annotations\":{\"kubectl.kubernetes.io/restartedAt\":\"2026-05-02T11:24:33-07:00\"},\"labels\":{\"app\":\"target-kata\",\"role\":\"target\"}},\"spec\":{\"containers\":[{\"image\":\"ghcr.io/farshadrahaei/crewai-sandbox-app:v1\",\"imagePullPolicy\":\"IfNotPresent\",\"name\":\"app\",\"ports\":[{\"containerPort\":8000,\"protocol\":\"TCP\"}],\"resources\":{\"limits\":{\"cpu\":\"1\",\"memory\":\"1Gi\"},\"requests\":{\"cpu\":\"250m\",\"memory\":\"256Mi\"}},\"securityContext\":{\"allowPrivilegeEscalation\":false,\"capabilities\":{\"drop\":[\"ALL\"]},\"runAsNonRoot\":true,\"runAsUser\":10001},\"terminationMessagePath\":\"/dev/termination-log\",\"terminationMessagePolicy\":\"File\",\"volumeMounts\":[{\"mountPath\":\"/workspace\",\"name\":\"workspace\"},{\"mountPath\":\"/artifacts\",\"name\":\"artifacts\"}]}],\"dnsPolicy\":\"ClusterFirst\",\"nodeSelector\":{\"sandbox\":\"kata\"},\"restartPolicy\":\"Always\",\"runtimeClassName\":\"kata-qemu\",\"schedulerName\":\"default-scheduler\",\"securityContext\":{\"seccompProfile\":{\"type\":\"RuntimeDefault\"}},\"terminationGracePeriodSeconds\":30,\"volumes\":[{\"emptyDir\":{},\"name\":\"workspace\"},{\"emptyDir\":{},\"name\":\"artifacts\"}]}}}}\n"
+    },
+    "creationTimestamp": "2026-05-02T17:44:59Z",
+    "generation": 39,
+    "name": "target-kata",
+    "namespace": "sandbox-kata",
+    "resourceVersion": "259225",
+    "uid": "e529cdd5-71ee-4658-bd14-219c5eabc1b0"
+  },
+  "spec": {
+    "progressDeadlineSeconds": 600,
+    "replicas": 1,
+    "revisionHistoryLimit": 10,
+    "selector": {
+      "matchLabels": {
+        "app": "target-kata",
+        "role": "target"
+      }
+    },
+    "strategy": {
+      "rollingUpdate": {
+        "maxSurge": "25%",
+        "maxUnavailable": "25%"
+      },
+      "type": "RollingUpdate"
+    },
+    "template": {
+      "metadata": {
+        "annotations": {
+          "kubectl.kubernetes.io/restartedAt": "2026-05-02T11:24:33-07:00"
+        },
+        "labels": {
+          "app": "target-kata",
+          "role": "target"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "image": "ghcr.io/farshadrahaei/crewai-sandbox-app:v1",
+            "imagePullPolicy": "IfNotPresent",
+            "name": "app",
+            "ports": [
+              {
+                "containerPort": 8000,
+                "protocol": "TCP"
+              }
+            ],
+            "resources": {
+              "limits": {
+                "cpu": "1",
+                "memory": "1Gi"
+              },
+              "requests": {
+                "cpu": "250m",
+                "memory": "256Mi"
+              }
+            },
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              },
+              "runAsNonRoot": true,
+              "runAsUser": 10001
+            },
+            "terminationMessagePath": "/dev/termination-log",
+            "terminationMessagePolicy": "File",
+            "volumeMounts": [
+              {
+                "mountPath": "/workspace",
+                "name": "workspace"
+              },
+              {
+                "mountPath": "/artifacts",
+                "name": "artifacts"
+              }
+            ]
+          }
+        ],
+        "dnsPolicy": "ClusterFirst",
+        "nodeSelector": {
+          "sandbox": "kata"
+        },
+        "restartPolicy": "Always",
+        "runtimeClassName": "kata-qemu",
+        "schedulerName": "default-scheduler",
+        "securityContext": {
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "terminationGracePeriodSeconds": 30,
+        "volumes": [
+          {
+            "emptyDir": {},
+            "name": "workspace"
+          },
+          {
+            "emptyDir": {},
+            "name": "artifacts"
+          }
+        ]
+      }
+    }
+  },
+  "status": {
+    "availableReplicas": 1,
+    "conditions": [
+      {
+        "lastTransitionTime": "2026-05-03T15:59:56Z",
+        "lastUpdateTime": "2026-05-03T15:59:56Z",
+        "message": "Deployment has minimum availability.",
+        "reason": "MinimumReplicasAvailable",
+        "status": "True",
+        "type": "Available"
+      },
+      {
+        "lastTransitionTime": "2026-05-02T18:11:43Z",
+        "lastUpdateTime": "2026-05-04T18:07:01Z",
+        "message": "ReplicaSet \"target-kata-5d5d7799cf\" has successfully progressed.",
+        "reason": "NewReplicaSetAvailable",
+        "status": "True",
+        "type": "Progressing"
+      }
+    ],
+    "observedGeneration": 39,
+    "readyReplicas": 1,
+    "replicas": 1,
+    "terminatingReplicas": 0,
+    "updatedReplicas": 1
+  }
+}

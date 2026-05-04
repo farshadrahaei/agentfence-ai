@@ -2343,12 +2343,106 @@ def apply_spec_fallback_if_needed(audit_obj):
     internal_error = internal_audit.get('error') if isinstance(internal_audit, dict) else None
     if not internal_error:
         return audit_obj
-    if internal_error not in ('internal_exec_parse_failed',) and 'internal_exec' not in str(internal_error):
+    fallback_errors = {
+        'internal_exec_parse_failed',
+        'no_python_in_target_pod',
+        'no_shell_in_target_pod',
+        'internal_exec_failed',
+    }
+    if internal_error not in fallback_errors and 'internal_exec' not in str(internal_error):
         return audit_obj
     fallback = build_spec_fallback_revalidation(audit_obj, audit_obj)
     fallback.setdefault('meta', {})['assessment_status'] = 'partially_verified'
     fallback['meta']['assessment_reason'] = internal_error
     return fallback
+
+
+def reconcile_spec_backed_findings(audit_obj):
+    audit_obj = copy.deepcopy(audit_obj or {})
+    internal_audit = ((audit_obj.get('results') or {}).get('internal_audit') or {})
+    if not isinstance(internal_audit, dict) or internal_audit.get('error'):
+        return audit_obj
+    try:
+        fallback = build_spec_fallback_revalidation(audit_obj, audit_obj)
+    except Exception:
+        return audit_obj
+    current_items = actionable_remediation_items(audit_obj.get('remediation'))
+    fallback_items = actionable_remediation_items(fallback.get('remediation'))
+    meta = audit_obj.get('meta') or {}
+    recent_unverifiable = recent_unverifiable_issue_items(meta.get('namespace'), meta.get('workload_name'))
+    if not current_items and not fallback_items and not recent_unverifiable:
+        return audit_obj
+
+    spec_backed_issue_ids = {
+        'SERVICE_ACCOUNT_TOKEN',
+        'ROOTFS_RW',
+        'SECCOMP_DISABLED',
+        'NO_NEW_PRIVS_DISABLED',
+        'RUN_AS_ROOT',
+        'LINUX_CAPS',
+    }
+    fallback_map = {item.get('issue_id'): copy.deepcopy(item) for item in fallback_items if item.get('issue_id')}
+    merged = []
+    seen = set()
+    for item in current_items:
+        issue_id = item.get('issue_id')
+        if not issue_id or issue_id in seen:
+            continue
+        seen.add(issue_id)
+        if issue_id in spec_backed_issue_ids:
+            if issue_id in fallback_map:
+                merged.append(copy.deepcopy(fallback_map[issue_id]))
+            continue
+        merged.append(copy.deepcopy(item))
+    for issue_id, item in fallback_map.items():
+        if issue_id in spec_backed_issue_ids and issue_id not in seen:
+            merged.append(copy.deepcopy(item))
+    for item in recent_unverifiable:
+        issue_id = item.get('issue_id')
+        if issue_id and issue_id not in seen:
+            seen.add(issue_id)
+            merged.append(copy.deepcopy(item))
+
+    if any((item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES' for item in merged):
+        merged = [item for item in merged if (item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES']
+
+    templates = {}
+    templates.update((audit_obj.get('remediation') or {}).get('templates', {}) or {})
+    templates.update((fallback.get('remediation') or {}).get('templates', {}) or {})
+    audit_obj['remediation'] = {'count': len(merged), 'items': merged, 'templates': templates}
+    audit_obj['risk_score'] = compute_risk_score(audit_obj)
+    audit_obj.setdefault('controller', {})['spec_reconciliation'] = {
+        'status': 'applied',
+        'reason': 'spec_backed_checks_reconciled',
+    }
+    return audit_obj
+
+
+def recent_unverifiable_issue_items(namespace, workload_name, limit=20):
+    if not namespace or not workload_name:
+        return []
+    patterns = [
+        f"guided_analyze_audit_{safe_slug(namespace, 'namespace')}_{safe_slug(workload_name, 'workload')}_*.json",
+        f"guided_remediation_audit_{safe_slug(namespace, 'namespace')}_{safe_slug(workload_name, 'workload')}_*.json",
+    ]
+    files = []
+    root = ensure_output_root()
+    for pattern in patterns:
+        files.extend(sorted(root.glob(pattern), reverse=True))
+    seen = set()
+    carry_ids = {'SETID_BINARIES_PRESENT', 'SENSITIVE_PATHS_WRITABLE', 'RISKY_DEVICE_NODES'}
+    carried = []
+    for path in files[:limit]:
+        try:
+            obj = json.loads(Path(path).read_text())
+        except Exception:
+            continue
+        for item in (((obj.get('remediation') or {}).get('items') or [])):
+            issue_id = item.get('issue_id')
+            if issue_id in carry_ids and issue_id not in seen:
+                seen.add(issue_id)
+                carried.append(copy.deepcopy(item))
+    return carried
 
 
 def get_nested(obj, *path):
@@ -2455,8 +2549,24 @@ def compatibility_assessment(audit_obj):
 
 
 def markdown_report(audit_obj, fix_result=None):
-    meta = audit_obj.get('meta', {}) or {}
+    audit_obj = audit_obj or {}
+    fix_result = fix_result or None
+    meta = (audit_obj.get('meta', {}) or {}).copy()
+    if fix_result and not meta:
+        apply_meta = ((fix_result.get('apply_result') or {}).get('meta') or {})
+        fix_meta = (fix_result.get('meta') or {})
+        meta = {
+            'namespace': apply_meta.get('namespace') or fix_meta.get('namespace'),
+            'workload_kind': apply_meta.get('workload_kind') or fix_meta.get('kind'),
+            'workload_name': apply_meta.get('workload_name') or fix_meta.get('workload'),
+            'dependencies': apply_meta.get('dependencies') or {},
+        }
     score = audit_obj.get('risk_score') or compute_risk_score(audit_obj)
+    if fix_result:
+        post_revalidated = ((fix_result.get('apply_result') or {}).get('post_fix_revalidation') or {})
+        post_score = post_revalidated.get('risk_score')
+        if post_score:
+            score = post_score
     lines = [
         '# Sandbox Audit Report', '',
         f"- Generated: {now_utc_iso()}",
@@ -2479,6 +2589,11 @@ def markdown_report(audit_obj, fix_result=None):
         lines.extend(['', '## Fix result', f"- Status: {fix_result.get('status')}"])
         for item in fix_result.get('per_issue', []):
             lines.append(f"- {item.get('issue_id')}: {item.get('status')}")
+        post_revalidated = ((fix_result.get('apply_result') or {}).get('post_fix_revalidation') or {})
+        post_score = post_revalidated.get('risk_score')
+        if post_score:
+            suffix = ' (partially verified)' if post_revalidated.get('risk_score_unverified') else ''
+            lines.append(f"- Post-remediation risk score: {post_score.get('total')} ({post_score.get('band')}){suffix}")
     advisor = audit_obj.get('ai_advisor') or {}
     if advisor.get('status') == 'ok':
         lines.extend(['', '## AI Advisor'])
@@ -2848,6 +2963,10 @@ def post_fix_revalidate(audit_obj, timeout=2.0):
                 create_if_missing=False,
                 cleanup_temporary_attacker=False,
             )
+            revalidated.setdefault('meta', {})
+            for key in ('namespace', 'target_selector', 'workload_name', 'workload_kind', 'service_account_name', 'selector_labels'):
+                if meta.get(key) and not revalidated['meta'].get(key):
+                    revalidated['meta'][key] = copy.deepcopy(meta.get(key))
             if (audit_obj.get('results') or {}).get('internal_audit'):
                 target_pod = get_nested(revalidated, 'meta', 'target_pod')
                 if target_pod:
@@ -2859,6 +2978,9 @@ def post_fix_revalidate(audit_obj, timeout=2.0):
                     revalidated = promote_internal_audit_findings(revalidated)
                     if internal_state.get('status') != 'collected_from_laptop':
                         revalidated = build_spec_fallback_revalidation(audit_obj, revalidated)
+                else:
+                    revalidated = build_spec_fallback_revalidation(audit_obj, revalidated)
+            revalidated = reconcile_spec_backed_findings(revalidated)
             return revalidated
         return collect_internal(timeout=timeout)
     except Exception as e:
@@ -3066,6 +3188,7 @@ def apply_fixes(audit_obj, namespace=None, workload=None, kind=None, apply_netwo
         if isinstance(revalidated, dict) and not revalidated.get('error'):
             revalidated['remediation'] = remediation_from_audit(revalidated)
             revalidated = promote_internal_audit_findings(revalidated)
+            revalidated = reconcile_spec_backed_findings(revalidated)
             revalidated['remediation'] = enrich_remediation(revalidated.get('remediation') or {})
             revalidated['risk_score'] = compute_risk_score(revalidated)
             if ((revalidated.get('controller') or {}).get('internal_execution') or {}).get('status') != 'collected_from_laptop':
@@ -3184,14 +3307,14 @@ def run_selected_fix_groups(audit_obj, selected_items, namespace=None, workload=
     result = _original_run_selected_fix_groups(audit_obj, selected_items, namespace=namespace, workload=workload, kind=kind, execute=execute)
     apply_result = result.get('apply_result') or {}
     revalidated = apply_result.get('post_fix_revalidation') or {}
-    if execute and revalidated and revalidated.get('risk_score_unverified'):
+    if execute and revalidated and not revalidated.get('error'):
+        revalidated = reconcile_spec_backed_findings(revalidated)
         current_items = ((revalidated.get('remediation') or {}).get('items') or [])
         current_ids = {item.get('issue_id') for item in current_items}
-        for item in selected_items:
+        carry_ids = {'SETID_BINARIES_PRESENT', 'SENSITIVE_PATHS_WRITABLE', 'RISKY_DEVICE_NODES'}
+        for item in (((audit_obj.get('remediation') or {}).get('items') or [])):
             issue_id = item.get('issue_id')
-            if not issue_id or issue_id in current_ids:
-                continue
-            if item.get('auto_applicable') is False or item.get('fix_group') == 'manual_only':
+            if issue_id in carry_ids and issue_id not in current_ids:
                 current_items.append(copy.deepcopy(item))
         if any((item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES' for item in current_items):
             current_items = [item for item in current_items if (item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES']
@@ -3203,6 +3326,41 @@ def run_selected_fix_groups(audit_obj, selected_items, namespace=None, workload=
         revalidated['risk_score'] = compute_risk_score(revalidated)
         apply_result['post_fix_revalidation'] = revalidated
         result['apply_result'] = apply_result
+    if execute and revalidated and revalidated.get('risk_score_unverified'):
+        current_items = ((revalidated.get('remediation') or {}).get('items') or [])
+        current_ids = {item.get('issue_id') for item in current_items}
+        unverifiable_issue_ids = {'SETID_BINARIES_PRESENT', 'SENSITIVE_PATHS_WRITABLE', 'RISKY_DEVICE_NODES'}
+        for item in selected_items:
+            issue_id = item.get('issue_id')
+            if not issue_id or issue_id in current_ids:
+                continue
+            if issue_id in unverifiable_issue_ids:
+                current_items.append(copy.deepcopy(item))
+        if any((item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES' for item in current_items):
+            current_items = [item for item in current_items if (item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES']
+        revalidated['remediation'] = enrich_remediation({
+            'count': len(current_items),
+            'items': current_items,
+            'templates': (revalidated.get('remediation') or {}).get('templates', {}),
+        })
+        revalidated['risk_score'] = compute_risk_score(revalidated)
+        apply_result['post_fix_revalidation'] = revalidated
+        result['apply_result'] = apply_result
+    if execute and revalidated and not revalidated.get('error'):
+        remaining_issue_ids = {
+            item.get('issue_id')
+            for item in (((revalidated.get('remediation') or {}).get('items') or []))
+            if item.get('issue_id') and item.get('issue_id') != 'NO_ACTIONABLE_FAILURES'
+        }
+        for item in result.get('per_issue', []):
+            issue_id = item.get('issue_id')
+            if not issue_id:
+                continue
+            if item.get('status') == 'manual_only' and issue_id not in remaining_issue_ids:
+                item['status'] = 'resolved_by_applied_patch'
+                note = item.get('note') or ''
+                suffix = 'Cleared from post-remediation revalidation.'
+                item['note'] = f"{note} {suffix}".strip()
     result['fix_profile'] = infer_fix_profile(selected_items)
     return result
 
@@ -3880,6 +4038,7 @@ def print_ai_remediation_completion_summary(audit_obj, fix_result, analyze_ran=F
     health = ((fix_result or {}).get('post_fix_health') or {}).get('status')
     revalidated = apply_result.get('post_fix_revalidation') or {}
     post_risk = revalidated.get('risk_score') or (compute_risk_score(revalidated) if revalidated and not revalidated.get('error') else None)
+    post_risk_suffix = " (partially verified)" if revalidated.get('risk_score_unverified') else ""
     if not post_risk:
         post_risk = (audit_obj or {}).get('risk_score') or compute_risk_score(audit_obj or {})
     action_text = "Analyzed and remediated" if analyze_ran else "Remediated"
@@ -3889,7 +4048,7 @@ def print_ai_remediation_completion_summary(audit_obj, fix_result, analyze_ran=F
         print(f"Applied {len(executed)} change step(s).")
     else:
         print("No in-cluster changes were applied.")
-    print(f"Recalculated risk score after remediation: {post_risk.get('total', 0)} ({post_risk.get('band', 'unknown')}).")
+    print(f"Recalculated risk score after remediation: {post_risk.get('total', 0)} ({post_risk.get('band', 'unknown')}){post_risk_suffix}.")
     if health:
         print(f"Post-fix health: {health}.")
 
@@ -5035,8 +5194,16 @@ def smart_write_json_file(path, obj, msg=None, announce=True):
     _base_write_json_file(path, obj, msg if announce else None)
     try:
         md_path = os.path.splitext(path)[0] + '.md'
+        report_audit = obj
+        report_fix = obj if obj.get('per_issue') else None
+        if not obj.get('results'):
+            report_audit = (
+                ((obj.get('apply_result') or {}).get('post_fix_revalidation'))
+                or obj.get('audit')
+                or {'meta': obj.get('meta', {}), 'remediation': obj.get('remediation', {}), 'risk_score': obj.get('risk_score', {})}
+            )
         with open(md_path, 'w') as f:
-            f.write(markdown_report(obj if obj.get('results') else {'meta': obj.get('meta', {}), 'remediation': obj.get('remediation', {}), 'risk_score': obj.get('risk_score', {})}, obj if obj.get('per_issue') else None))
+            f.write(markdown_report(report_audit, report_fix))
         if announce:
             print(f'Markdown report written: {md_path}')
     except Exception:
@@ -5629,6 +5796,7 @@ def build_base_analysis(namespace, selected, timeout=2.0, app_mode='default'):
     )
     remote_obj = promote_internal_audit_findings(remote_obj)
     remote_obj = apply_spec_fallback_if_needed(remote_obj)
+    remote_obj = reconcile_spec_backed_findings(remote_obj)
     remote_obj = apply_smart_enrichment(remote_obj, load_history())
     remote_obj = attach_ai_advisor(remote_obj, selected=selected, workflow_mode='analyze', app_mode=app_mode)
     return remote_obj, selector, pod, container
@@ -5668,7 +5836,10 @@ def check_agentic_workload_health_guided(audit_obj, fix_result, timeout=2.0):
             if health.get('status') in ('unknown', 'healthy'):
                 health['status'] = 'healthy'
         else:
-            health['status'] = 'degraded'
+            if health.get('status') == 'healthy':
+                health['status'] = 'validation_incomplete'
+            else:
+                health['status'] = 'degraded'
     return health
 
 
@@ -5938,7 +6109,45 @@ def guided_remediation_mode(cluster, namespace, selected, timeout=2.0, analyze_f
     audit_obj = (analyze_bundle or {}).get('audit')
     if not audit_obj:
         audit_obj, _, _, _ = build_base_analysis(namespace, selected, timeout=timeout, app_mode=app_mode)
+    outputs = guided_output_paths('guided_remediation', namespace, selected.get('workload_name'))
+    ai_mode = normalize_app_mode(app_mode) == 'ai'
+    smart_write_json_file(outputs['audit'], audit_obj, 'Audit JSON written', announce=not ai_mode)
     items = (audit_obj.get('remediation') or {}).get('items') or []
+    actionable_items = [item for item in items if (item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES']
+    if not actionable_items:
+        fix_result = {
+            'status': 'no_change',
+            'meta': {
+                'namespace': namespace,
+                'workload': selected.get('workload_name'),
+                'kind': (selected.get('workload_kind') or 'deployment').lower(),
+                'executed_at': now_utc_iso(),
+            },
+            'selected_issue_ids': [item.get('issue_id') for item in items],
+            'per_issue': [{
+                'issue_id': item.get('issue_id'),
+                'title': item.get('title'),
+                'status': 'manual_only',
+                'risk_level': item.get('risk_level'),
+                'note': item.get('manual_recommendation') or item.get('risk_note') or 'No actionable remediation rule was confirmed for this audit.',
+            } for item in items],
+            'apply_result': None,
+            'approval_required': [],
+            'manual_only': items,
+            'aggressive_execute': True,
+            'post_fix_health': {'status': 'not_run', 'checks': [], 'reason': 'no_actionable_remediation_items'},
+        }
+        smart_write_json_file(outputs['fix'], fix_result, 'Fix JSON written', announce=not ai_mode)
+        remediation_bundle = {'outputs': outputs, 'fix': fix_result}
+        if ai_mode:
+            print_ai_remediation_completion_summary(audit_obj, fix_result, analyze_ran=bool(analyze_bundle))
+            print_artifact_summary(analyze_result=analyze_bundle, fix_result=remediation_bundle, manifest_result=(analyze_bundle or {}).get('manifest_result'))
+        else:
+            print_fix_result(fix_result)
+            print_artifact_summary(analyze_result=analyze_bundle, fix_result=remediation_bundle, manifest_result=(analyze_bundle or {}).get('manifest_result'))
+        if normalize_app_mode(app_mode) == 'ai' and start_chat:
+            start_ai_chat_session(audit_obj, selected=selected, workflow_mode='guided-remediation')
+        return {'status': 'remediated', 'cluster': cluster, 'namespace': namespace, 'audit': audit_obj, 'fix': fix_result, 'outputs': outputs, 'analyze_bundle': analyze_bundle}
     grouping = safe_autonomous_selection(items, aggressive=True)
     fix_result = run_selected_fix_groups(
         audit_obj,
@@ -5952,8 +6161,6 @@ def guided_remediation_mode(cluster, namespace, selected, timeout=2.0, analyze_f
     fix_result['manual_only'] = grouping['manual_only']
     fix_result['aggressive_execute'] = True
     fix_result['post_fix_health'] = check_agentic_workload_health_guided(audit_obj, fix_result, timeout=timeout)
-    outputs = guided_output_paths('guided_remediation', namespace, selected.get('workload_name'))
-    ai_mode = normalize_app_mode(app_mode) == 'ai'
     smart_write_json_file(outputs['fix'], fix_result, 'Fix JSON written', announce=not ai_mode)
     remediation_bundle = {'outputs': outputs, 'fix': fix_result}
     if ai_mode:

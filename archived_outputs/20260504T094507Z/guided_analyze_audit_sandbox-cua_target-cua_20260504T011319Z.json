@@ -1,0 +1,495 @@
+{
+  "meta": {
+    "ts_utc": "2026-05-04T01:12:40Z",
+    "namespace": "sandbox-cua",
+    "target_selector": "app=target-cua,role=target",
+    "tool": "combined_sandbox_audit",
+    "host": "Darwin 25.4.0",
+    "target_pod": "target-cua-5bdc5cbf6-lssmn",
+    "target_ip": "192.168.8.223",
+    "node": "worker-cua-1.us-central1-a.c.asl-0502-093447.internal",
+    "image": "ghcr.io/farshadrahaei/crewai-sandbox-app:v1",
+    "imageID": "ghcr.io/farshadrahaei/crewai-sandbox-app@sha256:3c23e0a9d989662a7159056d9c828017f2dde64f394b85675015b8fa8486260f",
+    "workload_name": "target-cua",
+    "workload_kind": "deployment",
+    "container_names": [
+      "app"
+    ],
+    "service_account_name": "default",
+    "selector_labels": {
+      "app": "target-cua",
+      "role": "target"
+    },
+    "attacker_pod": "attacker-cua-59cfbbf587-vnmtt",
+    "attacker_created_tmp": false,
+    "dependencies": {
+      "services": [
+        "target-cua"
+      ],
+      "ingresses": [],
+      "network_policies": [
+        "allow-attacker-to-target",
+        "allow-dns-egress",
+        "allow-llm-gateway-egress",
+        "default-deny-all"
+      ],
+      "hpas": [],
+      "pdbs": [],
+      "configmaps": [],
+      "secrets": [],
+      "runtime_class": null,
+      "node_selector": {
+        "sandbox": "cua"
+      },
+      "volumes": [
+        {
+          "emptyDir": {},
+          "name": "workspace"
+        },
+        {
+          "emptyDir": {},
+          "name": "artifacts"
+        }
+      ]
+    },
+    "compatibility_notes": [
+      {
+        "issue_id": "REMOTE_REACHABILITY",
+        "risk": "high",
+        "message": "Services select this workload: target-cua. Default-deny policy may block expected traffic."
+      }
+    ],
+    "app_mode": "ai"
+  },
+  "results": {
+    "scanned_ports": [
+      {
+        "port": 22,
+        "reachable": false,
+        "nc_output": "nc: connect to 192.168.8.223 port 22 (tcp) timed out: Operation in progress"
+      },
+      {
+        "port": 80,
+        "reachable": false,
+        "nc_output": "nc: connect to 192.168.8.223 port 80 (tcp) timed out: Operation in progress"
+      },
+      {
+        "port": 443,
+        "reachable": false,
+        "nc_output": "nc: connect to 192.168.8.223 port 443 (tcp) timed out: Operation in progress"
+      },
+      {
+        "port": 5901,
+        "reachable": false,
+        "nc_output": "nc: connect to 192.168.8.223 port 5901 (tcp) timed out: Operation in progress"
+      },
+      {
+        "port": 6080,
+        "reachable": false,
+        "nc_output": "nc: connect to 192.168.8.223 port 6080 (tcp) timed out: Operation in progress"
+      },
+      {
+        "port": 6901,
+        "reachable": false,
+        "nc_output": "nc: connect to 192.168.8.223 port 6901 (tcp) timed out: Operation in progress"
+      },
+      {
+        "port": 8000,
+        "reachable": true,
+        "nc_output": "Connection to 192.168.8.223 8000 port [tcp/*] succeeded!"
+      },
+      {
+        "port": 8080,
+        "reachable": false,
+        "nc_output": "nc: connect to 192.168.8.223 port 8080 (tcp) timed out: Operation in progress"
+      },
+      {
+        "port": 8443,
+        "reachable": false,
+        "nc_output": "nc: connect to 192.168.8.223 port 8443 (tcp) timed out: Operation in progress"
+      },
+      {
+        "port": 10250,
+        "reachable": false,
+        "nc_output": "nc: connect to 192.168.8.223 port 10250 (tcp) timed out: Operation in progress"
+      },
+      {
+        "port": 10255,
+        "reachable": false,
+        "nc_output": "nc: connect to 192.168.8.223 port 10255 (tcp) timed out: Operation in progress"
+      }
+    ],
+    "novnc_http_6901": {
+      "ok": false,
+      "status_line": ""
+    },
+    "novnc_ws_6901": {
+      "raw": "nc: connect to 192.168.8.223 port 6901 (tcp) timed out: Operation in progress\n",
+      "switching_protocols_101": false
+    },
+    "vnc_rfb_5901": {
+      "error": "timed out",
+      "classification": "error"
+    },
+    "internal_introspection": {
+      "ok": true,
+      "processes": "sh: 1: ps: not found",
+      "listening": "sh: 1: ss: not found\nsh: 1: netstat: not found",
+      "env": ""
+    },
+    "internal_audit": {
+      "error": "no_python_in_target_pod",
+      "runtime": {
+        "pod": "target-cua-6b88bdd94d-xzsgh",
+        "container": null,
+        "python": null,
+        "shell": null,
+        "writable_tmp": null
+      }
+    },
+    "classification": "not_reachable_or_insufficient_signals"
+  },
+  "remediation": {
+    "count": 1,
+    "items": [
+      {
+        "issue_id": "NO_ACTIONABLE_FAILURES",
+        "severity": "info",
+        "title": "No failed checks were mapped to a built-in remediation rule",
+        "rationale": "The remediation engine did not find a failed check it recognizes in this audit result.",
+        "actions": [
+          "Review raw evidence manually.",
+          "Extend remediation_from_audit() with environment-specific rules.",
+          "Keep the audit JSON for traceability."
+        ],
+        "snippet": "",
+        "refs": [],
+        "risk_level": "info",
+        "auto_applicable": false,
+        "fix_group": "manual_only",
+        "risk_note": "",
+        "manual_recommendation": "Review the raw findings manually.",
+        "simulation_hint": "Review the raw findings manually.",
+        "base_auto_applicable": false,
+        "confidence": {
+          "finding_confidence": 0.55,
+          "fix_confidence": 0.52,
+          "safety_confidence": 0.5,
+          "reasons": []
+        },
+        "pre_fix_model": {
+          "safe_to_autofix": true,
+          "predicted_risks": [],
+          "predicted_breakage": false
+        },
+        "automation_decision": "manual-only",
+        "decision_reasoning": [
+          "Fix requires workload redesign, image changes, or environment-specific validation beyond safe automatic patching."
+        ],
+        "priority_score": 2.75,
+        "policy_reasoning": [
+          "Dependency graph was used to avoid patching the pod in isolation when workload-scoped resources depend on it."
+        ],
+        "why_not_auto_fixed": [
+          "Fix requires workload redesign, image changes, or environment-specific validation beyond safe automatic patching."
+        ],
+        "manual_runbook": {
+          "issue_id": "NO_ACTIONABLE_FAILURES",
+          "title": "No failed checks were mapped to a built-in remediation rule",
+          "steps": [
+            "Review the generated remediation recommendation and compatibility notes.",
+            "Apply the fix in a staging-safe manner and re-run the audit."
+          ],
+          "rollback": [
+            "Use the generated rollback artifacts or restore the prior manifest revision."
+          ],
+          "validation_commands": [
+            "kubectl -n sandbox-cua get all",
+            "kubectl -n sandbox-cua describe deploy/target-cua"
+          ]
+        }
+      }
+    ],
+    "templates": {
+      "pod_hardening": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: REPLACE_ME\nspec:\n  template:\n    metadata:\n      labels:\n        app: target-cua,role=target\n    spec:\n      automountServiceAccountToken: false\n      containers:\n      - name: REPLACE_ME\n        securityContext:\n          runAsNonRoot: true\n          runAsUser: 10001\n          runAsGroup: 10001\n          allowPrivilegeEscalation: false\n          readOnlyRootFilesystem: true\n          capabilities:\n            drop: [\"ALL\"]\n          seccompProfile:\n            type: RuntimeDefault",
+      "network_policy": "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: sandbox-default-deny\n  namespace: sandbox-cua\nspec:\n  podSelector:\n    matchLabels:\n      app: target-cua,role=target\n  policyTypes:\n  - Ingress\n  - Egress\n  ingress: []\n  egress:\n  - to:\n    - namespaceSelector: {}\n      podSelector:\n        matchLabels:\n          k8s-app: kube-dns\n    ports:\n    - protocol: UDP\n      port: 53\n    - protocol: TCP\n      port: 53",
+      "service_account": "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: sandbox-sa\n  namespace: sandbox-cua\nautomountServiceAccountToken: false",
+      "kyverno_policy": "apiVersion: kyverno.io/v1\nkind: ClusterPolicy\nmetadata:\n  name: sandbox-restricted\nspec:\n  validationFailureAction: Audit\n  rules:\n  - name: require-restricted-security-context\n    match:\n      resources:\n        kinds:\n        - Pod\n    validate:\n      message: Enforce restricted securityContext for sandbox workloads.\n      pattern:\n        spec:\n          containers:\n          - securityContext:\n              allowPrivilegeEscalation: false\n              readOnlyRootFilesystem: true\n              seccompProfile:\n                type: RuntimeDefault\n",
+      "gatekeeper_template": "apiVersion: templates.gatekeeper.sh/v1beta1\nkind: ConstraintTemplate\nmetadata:\n  name: k8srequiredsandboxsecurity\nspec:\n  crd:\n    spec:\n      names:\n        kind: K8sRequiredSandboxSecurity\n  targets:\n  - target: admission.k8s.gatekeeper.sh\n    rego: |\n      package k8srequiredsandboxsecurity\n      violation[{\"msg\": msg}] {\n        input.review.kind.kind == \"Pod\"\n        not input.review.object.spec.containers[_].securityContext.readOnlyRootFilesystem\n        msg := \"Sandbox pods must set readOnlyRootFilesystem=true\"\n      }\n",
+      "pod_security_admission": {
+        "pod_security_admission": "Use namespace labels: pod-security.kubernetes.io/enforce=restricted"
+      }
+    }
+  },
+  "evidence": [
+    {
+      "section": "results",
+      "check_id": "novnc_http_6901",
+      "ok": false,
+      "evidence": "",
+      "timestamp_utc": "2026-05-04T01:13:09.107936+00:00"
+    },
+    {
+      "section": "results",
+      "check_id": "internal_introspection",
+      "ok": true,
+      "evidence": "",
+      "timestamp_utc": "2026-05-04T01:13:09.107984+00:00"
+    }
+  ],
+  "risk_score": {
+    "probability": 0,
+    "blast_radius": 0,
+    "total": 0,
+    "band": "low",
+    "contributions": [
+      {
+        "issue_id": "NO_ACTIONABLE_FAILURES",
+        "severity": "info",
+        "P": 0,
+        "B": 0,
+        "title": "No failed checks were mapped to a built-in remediation rule"
+      }
+    ]
+  },
+  "reports": {
+    "markdown": "# Sandbox Audit Report\n\n- Generated: 2026-05-04T01:13:09.108137+00:00\n- Namespace: sandbox-cua\n- Workload: deployment/target-cua\n- Risk score: 0 (low)\n\n## Findings\n- **NO_ACTIONABLE_FAILURES** [info] No failed checks were mapped to a built-in remediation rule\n\n## Dependencies\n- services: target-cua\n- ingresses: none\n- network_policies: allow-attacker-to-target, allow-dns-egress, allow-llm-gateway-egress, default-deny-all\n- hpas: none\n- pdbs: none\n- configmaps: none\n- secrets: none\n- runtime_class: None\n- node_selector: {'sandbox': 'cua'}\n- volumes: {\"emptyDir\": {}, \"name\": \"workspace\"}, {\"emptyDir\": {}, \"name\": \"artifacts\"}\n"
+  },
+  "attacker_cleanup": {
+    "ok": true,
+    "reason": "not_requested"
+  },
+  "controller": {
+    "internal_execution": {
+      "status": "manual_in_cluster_required",
+      "reason": "no_python_in_target_pod",
+      "runtime": {
+        "pod": "target-cua-6b88bdd94d-xzsgh",
+        "container": null,
+        "python": null,
+        "shell": null,
+        "writable_tmp": null
+      },
+      "manual_commands": {
+        "copy_and_run": [
+          "kubectl cp combined_audit_with_remediation.py sandbox-cua/target-cua-6b88bdd94d-xzsgh:/tmp/combined_audit.py",
+          "kubectl exec -n sandbox-cua target-cua-6b88bdd94d-xzsgh -- python3 /tmp/combined_audit.py internal --timeout 2.0 --out /tmp/audit.json",
+          "kubectl cp sandbox-cua/target-cua-6b88bdd94d-xzsgh:/tmp/audit.json ./audit.json"
+        ],
+        "stream_and_run": [
+          "cat combined_audit_with_remediation.py | kubectl exec -i -n sandbox-cua target-cua-6b88bdd94d-xzsgh -- sh -lc 'python3 -c '\"'\"'import sys; sys.argv=[\"combined_audit_with_remediation.py\", \"internal\", \"--timeout\", \"2.0\", \"--out /dev/stdout\"]; src=sys.stdin.read(); ns={'\"'\"'\"'\"'\"'\"'\"'\"'__name__'\"'\"'\"'\"'\"'\"'\"'\"':'\"'\"'\"'\"'\"'\"'\"'\"'__main__'\"'\"'\"'\"'\"'\"'\"'\"','\"'\"'\"'\"'\"'\"'\"'\"'__file__'\"'\"'\"'\"'\"'\"'\"'\"':'\"'\"'\"'\"'\"'\"'\"'\"'combined_audit_with_remediation.py'\"'\"'\"'\"'\"'\"'\"'\"'}; exec(compile(src, '\"'\"'\"'\"'\"'\"'\"'\"'combined_audit_with_remediation.py'\"'\"'\"'\"'\"'\"'\"'\"', '\"'\"'\"'\"'\"'\"'\"'\"'exec'\"'\"'\"'\"'\"'\"'\"'\"'), ns, ns)'\"'\"''"
+        ]
+      }
+    },
+    "selected_resource": {
+      "namespace": "sandbox-cua",
+      "pod_name": "target-cua-6b88bdd94d-xzsgh",
+      "pod_ip": "192.168.8.222",
+      "node_name": "worker-cua-1.us-central1-a.c.asl-0502-093447.internal",
+      "service_account_name": "default",
+      "container_names": [
+        "app"
+      ],
+      "pod_labels": {
+        "app": "target-cua",
+        "pod-template-hash": "6b88bdd94d",
+        "role": "target"
+      },
+      "workload_kind": "Deployment",
+      "workload_name": "target-cua",
+      "selector_labels": {
+        "app": "target-cua",
+        "role": "target"
+      },
+      "selector": "app=target-cua,role=target"
+    }
+  },
+  "dependencies": {
+    "services": [
+      "target-cua"
+    ],
+    "ingresses": [],
+    "network_policies": [
+      "allow-attacker-to-target",
+      "allow-dns-egress",
+      "allow-llm-gateway-egress",
+      "default-deny-all"
+    ],
+    "hpas": [],
+    "pdbs": [],
+    "configmaps": [],
+    "secrets": [],
+    "runtime_class": null,
+    "node_selector": {
+      "sandbox": "cua"
+    },
+    "volumes": [
+      {
+        "emptyDir": {},
+        "name": "workspace"
+      },
+      {
+        "emptyDir": {},
+        "name": "artifacts"
+      }
+    ]
+  },
+  "intent_inference": {
+    "intent": [
+      "service-endpoint"
+    ],
+    "listener_ports": [
+      8000
+    ],
+    "services": [
+      "target-cua"
+    ],
+    "needs": {
+      "network_egress": true,
+      "service_account": false,
+      "writable_workspace": false
+    },
+    "explanation": [
+      "Detected service-like port exposure or Kubernetes Service objects selecting the workload."
+    ]
+  },
+  "environment_profile": "lab",
+  "dependency_graph": {
+    "nodes": [
+      {
+        "id": "target-cua-5bdc5cbf6-lssmn",
+        "type": "Pod"
+      },
+      {
+        "id": "target-cua",
+        "type": "deployment"
+      },
+      {
+        "id": "target-cua",
+        "type": "Service"
+      },
+      {
+        "id": "allow-attacker-to-target",
+        "type": "NetworkPolicy"
+      },
+      {
+        "id": "allow-dns-egress",
+        "type": "NetworkPolicy"
+      },
+      {
+        "id": "allow-llm-gateway-egress",
+        "type": "NetworkPolicy"
+      },
+      {
+        "id": "default-deny-all",
+        "type": "NetworkPolicy"
+      }
+    ],
+    "edges": [
+      {
+        "from": "target-cua-5bdc5cbf6-lssmn",
+        "to": "target-cua",
+        "relationship": "owned_by"
+      },
+      {
+        "from": "target-cua",
+        "to": "target-cua",
+        "relationship": "selects"
+      },
+      {
+        "from": "target-cua",
+        "to": "allow-attacker-to-target",
+        "relationship": "selects"
+      },
+      {
+        "from": "target-cua",
+        "to": "allow-dns-egress",
+        "relationship": "selects"
+      },
+      {
+        "from": "target-cua",
+        "to": "allow-llm-gateway-egress",
+        "relationship": "selects"
+      },
+      {
+        "from": "target-cua",
+        "to": "default-deny-all",
+        "relationship": "selects"
+      }
+    ]
+  },
+  "runtime_intelligence": {
+    "runtime": "cua",
+    "notes": [
+      "Hardened OCI baseline with higher chance of app-level exposure by default.",
+      "Observed listener profile is consistent with the inferred cua runtime expectations.",
+      "Recommended fix profiles: agentic-desktop-compatible, baseline-safe."
+    ]
+  },
+  "knowledge_base_patterns": [],
+  "history_insights": {
+    "repeated_findings": {
+      "NO_ACTIONABLE_FAILURES": 2,
+      "SECCOMP_DISABLED": 7,
+      "SERVICE_ACCOUNT_TOKEN": 16,
+      "ROOTFS_RW": 16,
+      "NO_NEW_PRIVS_DISABLED": 7,
+      "SETID_BINARIES_PRESENT": 16
+    },
+    "notes": [
+      "NO_ACTIONABLE_FAILURES has appeared in 2 recent runs; consider promoting this into a default policy or baseline control."
+    ]
+  },
+  "explainable_prioritization": [
+    {
+      "issue_id": "NO_ACTIONABLE_FAILURES",
+      "title": "No failed checks were mapped to a built-in remediation rule",
+      "priority_score": 2.75,
+      "why_ranked_here": [
+        "Severity=info, risk=info",
+        "Finding confidence=0.55",
+        "Decision=manual-only",
+        "Dependency graph was used to avoid patching the pod in isolation when workload-scoped resources depend on it."
+      ]
+    }
+  ],
+  "app_mode": "ai",
+  "ai_advisor": {
+    "status": "ok",
+    "enabled": true,
+    "provider": "openai",
+    "model": "gpt-5-mini",
+    "executive_summary": "Analysis found no actionable security failures mapped to automatic remediation. Review findings manually and consider workload-design or image changes if concerns remain.",
+    "remediation_overview": "All detected issues are informational and require manual review; no safe automated fixes available. Follow manual_recommendation and validate any redesigns in staging before production.",
+    "prioritized_groups": [
+      {
+        "title": "Manual review required",
+        "priority": "low",
+        "issue_ids": [
+          "NO_ACTIONABLE_FAILURES"
+        ],
+        "rationale": "No built-in remediation rules apply; fixes need workload redesign, image updates, or environment-specific validation."
+      }
+    ],
+    "item_advice": [
+      {
+        "issue_id": "NO_ACTIONABLE_FAILURES",
+        "explanation": "No failed checks mapped to an automatic remediation rule. The scan flagged informational items only.",
+        "operator_impact": "No immediate operational change required. Existing network-policies and services may affect traffic (services select this workload: target-cua).",
+        "validation_advice": "Manually review raw findings and confirm intended network-policy and service behavior. Test any design or image changes in a sandbox before deployment.",
+        "ordering_reason": "Only item present; manual review is the appropriate first step."
+      }
+    ],
+    "guided_operator_message": "No automatic fixes available. Manually review findings, validate network-policy/service interactions, and plan any redesigns in a test environment.",
+    "warnings": [
+      "Default-deny network policy may block expected traffic to this workload.",
+      "Remediation requires manual changes; avoid live production edits without testing."
+    ],
+    "next_steps": [
+      "Inspect raw scanner findings and logs for this deployment.",
+      "Validate network policies (allow-attacker-to-target, allow-dns-egress, allow-llm-gateway-egress, default-deny-all) against expected traffic flows.",
+      "If redesign or image updates are needed, implement and test in a staging namespace.",
+      "Document changes and roll out via CI/CD with rollback plan."
+    ]
+  }
+}
