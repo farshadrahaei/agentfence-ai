@@ -344,7 +344,7 @@ After `remediate` or `analyze and remediate`, artifacts typically include:
 
 ## Example workflows
 
-### CUA
+### Example
 
 ```bash
 python3 agentfence.py --app-mode ai
@@ -355,26 +355,6 @@ Then:
 ```text
 choose kubernetes
 choose sandbox-cua
-analyze
-remediate
-restore
-```
-
-### gVisor
-
-```text
-choose kubernetes
-choose sandbox-gvisor
-analyze
-remediate
-restore
-```
-
-### Kata
-
-```text
-choose kubernetes
-choose sandbox-kata
 analyze
 remediate
 restore
@@ -418,7 +398,6 @@ To move the tool to another system, copy the `AgentFence AI` folder and ensure:
 You do not need to copy:
 
 - old `generated_outputs/`
-- `__pycache__/`
 - local experiment artifacts outside the package folder
 
 ## License
