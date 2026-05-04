@@ -2,6 +2,12 @@
 
 `AgentFence AI` audits Kubernetes sandbox workloads, recommends fixes, applies supported remediations with rollback protection, and generates source-of-truth manifest updates for permanent fixes.
 
+It is an extension of the [Agentic AI Sandbox Security Evaluation](https://github.com/farshadrahaei/agentic-ai-sandbox-security-evaluation) project, with major additions for operational use:
+
+- remediation workflows
+- backup and restore support
+- an interactive AI CLI for guided analysis and remediation
+
 ## Why this app matters
 
 Modern agentic AI workloads often run in Kubernetes sandboxes that are intentionally more dynamic than traditional applications. They may need browsers, writable workspace volumes, temporary artifacts, or interactive runtime components. That makes them useful for research and experimentation, but it also creates a bigger gap between:
