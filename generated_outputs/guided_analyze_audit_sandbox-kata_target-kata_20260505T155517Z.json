@@ -1,12 +1,12 @@
 {
   "meta": {
-    "ts_utc": "2026-05-04T18:52:37Z",
+    "ts_utc": "2026-05-05T15:54:33Z",
     "namespace": "sandbox-kata",
     "target_selector": "app=target-kata,role=target",
     "tool": "combined_sandbox_audit",
     "host": "Darwin 25.4.0",
-    "target_pod": "target-kata-cf45c97b7-lvx76",
-    "target_ip": "192.168.192.188",
+    "target_pod": "target-kata-5d5d7799cf-cfng2",
+    "target_ip": "192.168.192.130",
     "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
     "image": "ghcr.io/farshadrahaei/crewai-sandbox-app:v1",
     "imageID": "ghcr.io/farshadrahaei/crewai-sandbox-app@sha256:3c23e0a9d989662a7159056d9c828017f2dde64f394b85675015b8fa8486260f",
@@ -59,64 +59,64 @@
         "message": "Services select this workload: target-kata. Default-deny policy may block expected traffic."
       }
     ],
-    "app_mode": "ai"
+    "app_mode": "default"
   },
   "results": {
     "scanned_ports": [
       {
         "port": 22,
         "reachable": false,
-        "nc_output": "nc: connect to 192.168.192.188 port 22 (tcp) timed out: Operation in progress"
+        "nc_output": "nc: connect to 192.168.192.130 port 22 (tcp) timed out: Operation in progress"
       },
       {
         "port": 80,
         "reachable": false,
-        "nc_output": "nc: connect to 192.168.192.188 port 80 (tcp) timed out: Operation in progress"
+        "nc_output": "nc: connect to 192.168.192.130 port 80 (tcp) timed out: Operation in progress"
       },
       {
         "port": 443,
         "reachable": false,
-        "nc_output": "nc: connect to 192.168.192.188 port 443 (tcp) timed out: Operation in progress"
+        "nc_output": "nc: connect to 192.168.192.130 port 443 (tcp) timed out: Operation in progress"
       },
       {
         "port": 5901,
         "reachable": false,
-        "nc_output": "nc: connect to 192.168.192.188 port 5901 (tcp) timed out: Operation in progress"
+        "nc_output": "nc: connect to 192.168.192.130 port 5901 (tcp) timed out: Operation in progress"
       },
       {
         "port": 6080,
         "reachable": false,
-        "nc_output": "nc: connect to 192.168.192.188 port 6080 (tcp) timed out: Operation in progress"
+        "nc_output": "nc: connect to 192.168.192.130 port 6080 (tcp) timed out: Operation in progress"
       },
       {
         "port": 6901,
         "reachable": false,
-        "nc_output": "nc: connect to 192.168.192.188 port 6901 (tcp) timed out: Operation in progress"
+        "nc_output": "nc: connect to 192.168.192.130 port 6901 (tcp) timed out: Operation in progress"
       },
       {
         "port": 8000,
         "reachable": true,
-        "nc_output": "Connection to 192.168.192.188 8000 port [tcp/*] succeeded!"
+        "nc_output": "Connection to 192.168.192.130 8000 port [tcp/*] succeeded!"
       },
       {
         "port": 8080,
         "reachable": false,
-        "nc_output": "nc: connect to 192.168.192.188 port 8080 (tcp) timed out: Operation in progress"
+        "nc_output": "nc: connect to 192.168.192.130 port 8080 (tcp) timed out: Operation in progress"
       },
       {
         "port": 8443,
         "reachable": false,
-        "nc_output": "nc: connect to 192.168.192.188 port 8443 (tcp) timed out: Operation in progress"
+        "nc_output": "nc: connect to 192.168.192.130 port 8443 (tcp) timed out: Operation in progress"
       },
       {
         "port": 10250,
         "reachable": false,
-        "nc_output": "nc: connect to 192.168.192.188 port 10250 (tcp) timed out: Operation in progress"
+        "nc_output": "nc: connect to 192.168.192.130 port 10250 (tcp) timed out: Operation in progress"
       },
       {
         "port": 10255,
         "reachable": false,
-        "nc_output": "nc: connect to 192.168.192.188 port 10255 (tcp) timed out: Operation in progress"
+        "nc_output": "nc: connect to 192.168.192.130 port 10255 (tcp) timed out: Operation in progress"
       }
     ],
     "novnc_http_6901": {
@@ -124,7 +124,7 @@
       "status_line": ""
     },
     "novnc_ws_6901": {
-      "raw": "nc: connect to 192.168.192.188 port 6901 (tcp) timed out: Operation in progress\n",
+      "raw": "nc: connect to 192.168.192.130 port 6901 (tcp) timed out: Operation in progress\n",
       "switching_protocols_101": false
     },
     "vnc_rfb_5901": {
@@ -139,17 +139,23 @@
     },
     "internal_audit": {
       "meta": {
-        "ts_utc": "2026-05-04T18:53:13.346975+00:00",
+        "ts_utc": "2026-05-05T15:55:06.938789+00:00",
         "python_version": "3.11.15",
         "platform": "Linux-6.18.12-x86_64-with-glibc2.41",
-        "hostname": "target-kata-cf45c97b7-lvx76",
+        "hostname": "target-kata-5d5d7799cf-cfng2",
         "cwd": "/app",
         "uid": 10001,
         "env_hints": {
           "KUBERNETES_SERVICE_HOST": "10.96.0.1",
-          "HOSTNAME": "target-kata-cf45c97b7-lvx76"
+          "HOSTNAME": "target-kata-5d5d7799cf-cfng2"
         },
-        "compatibility_notes": []
+        "compatibility_notes": [
+          {
+            "issue_id": "ROOTFS_RW",
+            "risk": "high",
+            "message": "Writable root filesystem detected; validate /tmp, /var/tmp, and application workspace writes before enabling read-only rootfs."
+          }
+        ]
       },
       "results": {
         "no_vnc_password_in_env": {
@@ -161,8 +167,8 @@
           "evidence": "euid=10001"
         },
         "rootfs_readonly": {
-          "ok": true,
-          "evidence": "root_mount_opts=ro,nodev,relatime"
+          "ok": false,
+          "evidence": "root_mount_opts=rw,relatime"
         },
         "sensitive_paths_readonly": {
           "ok": true,
@@ -199,8 +205,8 @@
           "evidence": "exists=False"
         },
         "sa_mount_readonly": {
-          "ok": true,
-          "evidence": "mount_opts=ro,nodev,relatime"
+          "ok": false,
+          "evidence": "mount_opts=rw,relatime"
         },
         "seccomp_enforced": {
           "ok": false,
@@ -219,8 +225,8 @@
           "evidence": "present=none;mask=0x0"
         },
         "rootfs_readonly": {
-          "ok": true,
-          "evidence": "root_mount_opts=ro,nodev,relatime"
+          "ok": false,
+          "evidence": "root_mount_opts=rw,relatime"
         },
         "host_mounts_absent": {
           "ok": true,
@@ -244,12 +250,27 @@
         }
       },
       "summary": {
-        "passed": 19,
+        "passed": 16,
         "total": 22
       },
       "remediation": {
-        "count": 3,
+        "count": 5,
         "items": [
+          {
+            "issue_id": "ROOTFS_RW",
+            "severity": "high",
+            "title": "Mount the root filesystem read-only",
+            "rationale": "Writable root filesystems make persistence and tampering easier after compromise.",
+            "actions": [
+              "Set readOnlyRootFilesystem: true.",
+              "Move writable paths to explicit emptyDir or persistent volumes.",
+              "Validate startup scripts and temp directories still work after the change."
+            ],
+            "snippet": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: REPLACE_ME\nspec:\n  template:\n    metadata:\n      labels:\n        app: cua\n    spec:\n      automountServiceAccountToken: false\n      containers:\n      - name: REPLACE_ME\n        securityContext:\n          runAsNonRoot: true\n          runAsUser: 10001\n          runAsGroup: 10001\n          allowPrivilegeEscalation: false\n          readOnlyRootFilesystem: true\n          capabilities:\n            drop: [\"ALL\"]\n          seccompProfile:\n            type: RuntimeDefault",
+            "refs": [
+              "Kubernetes securityContext"
+            ]
+          },
           {
             "issue_id": "SECCOMP_DISABLED",
             "severity": "high",
@@ -264,6 +285,22 @@
             "refs": [
               "seccomp",
               "Kubernetes RuntimeDefault"
+            ]
+          },
+          {
+            "issue_id": "SERVICE_ACCOUNT_TOKEN",
+            "severity": "high",
+            "title": "Reduce service account token exposure",
+            "rationale": "Mounted service account tokens expand blast radius when a pod is compromised and should be disabled unless the workload truly needs Kubernetes API access.",
+            "actions": [
+              "Set automountServiceAccountToken: false for workloads that do not need the API.",
+              "Use a dedicated least-privilege service account when API access is required.",
+              "Keep token mounts read-only and review RBAC bindings."
+            ],
+            "snippet": "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: sandbox-sa\n  namespace: default\nautomountServiceAccountToken: false",
+            "refs": [
+              "ServiceAccount",
+              "RBAC"
             ]
           },
           {
@@ -315,168 +352,182 @@
           "check_id": "no_vnc_password_in_env",
           "ok": true,
           "evidence": "vars=absent",
-          "timestamp_utc": "2026-05-04T18:53:22.526935+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191090+00:00"
         },
         {
           "section": "results",
           "check_id": "running_as_non_root",
           "ok": true,
           "evidence": "euid=10001",
-          "timestamp_utc": "2026-05-04T18:53:22.526969+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191108+00:00"
         },
         {
           "section": "results",
           "check_id": "rootfs_readonly",
-          "ok": true,
-          "evidence": "root_mount_opts=ro,nodev,relatime",
-          "timestamp_utc": "2026-05-04T18:53:22.526973+00:00"
+          "ok": false,
+          "evidence": "root_mount_opts=rw,relatime",
+          "timestamp_utc": "2026-05-05T15:55:16.191111+00:00"
         },
         {
           "section": "results",
           "check_id": "sensitive_paths_readonly",
           "ok": true,
           "evidence": "writable=none",
-          "timestamp_utc": "2026-05-04T18:53:22.526976+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191114+00:00"
         },
         {
           "section": "results",
           "check_id": "setid_binaries_absent",
           "ok": false,
           "evidence": "found=/bin/su,/bin/passwd,/bin/chfn,/bin/newgrp,/bin/sg,/bin/chsh,/bin/gpasswd,/bin/umount,/bin/chage,/bin/expiry",
-          "timestamp_utc": "2026-05-04T18:53:22.526978+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191117+00:00"
         },
         {
           "section": "results",
           "check_id": "host_engine_sockets_absent",
           "ok": true,
           "evidence": "found=none",
-          "timestamp_utc": "2026-05-04T18:53:22.526981+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191119+00:00"
         },
         {
           "section": "results",
           "check_id": "cloud_imds_blocked",
           "ok": true,
           "evidence": "169.254.169.254:80 reach=False; 169.254.170.2:80 reach=False",
-          "timestamp_utc": "2026-05-04T18:53:22.526985+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191123+00:00"
         },
         {
           "section": "results",
           "check_id": "risky_device_nodes_absent",
           "ok": true,
           "evidence": "found=none",
-          "timestamp_utc": "2026-05-04T18:53:22.526989+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191127+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "sa_token_present",
           "ok": true,
           "evidence": "exists=False",
-          "timestamp_utc": "2026-05-04T18:53:22.526993+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191131+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "sa_ca_present",
           "ok": true,
           "evidence": "exists=False",
-          "timestamp_utc": "2026-05-04T18:53:22.526996+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191133+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "sa_namespace_present",
           "ok": true,
           "evidence": "exists=False",
-          "timestamp_utc": "2026-05-04T18:53:22.526998+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191136+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "sa_mount_readonly",
-          "ok": true,
-          "evidence": "mount_opts=ro,nodev,relatime",
-          "timestamp_utc": "2026-05-04T18:53:22.527000+00:00"
+          "ok": false,
+          "evidence": "mount_opts=rw,relatime",
+          "timestamp_utc": "2026-05-05T15:55:16.191138+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "seccomp_enforced",
           "ok": false,
           "evidence": "Seccomp=0",
-          "timestamp_utc": "2026-05-04T18:53:22.527002+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191140+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "no_new_privs",
           "ok": false,
           "evidence": "NoNewPrivs=0",
-          "timestamp_utc": "2026-05-04T18:53:22.527005+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191142+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "apparmor_profile",
           "ok": true,
           "evidence": "profile='__ERR__ [Errno 22] Invalid argument'",
-          "timestamp_utc": "2026-05-04T18:53:22.527007+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191144+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "dangerous_caps_absent",
           "ok": true,
           "evidence": "present=none;mask=0x0",
-          "timestamp_utc": "2026-05-04T18:53:22.527009+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191146+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "rootfs_readonly",
-          "ok": true,
-          "evidence": "root_mount_opts=ro,nodev,relatime",
-          "timestamp_utc": "2026-05-04T18:53:22.527011+00:00"
+          "ok": false,
+          "evidence": "root_mount_opts=rw,relatime",
+          "timestamp_utc": "2026-05-05T15:55:16.191148+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "host_mounts_absent",
           "ok": true,
           "evidence": "found=none",
-          "timestamp_utc": "2026-05-04T18:53:22.527013+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191151+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "egress_api_tcp_443",
           "ok": true,
           "evidence": "reachable=False; TimeoutError: timed out",
-          "timestamp_utc": "2026-05-04T18:53:22.527016+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191153+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "egress_api_https_version",
           "ok": true,
           "evidence": "reachable=False; TimeoutError: timed out",
-          "timestamp_utc": "2026-05-04T18:53:22.527018+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191156+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "imds_blocked",
           "ok": true,
           "evidence": "169.254.169.254:80 reach=False; 169.254.170.2:80 reach=False",
-          "timestamp_utc": "2026-05-04T18:53:22.527020+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191158+00:00"
         },
         {
           "section": "kubernetes",
           "check_id": "net_raw_absent",
           "ok": true,
           "evidence": "CAP_NET_RAW=False",
-          "timestamp_utc": "2026-05-04T18:53:22.527022+00:00"
+          "timestamp_utc": "2026-05-05T15:55:16.191160+00:00"
         }
       ],
       "risk_score": {
-        "probability": 4,
-        "blast_radius": 4,
-        "total": 8,
-        "band": "medium",
+        "probability": 10,
+        "blast_radius": 10,
+        "total": 20,
+        "band": "critical",
         "contributions": [
+          {
+            "issue_id": "ROOTFS_RW",
+            "severity": "high",
+            "P": 3,
+            "B": 3,
+            "title": "Mount the root filesystem read-only"
+          },
           {
             "issue_id": "SECCOMP_DISABLED",
             "severity": "high",
             "P": 2,
             "B": 2,
             "title": "Enable seccomp filtering"
+          },
+          {
+            "issue_id": "SERVICE_ACCOUNT_TOKEN",
+            "severity": "high",
+            "P": 3,
+            "B": 3,
+            "title": "Reduce service account token exposure"
           },
           {
             "issue_id": "SETID_BINARIES_PRESENT",
@@ -495,14 +546,145 @@
         ]
       },
       "reports": {
-        "markdown": "# Sandbox Audit Report\n\n- Generated: 2026-05-04T18:53:22.527051+00:00\n- Namespace: n/a\n- Workload: /\n- Risk score: 8 (medium)\n\n## Findings\n- **SECCOMP_DISABLED** [high] Enable seccomp filtering\n- **SETID_BINARIES_PRESENT** [medium] Remove setuid/setgid binaries from the image\n- **NO_NEW_PRIVS_DISABLED** [medium] Disallow privilege escalation\n\n## Dependencies\n"
+        "markdown": "# Sandbox Audit Report\n\n- Generated: 2026-05-05T15:55:16.191191+00:00\n- Namespace: n/a\n- Workload: /\n- Risk score: 20 (critical)\n\n## Findings\n- **ROOTFS_RW** [high] Mount the root filesystem read-only\n- **SECCOMP_DISABLED** [high] Enable seccomp filtering\n- **SERVICE_ACCOUNT_TOKEN** [high] Reduce service account token exposure\n- **SETID_BINARIES_PRESENT** [medium] Remove setuid/setgid binaries from the image\n- **NO_NEW_PRIVS_DISABLED** [medium] Disallow privilege escalation\n\n## Dependencies\n"
       }
     },
     "classification": "not_reachable_or_insufficient_signals"
   },
   "remediation": {
-    "count": 1,
+    "count": 3,
     "items": [
+      {
+        "issue_id": "SERVICE_ACCOUNT_TOKEN",
+        "severity": "high",
+        "title": "Reduce service account token exposure",
+        "rationale": "Mounted service account tokens expand blast radius when a pod is compromised and should be disabled unless the workload truly needs Kubernetes API access.",
+        "actions": [
+          "Set automountServiceAccountToken: false for workloads that do not need the API.",
+          "Use a dedicated least-privilege service account when API access is required.",
+          "Keep token mounts read-only and review RBAC bindings."
+        ],
+        "snippet": "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: sandbox-sa\n  namespace: sandbox-kata\nautomountServiceAccountToken: false",
+        "refs": [
+          "ServiceAccount",
+          "RBAC"
+        ],
+        "risk_level": "high",
+        "auto_applicable": false,
+        "fix_group": "service_account",
+        "risk_note": "Disabling token automount will break workloads that call the Kubernetes API from inside the pod.",
+        "manual_recommendation": "Confirm whether the workload needs Kubernetes API access before disabling automount.",
+        "simulation_hint": "Disabling token automount will break workloads that call the Kubernetes API from inside the pod.",
+        "base_auto_applicable": true,
+        "confidence": {
+          "finding_confidence": 0.6,
+          "fix_confidence": 0.57,
+          "safety_confidence": 0.42,
+          "reasons": [
+            "Higher-severity items are prioritized with additional confidence weighting."
+          ]
+        },
+        "pre_fix_model": {
+          "safe_to_autofix": false,
+          "predicted_risks": [],
+          "predicted_breakage": false
+        },
+        "automation_decision": "conditional-approval",
+        "decision_reasoning": [
+          "Fix can be generated automatically, but workload compatibility is uncertain and operator approval is recommended."
+        ],
+        "priority_score": 33.0,
+        "policy_reasoning": [
+          "ServiceAccount remediation is governed by observed token presence plus whether Kubernetes API access appears necessary.",
+          "Dependency graph was used to avoid patching the pod in isolation when workload-scoped resources depend on it."
+        ],
+        "why_not_auto_fixed": [
+          "Fix can be generated automatically, but workload compatibility is uncertain and operator approval is recommended."
+        ],
+        "manual_runbook": {
+          "issue_id": "SERVICE_ACCOUNT_TOKEN",
+          "title": "Reduce service account token exposure",
+          "steps": [
+            "Review the generated remediation recommendation and compatibility notes.",
+            "Apply the fix in a staging-safe manner and re-run the audit."
+          ],
+          "rollback": [
+            "Use the generated rollback artifacts or restore the prior manifest revision."
+          ],
+          "validation_commands": [
+            "kubectl -n sandbox-kata get all",
+            "kubectl -n sandbox-kata describe deploy/target-kata"
+          ]
+        }
+      },
+      {
+        "issue_id": "ROOTFS_RW",
+        "severity": "high",
+        "title": "Mount the root filesystem read-only",
+        "rationale": "Writable root filesystems make persistence and tampering easier after compromise.",
+        "actions": [
+          "Set readOnlyRootFilesystem: true.",
+          "Move writable paths to explicit emptyDir or persistent volumes.",
+          "Validate startup scripts and temp directories still work after the change."
+        ],
+        "snippet": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: REPLACE_ME\nspec:\n  template:\n    metadata:\n      labels:\n        app: target-kata,role=target\n    spec:\n      automountServiceAccountToken: false\n      containers:\n      - name: REPLACE_ME\n        securityContext:\n          runAsNonRoot: true\n          runAsUser: 10001\n          runAsGroup: 10001\n          allowPrivilegeEscalation: false\n          readOnlyRootFilesystem: true\n          capabilities:\n            drop: [\"ALL\"]\n          seccompProfile:\n            type: RuntimeDefault",
+        "refs": [
+          "Kubernetes securityContext"
+        ],
+        "risk_level": "high",
+        "auto_applicable": false,
+        "fix_group": "workload_patch",
+        "risk_note": "Enabling readOnlyRootFilesystem can break workloads that write under /tmp, /var, /etc, or application paths.",
+        "manual_recommendation": "Identify writable paths and move them to explicit volumes or emptyDir mounts first.",
+        "simulation_hint": "Enabling readOnlyRootFilesystem can break workloads that write under /tmp, /var, /etc, or application paths.",
+        "base_auto_applicable": true,
+        "confidence": {
+          "finding_confidence": 0.5,
+          "fix_confidence": 0.47,
+          "safety_confidence": 0.32,
+          "reasons": [
+            "Higher-severity items are prioritized with additional confidence weighting.",
+            "Remediation safety depends heavily on workload behavior and image design."
+          ]
+        },
+        "pre_fix_model": {
+          "safe_to_autofix": false,
+          "predicted_risks": [
+            "Application may write under root-owned paths; verify /tmp, /var/tmp, and workspace mounts before enabling read-only root filesystem."
+          ],
+          "predicted_breakage": true
+        },
+        "automation_decision": "conditional-approval",
+        "decision_reasoning": [
+          "Fix can be generated automatically, but workload compatibility is uncertain and operator approval is recommended.",
+          "Application may write under root-owned paths; verify /tmp, /var/tmp, and workspace mounts before enabling read-only root filesystem."
+        ],
+        "priority_score": 32.5,
+        "policy_reasoning": [
+          "Dependency graph was used to avoid patching the pod in isolation when workload-scoped resources depend on it."
+        ],
+        "why_not_auto_fixed": [
+          "Fix can be generated automatically, but workload compatibility is uncertain and operator approval is recommended.",
+          "Application may write under root-owned paths; verify /tmp, /var/tmp, and workspace mounts before enabling read-only root filesystem."
+        ],
+        "manual_runbook": {
+          "issue_id": "ROOTFS_RW",
+          "title": "Mount the root filesystem read-only",
+          "steps": [
+            "Identify write paths from logs, entrypoint scripts, and runtime behavior.",
+            "Move mutable paths to emptyDir or persistent volumes.",
+            "Enable readOnlyRootFilesystem and redeploy.",
+            "Validate application startup, temp-file creation, and user workflow paths."
+          ],
+          "rollback": [
+            "Restore the previous writable filesystem setting and mounted scratch volumes if the application becomes unstable."
+          ],
+          "validation_commands": [
+            "kubectl -n sandbox-kata get all",
+            "kubectl -n sandbox-kata describe deploy/target-kata"
+          ]
+        }
+      },
       {
         "issue_id": "SETID_BINARIES_PRESENT",
         "severity": "medium",
@@ -581,176 +763,190 @@
       "check_id": "novnc_http_6901",
       "ok": false,
       "evidence": "",
-      "timestamp_utc": "2026-05-04T18:53:07.568743+00:00"
+      "timestamp_utc": "2026-05-05T15:55:03.434225+00:00"
     },
     {
       "section": "results",
       "check_id": "internal_introspection",
       "ok": true,
       "evidence": "",
-      "timestamp_utc": "2026-05-04T18:53:07.568798+00:00"
+      "timestamp_utc": "2026-05-05T15:55:03.434281+00:00"
     },
     {
       "section": "results",
       "check_id": "no_vnc_password_in_env",
       "ok": true,
       "evidence": "vars=absent",
-      "timestamp_utc": "2026-05-04T18:53:22.526935+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191090+00:00"
     },
     {
       "section": "results",
       "check_id": "running_as_non_root",
       "ok": true,
       "evidence": "euid=10001",
-      "timestamp_utc": "2026-05-04T18:53:22.526969+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191108+00:00"
     },
     {
       "section": "results",
       "check_id": "rootfs_readonly",
-      "ok": true,
-      "evidence": "root_mount_opts=ro,nodev,relatime",
-      "timestamp_utc": "2026-05-04T18:53:22.526973+00:00"
+      "ok": false,
+      "evidence": "root_mount_opts=rw,relatime",
+      "timestamp_utc": "2026-05-05T15:55:16.191111+00:00"
     },
     {
       "section": "results",
       "check_id": "sensitive_paths_readonly",
       "ok": true,
       "evidence": "writable=none",
-      "timestamp_utc": "2026-05-04T18:53:22.526976+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191114+00:00"
     },
     {
       "section": "results",
       "check_id": "setid_binaries_absent",
       "ok": false,
       "evidence": "found=/bin/su,/bin/passwd,/bin/chfn,/bin/newgrp,/bin/sg,/bin/chsh,/bin/gpasswd,/bin/umount,/bin/chage,/bin/expiry",
-      "timestamp_utc": "2026-05-04T18:53:22.526978+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191117+00:00"
     },
     {
       "section": "results",
       "check_id": "host_engine_sockets_absent",
       "ok": true,
       "evidence": "found=none",
-      "timestamp_utc": "2026-05-04T18:53:22.526981+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191119+00:00"
     },
     {
       "section": "results",
       "check_id": "cloud_imds_blocked",
       "ok": true,
       "evidence": "169.254.169.254:80 reach=False; 169.254.170.2:80 reach=False",
-      "timestamp_utc": "2026-05-04T18:53:22.526985+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191123+00:00"
     },
     {
       "section": "results",
       "check_id": "risky_device_nodes_absent",
       "ok": true,
       "evidence": "found=none",
-      "timestamp_utc": "2026-05-04T18:53:22.526989+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191127+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "sa_token_present",
       "ok": true,
       "evidence": "exists=False",
-      "timestamp_utc": "2026-05-04T18:53:22.526993+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191131+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "sa_ca_present",
       "ok": true,
       "evidence": "exists=False",
-      "timestamp_utc": "2026-05-04T18:53:22.526996+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191133+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "sa_namespace_present",
       "ok": true,
       "evidence": "exists=False",
-      "timestamp_utc": "2026-05-04T18:53:22.526998+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191136+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "sa_mount_readonly",
-      "ok": true,
-      "evidence": "mount_opts=ro,nodev,relatime",
-      "timestamp_utc": "2026-05-04T18:53:22.527000+00:00"
+      "ok": false,
+      "evidence": "mount_opts=rw,relatime",
+      "timestamp_utc": "2026-05-05T15:55:16.191138+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "seccomp_enforced",
       "ok": false,
       "evidence": "Seccomp=0",
-      "timestamp_utc": "2026-05-04T18:53:22.527002+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191140+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "no_new_privs",
       "ok": false,
       "evidence": "NoNewPrivs=0",
-      "timestamp_utc": "2026-05-04T18:53:22.527005+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191142+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "apparmor_profile",
       "ok": true,
       "evidence": "profile='__ERR__ [Errno 22] Invalid argument'",
-      "timestamp_utc": "2026-05-04T18:53:22.527007+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191144+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "dangerous_caps_absent",
       "ok": true,
       "evidence": "present=none;mask=0x0",
-      "timestamp_utc": "2026-05-04T18:53:22.527009+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191146+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "rootfs_readonly",
-      "ok": true,
-      "evidence": "root_mount_opts=ro,nodev,relatime",
-      "timestamp_utc": "2026-05-04T18:53:22.527011+00:00"
+      "ok": false,
+      "evidence": "root_mount_opts=rw,relatime",
+      "timestamp_utc": "2026-05-05T15:55:16.191148+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "host_mounts_absent",
       "ok": true,
       "evidence": "found=none",
-      "timestamp_utc": "2026-05-04T18:53:22.527013+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191151+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "egress_api_tcp_443",
       "ok": true,
       "evidence": "reachable=False; TimeoutError: timed out",
-      "timestamp_utc": "2026-05-04T18:53:22.527016+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191153+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "egress_api_https_version",
       "ok": true,
       "evidence": "reachable=False; TimeoutError: timed out",
-      "timestamp_utc": "2026-05-04T18:53:22.527018+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191156+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "imds_blocked",
       "ok": true,
       "evidence": "169.254.169.254:80 reach=False; 169.254.170.2:80 reach=False",
-      "timestamp_utc": "2026-05-04T18:53:22.527020+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191158+00:00"
     },
     {
       "section": "kubernetes",
       "check_id": "net_raw_absent",
       "ok": true,
       "evidence": "CAP_NET_RAW=False",
-      "timestamp_utc": "2026-05-04T18:53:22.527022+00:00"
+      "timestamp_utc": "2026-05-05T15:55:16.191160+00:00"
     }
   ],
   "risk_score": {
-    "probability": 1,
-    "blast_radius": 1,
-    "total": 2,
-    "band": "low",
+    "probability": 7,
+    "blast_radius": 7,
+    "total": 14,
+    "band": "high",
     "contributions": [
+      {
+        "issue_id": "SERVICE_ACCOUNT_TOKEN",
+        "severity": "high",
+        "P": 3,
+        "B": 3,
+        "title": "Reduce service account token exposure"
+      },
+      {
+        "issue_id": "ROOTFS_RW",
+        "severity": "high",
+        "P": 3,
+        "B": 3,
+        "title": "Mount the root filesystem read-only"
+      },
       {
         "issue_id": "SETID_BINARIES_PRESENT",
         "severity": "medium",
@@ -761,7 +957,7 @@
     ]
   },
   "reports": {
-    "markdown": "# Sandbox Audit Report\n\n- Generated: 2026-05-04T18:53:07.568842+00:00\n- Namespace: sandbox-kata\n- Workload: deployment/target-kata\n- Risk score: 0 (low)\n\n## Findings\n- **NO_ACTIONABLE_FAILURES** [info] No failed checks were mapped to a built-in remediation rule\n\n## Dependencies\n- services: target-kata\n- ingresses: none\n- network_policies: allow-attacker-to-target, allow-dns-egress, allow-llm-gateway-egress, default-deny-all\n- hpas: none\n- pdbs: none\n- configmaps: none\n- secrets: none\n- runtime_class: kata-qemu\n- node_selector: {'sandbox': 'kata'}\n- volumes: {\"emptyDir\": {}, \"name\": \"workspace\"}, {\"emptyDir\": {}, \"name\": \"artifacts\"}\n"
+    "markdown": "# Sandbox Audit Report\n\n- Generated: 2026-05-05T15:55:03.434351+00:00\n- Namespace: sandbox-kata\n- Workload: deployment/target-kata\n- Risk score: 0 (low)\n\n## Findings\n- **NO_ACTIONABLE_FAILURES** [info] No failed checks were mapped to a built-in remediation rule\n\n## Dependencies\n- services: target-kata\n- ingresses: none\n- network_policies: allow-attacker-to-target, allow-dns-egress, allow-llm-gateway-egress, default-deny-all\n- hpas: none\n- pdbs: none\n- configmaps: none\n- secrets: none\n- runtime_class: kata-qemu\n- node_selector: {'sandbox': 'kata'}\n- volumes: {\"emptyDir\": {}, \"name\": \"workspace\"}, {\"emptyDir\": {}, \"name\": \"artifacts\"}\n"
   },
   "attacker_cleanup": {
     "ok": true,
@@ -772,17 +968,17 @@
       "status": "collected_from_laptop",
       "method": "exec_stream",
       "runtime": {
-        "pod": "target-kata-cf45c97b7-lvx76",
+        "pod": "target-kata-5d5d7799cf-cfng2",
         "container": "app",
         "python": "python3",
         "shell": "sh",
-        "writable_tmp": false
+        "writable_tmp": true
       }
     },
     "selected_resource": {
       "namespace": "sandbox-kata",
-      "pod_name": "target-kata-cf45c97b7-lvx76",
-      "pod_ip": "192.168.192.188",
+      "pod_name": "target-kata-5d5d7799cf-cfng2",
+      "pod_ip": "192.168.192.130",
       "node_name": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
       "service_account_name": "default",
       "container_names": [
@@ -790,7 +986,7 @@
       ],
       "pod_labels": {
         "app": "target-kata",
-        "pod-template-hash": "cf45c97b7",
+        "pod-template-hash": "5d5d7799cf",
         "role": "target"
       },
       "workload_kind": "Deployment",
@@ -860,7 +1056,7 @@
   "dependency_graph": {
     "nodes": [
       {
-        "id": "target-kata-cf45c97b7-lvx76",
+        "id": "target-kata-5d5d7799cf-cfng2",
         "type": "Pod"
       },
       {
@@ -890,7 +1086,7 @@
     ],
     "edges": [
       {
-        "from": "target-kata-cf45c97b7-lvx76",
+        "from": "target-kata-5d5d7799cf-cfng2",
         "to": "target-kata",
         "relationship": "owned_by"
       },
@@ -929,7 +1125,12 @@
       "Recommended fix profiles: restricted-pod, sandbox-strict."
     ]
   },
-  "knowledge_base_patterns": [],
+  "knowledge_base_patterns": [
+    {
+      "pattern": "service-account-token-minimization",
+      "recommendation": "Disable automountServiceAccountToken when token presence is not matched by observed Kubernetes API usage."
+    }
+  ],
   "history_insights": {
     "repeated_findings": {
       "NO_ACTIONABLE_FAILURES": 2,
@@ -940,10 +1141,35 @@
       "SETID_BINARIES_PRESENT": 16
     },
     "notes": [
+      "SERVICE_ACCOUNT_TOKEN has appeared in 16 recent runs; consider promoting this into a default policy or baseline control.",
+      "ROOTFS_RW has appeared in 16 recent runs; consider promoting this into a default policy or baseline control.",
       "SETID_BINARIES_PRESENT has appeared in 16 recent runs; consider promoting this into a default policy or baseline control."
     ]
   },
   "explainable_prioritization": [
+    {
+      "issue_id": "SERVICE_ACCOUNT_TOKEN",
+      "title": "Reduce service account token exposure",
+      "priority_score": 33.0,
+      "why_ranked_here": [
+        "Severity=high, risk=high",
+        "Finding confidence=0.6",
+        "Decision=conditional-approval",
+        "ServiceAccount remediation is governed by observed token presence plus whether Kubernetes API access appears necessary.",
+        "Dependency graph was used to avoid patching the pod in isolation when workload-scoped resources depend on it."
+      ]
+    },
+    {
+      "issue_id": "ROOTFS_RW",
+      "title": "Mount the root filesystem read-only",
+      "priority_score": 32.5,
+      "why_ranked_here": [
+        "Severity=high, risk=high",
+        "Finding confidence=0.5",
+        "Decision=conditional-approval",
+        "Dependency graph was used to avoid patching the pod in isolation when workload-scoped resources depend on it."
+      ]
+    },
     {
       "issue_id": "SETID_BINARIES_PRESENT",
       "title": "Remove setuid/setgid binaries from the image",
@@ -956,43 +1182,11 @@
       ]
     }
   ],
-  "app_mode": "ai",
+  "app_mode": "default",
   "ai_advisor": {
-    "status": "ok",
-    "enabled": true,
+    "status": "disabled",
+    "enabled": false,
     "provider": "openai",
-    "model": "gpt-5-mini",
-    "executive_summary": "One medium-severity issue: setuid/setgid binaries are present in the workload image. Fix requires image rebuild and validation; risk band is low with limited blast radius.",
-    "remediation_overview": "Rebuild the container image from a minimal base, remove or replace unnecessary setuid/setgid helpers, and validate functionality in a staging environment before deployment. This is a manual change; do not attempt in-cluster automatic removal.",
-    "prioritized_groups": [
-      {
-        "title": "Manual image hardening",
-        "priority": "high",
-        "issue_ids": [
-          "SETID_BINARIES_PRESENT"
-        ],
-        "rationale": "Setuid/setgid binaries increase privilege escalation risk and require image rebuilds and functional validation; address first to reduce attack surface."
-      }
-    ],
-    "item_advice": [
-      {
-        "issue_id": "SETID_BINARIES_PRESENT",
-        "explanation": "The container image contains setuid/setgid binaries which can be abused for privilege escalation inside the pod or by a compromised container.",
-        "operator_impact": "Requires rebuilding images and possibly changing admin tooling that relied on those helpers; may affect runtime behavior and operations workflows.",
-        "validation_advice": "Build and test a hardened image in staging: run the same workloads, exercise admin flows, verify services select target-kata still function, and scan the image for setuid/setgid files (e.g., find / -perm /6000).",
-        "ordering_reason": "Fixing image-level privilege issues reduces attack surface and should precede lower-impact configuration changes."
-      }
-    ],
-    "guided_operator_message": "Plan an image rebuild to remove setuid/setgid binaries; validate in staging and update deployment with the new image once tested.",
-    "warnings": [
-      "Do not attempt to remove setuid/setgid files from running pods\u2014changes require image rebuild.",
-      "Services selecting this workload (target-kata) and default-deny network policies may affect testing; validate connectivity."
-    ],
-    "next_steps": [
-      "Identify which setuid/setgid binaries are present and why they are needed.",
-      "Create a minimal base image and remove unnecessary helpers; if needed, replace with non-setuid alternatives.",
-      "Test the rebuilt image in staging, including admin tooling and services that select target-kata.",
-      "Scan the new image for remaining setuid/setgid files before rollout."
-    ]
+    "model": "gpt-5-mini"
   }
 }
