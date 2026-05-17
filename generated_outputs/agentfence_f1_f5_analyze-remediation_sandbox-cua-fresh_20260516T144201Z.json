@@ -1,0 +1,1526 @@
+{
+  "schema": "agentfence-f1-f5-v2",
+  "status": "complete",
+  "generated_at_utc": "2026-05-16T14:42:01.330949+00:00",
+  "action": "analyze-remediation",
+  "namespace": "sandbox-cua-fresh",
+  "error": null,
+  "F1_runtime_placement": {
+    "status": "captured",
+    "target_pod": "target-cua-868d864fbc-77phz",
+    "target_container": "cua",
+    "node": null,
+    "runtime_class": null,
+    "node_selector": null,
+    "attacker_pod": "attacker-cua-bfdbd4856-cgtgv"
+  },
+  "F2_attack_path_containment": {
+    "status": "captured",
+    "source": "post_remediation",
+    "counts": {
+      "pass": 11,
+      "fail": 28,
+      "skip": 0
+    },
+    "unsafe_probe_ids": [
+      "AgentFence.ID.RUN_AS_UID_ZERO",
+      "AgentFence.ID.ROOTFS_WRITE_OK",
+      "AgentFence.FS.HOST_SYS_VISIBLE",
+      "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC",
+      "AgentFence.DEVICE.RAW_SOCKET_USABLE",
+      "AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT",
+      "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE",
+      "AgentFence.SIDE.HOST_DMI_LEAKED",
+      "AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE",
+      "AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED"
+    ],
+    "review_only_probe_ids": [
+      "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE"
+    ],
+    "skipped_probe_ids": []
+  },
+  "F3_remediation_effectiveness": {
+    "status": "improved",
+    "metrics_before": {
+      "issue_count": 12,
+      "score_raw": 16.5,
+      "tbe_issue_count": 2,
+      "tbe_score_raw": 4.0,
+      "tbe_score_normalized": 5.7143,
+      "catalog_max_tbe": 7.0,
+      "ele_issue_count": 10,
+      "ele_score_raw": 12.5,
+      "ele_score_normalized": 1.8657,
+      "catalog_max_ele": 67.0,
+      "score_normalized": 4.1748,
+      "headline_alpha": 0.6,
+      "catalog_version": "1.3.0",
+      "by_severity": {
+        "high": 3,
+        "medium": 6,
+        "low": 3
+      },
+      "skipped": []
+    },
+    "metrics_after": {
+      "issue_count": 10,
+      "score_raw": 14.5,
+      "tbe_issue_count": 2,
+      "tbe_score_raw": 4.0,
+      "tbe_score_normalized": 5.7143,
+      "catalog_max_tbe": 7.0,
+      "ele_issue_count": 8,
+      "ele_score_raw": 10.5,
+      "ele_score_normalized": 1.5672,
+      "catalog_max_ele": 67.0,
+      "score_normalized": 4.0554,
+      "headline_alpha": 0.6,
+      "catalog_version": "1.3.0",
+      "by_severity": {
+        "high": 3,
+        "medium": 4,
+        "low": 3
+      },
+      "skipped": []
+    },
+    "issue_count_before": 12,
+    "issue_count_after": 10,
+    "headline_before": 4.1748,
+    "headline_after": 4.0554,
+    "remediation_actionable_count": 13
+  },
+  "F4_artifact_consistency": {
+    "status": "captured",
+    "artifacts": [
+      {
+        "label": "main_json",
+        "path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/agentfence_analyze-remediation_sandbox-cua-fresh_20260516T144201Z.json",
+        "exists_at_generation": true
+      },
+      {
+        "label": "main_markdown",
+        "path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/agentfence_analyze-remediation_sandbox-cua-fresh_20260516T144201Z.md",
+        "exists_at_generation": true
+      },
+      {
+        "label": "f1_f5_json",
+        "path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/agentfence_f1_f5_analyze-remediation_sandbox-cua-fresh_20260516T144201Z.json",
+        "exists_at_generation": true
+      },
+      {
+        "label": "f1_f5_markdown",
+        "path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/agentfence_f1_f5_analyze-remediation_sandbox-cua-fresh_20260516T144201Z.md",
+        "exists_at_generation": true
+      },
+      {
+        "label": "rollback_bundle",
+        "path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-cua-fresh_target-cua-868d864fbc-77phz_20260516T143445Z",
+        "exists_at_generation": true
+      }
+    ],
+    "backup_checkpoint": {
+      "status": "verified_with_warnings",
+      "bundle_dir": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-cua-fresh_target-cua-868d864fbc-77phz_20260516T143445Z",
+      "manifest_path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-cua-fresh_target-cua-868d864fbc-77phz_20260516T143445Z/backup_manifest.json",
+      "validation_report": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-cua-fresh_target-cua-868d864fbc-77phz_20260516T143445Z/validation_report.json",
+      "restore_script": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-cua-fresh_target-cua-868d864fbc-77phz_20260516T143445Z/restore.sh"
+    }
+  },
+  "F5_recoverability": {
+    "status": "restore_checkpoint_ready",
+    "health": {
+      "schema": "agentfence-remediation-apply-v1",
+      "status": "partial",
+      "dry_run": false,
+      "applied_count": 2,
+      "failed_count": 1,
+      "manual_count": 11,
+      "records": [
+        {
+          "kind": "node_sysctl_hardening",
+          "status": "not_applicable",
+          "reason": "node hardening preflight found all desired sysctl values already enabled; no node changes applied",
+          "node": "worker-cua-1.us-central1-a.c.asl-0502-093447.internal",
+          "probe_ids": [
+            "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE",
+            "AgentFence.KERNEL.DMESG_VISIBLE",
+            "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE",
+            "AgentFence.KERNEL.USERFAULTFD_REACHABLE"
+          ],
+          "unsafe_probe_ids": [],
+          "sysctls": {
+            "AgentFence.KERNEL.DMESG_VISIBLE": {
+              "sysctl": "kernel.dmesg_restrict",
+              "value": "1",
+              "title": "Restrict kernel dmesg"
+            },
+            "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": {
+              "sysctl": "kernel.perf_event_paranoid",
+              "value": "4",
+              "title": "Restrict perf_event_open"
+            },
+            "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE": {
+              "sysctl": "kernel.unprivileged_bpf_disabled",
+              "value": "2",
+              "title": "Disable unprivileged BPF"
+            },
+            "AgentFence.KERNEL.USERFAULTFD_REACHABLE": {
+              "sysctl": "vm.unprivileged_userfaultfd",
+              "value": "0",
+              "title": "Restrict unprivileged userfaultfd"
+            }
+          },
+          "sysctl_states": {
+            "kernel.dmesg_restrict": {
+              "current": "1"
+            },
+            "kernel.perf_event_paranoid": {
+              "current": "4"
+            },
+            "kernel.unprivileged_bpf_disabled": {
+              "current": "2"
+            },
+            "vm.unprivileged_userfaultfd": {
+              "current": "0"
+            }
+          },
+          "desired_values_met": {
+            "AgentFence.KERNEL.DMESG_VISIBLE": true,
+            "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": true,
+            "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE": true,
+            "AgentFence.KERNEL.USERFAULTFD_REACHABLE": true
+          },
+          "node_config_changed": false,
+          "node_config_already_hardened": true,
+          "preflight": {
+            "kind": "node_runtime_hardening_preflight",
+            "status": "already_hardened",
+            "node": "worker-cua-1.us-central1-a.c.asl-0502-093447.internal",
+            "runtime": {
+              "runtime_class": null,
+              "handler": "default",
+              "family": "runc"
+            },
+            "sysctls": {
+              "AgentFence.KERNEL.DMESG_VISIBLE": {
+                "sysctl": "kernel.dmesg_restrict",
+                "value": "1",
+                "title": "Restrict kernel dmesg"
+              },
+              "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": {
+                "sysctl": "kernel.perf_event_paranoid",
+                "value": "4",
+                "title": "Restrict perf_event_open"
+              },
+              "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE": {
+                "sysctl": "kernel.unprivileged_bpf_disabled",
+                "value": "2",
+                "title": "Disable unprivileged BPF"
+              },
+              "AgentFence.KERNEL.USERFAULTFD_REACHABLE": {
+                "sysctl": "vm.unprivileged_userfaultfd",
+                "value": "0",
+                "title": "Restrict unprivileged userfaultfd"
+              }
+            },
+            "sysctl_states": {
+              "kernel.dmesg_restrict": {
+                "current": "1"
+              },
+              "kernel.perf_event_paranoid": {
+                "current": "4"
+              },
+              "kernel.unprivileged_bpf_disabled": {
+                "current": "2"
+              },
+              "vm.unprivileged_userfaultfd": {
+                "current": "0"
+              }
+            },
+            "desired_values_met": {
+              "AgentFence.KERNEL.DMESG_VISIBLE": true,
+              "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": true,
+              "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE": true,
+              "AgentFence.KERNEL.USERFAULTFD_REACHABLE": true
+            },
+            "kata_guest_seccomp": {
+              "path": "",
+              "disable_guest_seccomp": "missing"
+            },
+            "changes_needed": false,
+            "change_reasons": [],
+            "node_runtime_command": {
+              "status": "complete",
+              "exit_code": 0,
+              "debug_pod": "node-debugger-worker-cua-1.us-central1-a.c.asl-0502-093447.internal-rpqx2",
+              "debug_pod_phase": "Succeeded",
+              "stdout": "Creating debugging pod node-debugger-worker-cua-1.us-central1-a.c.asl-0502-093447.internal-rpqx2 with container debugger on node worker-cua-1.us-central1-a.c.asl-0502-093447.internal.\n",
+              "stderr": "Warning: metadata.name: this is used in the Pod's hostname, which can result in surprising behavior; a DNS label is recommended: [must be no more than 63 characters must not contain dots]\n",
+              "logs": "AGENTFENCE_AUDIT_SYSCTL kernel.dmesg_restrict value=1\nAGENTFENCE_AUDIT_SYSCTL kernel.perf_event_paranoid value=4\nAGENTFENCE_AUDIT_SYSCTL kernel.unprivileged_bpf_disabled value=2\nAGENTFENCE_AUDIT_SYSCTL vm.unprivileged_userfaultfd value=0\nAGENTFENCE_AUDIT_KATA_CONFIG path= disable_guest_seccomp=missing\nAGENTFENCE_AUDIT_COMPLETE\n"
+            }
+          }
+        },
+        {
+          "kind": "workload_hardening_patch",
+          "stage": "seccomp_runtime_default",
+          "risk_level": "low",
+          "resource": "deployment",
+          "name": "target-cua",
+          "probe_ids": [
+            "AgentFence.IDENTITY.SECCOMP_BYPASS_OK"
+          ],
+          "artifact_kinds": [
+            "pod_security_context_patch"
+          ],
+          "workload": {
+            "target_pod": "target-cua-868d864fbc-77phz",
+            "target_container": "cua",
+            "service_account": "default",
+            "node": "worker-cua-1.us-central1-a.c.asl-0502-093447.internal",
+            "runtime_class": null,
+            "node_selector": {
+              "sandbox": "cua"
+            },
+            "workload": {
+              "kind": "Deployment",
+              "resource": "deployment",
+              "name": "target-cua"
+            },
+            "owner_chain": [
+              {
+                "kind": "ReplicaSet",
+                "name": "target-cua-868d864fbc"
+              },
+              {
+                "kind": "Deployment",
+                "name": "target-cua"
+              }
+            ],
+            "warnings": []
+          },
+          "workload_config_before": {
+            "schema": "agentfence-workload-config-before-autofix-v1",
+            "captured_at_utc": "2026-05-16T14:35:57.166747+00:00",
+            "namespace": "sandbox-cua-fresh",
+            "target_pod": "target-cua-868d864fbc-77phz",
+            "target_container": "cua",
+            "workload_reference": {
+              "target_pod": "target-cua-868d864fbc-77phz",
+              "target_container": "cua",
+              "service_account": "default",
+              "node": "worker-cua-1.us-central1-a.c.asl-0502-093447.internal",
+              "runtime_class": null,
+              "node_selector": {
+                "sandbox": "cua"
+              },
+              "workload": {
+                "kind": "Deployment",
+                "resource": "deployment",
+                "name": "target-cua"
+              },
+              "owner_chain": [
+                {
+                  "kind": "ReplicaSet",
+                  "name": "target-cua-868d864fbc"
+                },
+                {
+                  "kind": "Deployment",
+                  "name": "target-cua"
+                }
+              ],
+              "warnings": []
+            },
+            "workload_api_version": "apps/v1",
+            "workload_kind": "Deployment",
+            "workload_name": "target-cua",
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "app": "target-cua",
+                "role": "target"
+              }
+            },
+            "template_labels": {
+              "app": "target-cua",
+              "role": "target"
+            },
+            "service_account": "default",
+            "runtime_class": null,
+            "node_selector": {
+              "sandbox": "cua"
+            },
+            "pod_security_context": {},
+            "automount_service_account_token": null,
+            "containers": [
+              {
+                "name": "cua",
+                "image": "docker.io/trycua/cua-xfce@sha256:b4aae4f4a4092b1a1dda4157f863eebded72a2cd02e8d0667e1aba95ac82777e",
+                "ports": [
+                  {
+                    "containerPort": 5901,
+                    "name": "vnc",
+                    "protocol": "TCP"
+                  },
+                  {
+                    "containerPort": 6901,
+                    "name": "novnc",
+                    "protocol": "TCP"
+                  },
+                  {
+                    "containerPort": 8000,
+                    "name": "app",
+                    "protocol": "TCP"
+                  }
+                ],
+                "security_context": null,
+                "readiness_probe": {
+                  "failureThreshold": 12,
+                  "httpGet": {
+                    "path": "/",
+                    "port": 6901,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 20,
+                  "periodSeconds": 5,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "liveness_probe": {
+                  "failureThreshold": 6,
+                  "httpGet": {
+                    "path": "/",
+                    "port": 6901,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 30,
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                }
+              },
+              {
+                "name": "crewai-agent",
+                "image": "ghcr.io/farshadrahaei/crewai-sandbox-app:v1",
+                "ports": [
+                  {
+                    "containerPort": 8080,
+                    "name": "crewai",
+                    "protocol": "TCP"
+                  }
+                ],
+                "security_context": null,
+                "readiness_probe": {
+                  "failureThreshold": 3,
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": 8080,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 5,
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "liveness_probe": {
+                  "failureThreshold": 3,
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": 8080,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 15,
+                  "periodSeconds": 20,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                }
+              }
+            ],
+            "init_containers": [],
+            "pods_before": [
+              {
+                "name": "target-cua-868d864fbc-77phz",
+                "uid": "8a7df1ef-051a-4c6e-8fee-0f0ddc28da04",
+                "phase": "Running"
+              }
+            ],
+            "connectivity_expectations": [
+              {
+                "source_policy": "allow-llm-gateway-egress",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "protocol": "TCP",
+                "reason": "captured from concrete NetworkPolicy egress ipBlock before remediation"
+              }
+            ]
+          },
+          "patch": {
+            "spec": {
+              "template": {
+                "spec": {
+                  "securityContext": {
+                    "seccompProfile": {
+                      "type": "RuntimeDefault"
+                    }
+                  },
+                  "containers": [
+                    {
+                      "name": "cua",
+                      "securityContext": {
+                        "seccompProfile": {
+                          "type": "RuntimeDefault"
+                        }
+                      }
+                    },
+                    {
+                      "name": "crewai-agent",
+                      "securityContext": {
+                        "seccompProfile": {
+                          "type": "RuntimeDefault"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "status": "applied",
+          "kubectl": "deployment.apps/target-cua patched",
+          "changed": true,
+          "rollout_status": "complete",
+          "rollout_message": "Waiting for deployment \"target-cua\" rollout to finish: 1 old replicas are pending termination...\nWaiting for deployment \"target-cua\" rollout to finish: 1 old replicas are pending termination...\ndeployment \"target-cua\" successfully rolled out\n",
+          "workload_revalidation": {
+            "schema": "agentfence-workload-revalidation-v1",
+            "status": "healthy",
+            "healthy": true,
+            "resource": "deployment",
+            "name": "target-cua",
+            "expected_containers": [
+              "cua",
+              "crewai-agent"
+            ],
+            "requires_pod_recreation": true,
+            "rollout_status": "complete",
+            "rollout_message": "deployment \"target-cua\" successfully rolled out\n",
+            "target_refresh": {
+              "kind": "target_refresh",
+              "status": "updated",
+              "before": {
+                "target_pod": "target-cua-868d864fbc-77phz",
+                "target_container": "cua",
+                "target_ip": "192.168.8.210"
+              },
+              "after": {
+                "target_pod": "target-cua-775fcc9dc7-kx5rn",
+                "target_container": "cua",
+                "target_ip": "192.168.8.194"
+              }
+            },
+            "pod_count": 2,
+            "running_pod_count": 2,
+            "pod_recreated": true,
+            "container_readiness": [
+              {
+                "pod": "target-cua-775fcc9dc7-kx5rn",
+                "missing_containers": [],
+                "not_ready_containers": [],
+                "all_expected_ready": true
+              },
+              {
+                "pod": "target-cua-868d864fbc-77phz",
+                "missing_containers": [],
+                "not_ready_containers": [],
+                "all_expected_ready": true
+              }
+            ],
+            "connectivity_checks": [
+              {
+                "pod": "target-cua-775fcc9dc7-kx5rn",
+                "container": "crewai-agent",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "source_policy": "allow-llm-gateway-egress",
+                "status": "reachable",
+                "output": "OK"
+              },
+              {
+                "pod": "target-cua-775fcc9dc7-kx5rn",
+                "container": "cua",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "source_policy": "allow-llm-gateway-egress",
+                "status": "reachable",
+                "output": "OK"
+              }
+            ]
+          },
+          "runtime_seccomp_diagnostic": {
+            "schema": "agentfence-runtime-seccomp-diagnostic-v1",
+            "runtime": {
+              "runtime_class": null,
+              "handler": "default",
+              "family": "runc"
+            },
+            "pod_seccomp_profile": "RuntimeDefault",
+            "container_seccomp_profiles": {
+              "cua": "RuntimeDefault",
+              "crewai-agent": "RuntimeDefault"
+            },
+            "expected_containers": [
+              "cua",
+              "crewai-agent"
+            ],
+            "all_expected_containers_configured": true,
+            "process_seccomp_status": [
+              {
+                "pod": "target-cua-775fcc9dc7-kx5rn",
+                "container": "cua",
+                "status": "captured",
+                "seccomp_mode": 2,
+                "output": "CapBnd:\t00000000a80425fb\nNoNewPrivs:\t0\nSeccomp:\t2"
+              },
+              {
+                "pod": "target-cua-775fcc9dc7-kx5rn",
+                "container": "crewai-agent",
+                "status": "captured",
+                "seccomp_mode": 2,
+                "output": "CapBnd:\t00000000a80425fb\nNoNewPrivs:\t0\nSeccomp:\t2"
+              }
+            ],
+            "process_seccomp_active": true,
+            "gvisor_runtime_verified": false,
+            "runtime_config_required": false,
+            "node_config_changed": false,
+            "recommendation": ""
+          },
+          "verification": {
+            "status": "verified",
+            "probe_ids": [
+              "AgentFence.IDENTITY.SECCOMP_BYPASS_OK"
+            ],
+            "resolved_probe_ids": [
+              "AgentFence.IDENTITY.SECCOMP_BYPASS_OK"
+            ],
+            "still_unsafe_probe_ids": [],
+            "new_unsafe_probe_ids": [],
+            "score_raw_before": 16.5,
+            "score_raw_after": 15.5,
+            "changed": true
+          },
+          "resolved_probe_ids": [
+            "AgentFence.IDENTITY.SECCOMP_BYPASS_OK"
+          ]
+        },
+        {
+          "kind": "workload_hardening_patch",
+          "stage": "no_new_privileges",
+          "risk_level": "guarded",
+          "resource": "deployment",
+          "name": "target-cua",
+          "probe_ids": [
+            "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK"
+          ],
+          "artifact_kinds": [
+            "pod_security_context_patch"
+          ],
+          "workload": {
+            "target_pod": "target-cua-868d864fbc-77phz",
+            "target_container": "cua",
+            "service_account": "default",
+            "node": "worker-cua-1.us-central1-a.c.asl-0502-093447.internal",
+            "runtime_class": null,
+            "node_selector": {
+              "sandbox": "cua"
+            },
+            "workload": {
+              "kind": "Deployment",
+              "resource": "deployment",
+              "name": "target-cua"
+            },
+            "owner_chain": [
+              {
+                "kind": "ReplicaSet",
+                "name": "target-cua-868d864fbc"
+              },
+              {
+                "kind": "Deployment",
+                "name": "target-cua"
+              }
+            ],
+            "warnings": []
+          },
+          "workload_config_before": {
+            "schema": "agentfence-workload-config-before-autofix-v1",
+            "captured_at_utc": "2026-05-16T14:35:57.166747+00:00",
+            "namespace": "sandbox-cua-fresh",
+            "target_pod": "target-cua-868d864fbc-77phz",
+            "target_container": "cua",
+            "workload_reference": {
+              "target_pod": "target-cua-868d864fbc-77phz",
+              "target_container": "cua",
+              "service_account": "default",
+              "node": "worker-cua-1.us-central1-a.c.asl-0502-093447.internal",
+              "runtime_class": null,
+              "node_selector": {
+                "sandbox": "cua"
+              },
+              "workload": {
+                "kind": "Deployment",
+                "resource": "deployment",
+                "name": "target-cua"
+              },
+              "owner_chain": [
+                {
+                  "kind": "ReplicaSet",
+                  "name": "target-cua-868d864fbc"
+                },
+                {
+                  "kind": "Deployment",
+                  "name": "target-cua"
+                }
+              ],
+              "warnings": []
+            },
+            "workload_api_version": "apps/v1",
+            "workload_kind": "Deployment",
+            "workload_name": "target-cua",
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "app": "target-cua",
+                "role": "target"
+              }
+            },
+            "template_labels": {
+              "app": "target-cua",
+              "role": "target"
+            },
+            "service_account": "default",
+            "runtime_class": null,
+            "node_selector": {
+              "sandbox": "cua"
+            },
+            "pod_security_context": {},
+            "automount_service_account_token": null,
+            "containers": [
+              {
+                "name": "cua",
+                "image": "docker.io/trycua/cua-xfce@sha256:b4aae4f4a4092b1a1dda4157f863eebded72a2cd02e8d0667e1aba95ac82777e",
+                "ports": [
+                  {
+                    "containerPort": 5901,
+                    "name": "vnc",
+                    "protocol": "TCP"
+                  },
+                  {
+                    "containerPort": 6901,
+                    "name": "novnc",
+                    "protocol": "TCP"
+                  },
+                  {
+                    "containerPort": 8000,
+                    "name": "app",
+                    "protocol": "TCP"
+                  }
+                ],
+                "security_context": null,
+                "readiness_probe": {
+                  "failureThreshold": 12,
+                  "httpGet": {
+                    "path": "/",
+                    "port": 6901,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 20,
+                  "periodSeconds": 5,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "liveness_probe": {
+                  "failureThreshold": 6,
+                  "httpGet": {
+                    "path": "/",
+                    "port": 6901,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 30,
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                }
+              },
+              {
+                "name": "crewai-agent",
+                "image": "ghcr.io/farshadrahaei/crewai-sandbox-app:v1",
+                "ports": [
+                  {
+                    "containerPort": 8080,
+                    "name": "crewai",
+                    "protocol": "TCP"
+                  }
+                ],
+                "security_context": null,
+                "readiness_probe": {
+                  "failureThreshold": 3,
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": 8080,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 5,
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "liveness_probe": {
+                  "failureThreshold": 3,
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": 8080,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 15,
+                  "periodSeconds": 20,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                }
+              }
+            ],
+            "init_containers": [],
+            "pods_before": [
+              {
+                "name": "target-cua-868d864fbc-77phz",
+                "uid": "8a7df1ef-051a-4c6e-8fee-0f0ddc28da04",
+                "phase": "Running"
+              }
+            ],
+            "connectivity_expectations": [
+              {
+                "source_policy": "allow-llm-gateway-egress",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "protocol": "TCP",
+                "reason": "captured from concrete NetworkPolicy egress ipBlock before remediation"
+              }
+            ]
+          },
+          "patch": {
+            "spec": {
+              "template": {
+                "spec": {
+                  "containers": [
+                    {
+                      "name": "cua",
+                      "securityContext": {
+                        "allowPrivilegeEscalation": false
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "status": "applied",
+          "kubectl": "deployment.apps/target-cua patched",
+          "changed": true,
+          "rollout_status": "complete",
+          "rollout_message": "Waiting for deployment \"target-cua\" rollout to finish: 1 old replicas are pending termination...\nWaiting for deployment \"target-cua\" rollout to finish: 1 old replicas are pending termination...\ndeployment \"target-cua\" successfully rolled out\n",
+          "workload_revalidation": {
+            "schema": "agentfence-workload-revalidation-v1",
+            "status": "healthy",
+            "healthy": true,
+            "resource": "deployment",
+            "name": "target-cua",
+            "expected_containers": [
+              "cua",
+              "crewai-agent"
+            ],
+            "requires_pod_recreation": true,
+            "rollout_status": "complete",
+            "rollout_message": "deployment \"target-cua\" successfully rolled out\n",
+            "target_refresh": {
+              "kind": "target_refresh",
+              "status": "updated",
+              "before": {
+                "target_pod": "target-cua-775fcc9dc7-kx5rn",
+                "target_container": "cua",
+                "target_ip": "192.168.8.194"
+              },
+              "after": {
+                "target_pod": "target-cua-6495587c9c-chfgc",
+                "target_container": "cua",
+                "target_ip": "192.168.8.211"
+              }
+            },
+            "pod_count": 2,
+            "running_pod_count": 2,
+            "pod_recreated": true,
+            "container_readiness": [
+              {
+                "pod": "target-cua-6495587c9c-chfgc",
+                "missing_containers": [],
+                "not_ready_containers": [],
+                "all_expected_ready": true
+              },
+              {
+                "pod": "target-cua-775fcc9dc7-kx5rn",
+                "missing_containers": [],
+                "not_ready_containers": [],
+                "all_expected_ready": true
+              }
+            ],
+            "connectivity_checks": [
+              {
+                "pod": "target-cua-6495587c9c-chfgc",
+                "container": "crewai-agent",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "source_policy": "allow-llm-gateway-egress",
+                "status": "reachable",
+                "output": "OK"
+              },
+              {
+                "pod": "target-cua-6495587c9c-chfgc",
+                "container": "cua",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "source_policy": "allow-llm-gateway-egress",
+                "status": "reachable",
+                "output": "OK"
+              }
+            ]
+          },
+          "verification": {
+            "status": "verified",
+            "probe_ids": [
+              "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK"
+            ],
+            "resolved_probe_ids": [
+              "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK"
+            ],
+            "still_unsafe_probe_ids": [],
+            "new_unsafe_probe_ids": [],
+            "score_raw_before": 15.5,
+            "score_raw_after": 14.5,
+            "changed": true
+          },
+          "resolved_probe_ids": [
+            "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK"
+          ]
+        },
+        {
+          "kind": "workload_hardening_patch",
+          "stage": "capability_minimization",
+          "risk_level": "guarded",
+          "resource": "deployment",
+          "name": "target-cua",
+          "probe_ids": [
+            "AgentFence.DEVICE.RAW_SOCKET_USABLE",
+            "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE"
+          ],
+          "artifact_kinds": [
+            "capabilities_drop_patch",
+            "device_access_review_patch"
+          ],
+          "workload": {
+            "target_pod": "target-cua-868d864fbc-77phz",
+            "target_container": "cua",
+            "service_account": "default",
+            "node": "worker-cua-1.us-central1-a.c.asl-0502-093447.internal",
+            "runtime_class": null,
+            "node_selector": {
+              "sandbox": "cua"
+            },
+            "workload": {
+              "kind": "Deployment",
+              "resource": "deployment",
+              "name": "target-cua"
+            },
+            "owner_chain": [
+              {
+                "kind": "ReplicaSet",
+                "name": "target-cua-868d864fbc"
+              },
+              {
+                "kind": "Deployment",
+                "name": "target-cua"
+              }
+            ],
+            "warnings": []
+          },
+          "workload_config_before": {
+            "schema": "agentfence-workload-config-before-autofix-v1",
+            "captured_at_utc": "2026-05-16T14:35:57.166747+00:00",
+            "namespace": "sandbox-cua-fresh",
+            "target_pod": "target-cua-868d864fbc-77phz",
+            "target_container": "cua",
+            "workload_reference": {
+              "target_pod": "target-cua-868d864fbc-77phz",
+              "target_container": "cua",
+              "service_account": "default",
+              "node": "worker-cua-1.us-central1-a.c.asl-0502-093447.internal",
+              "runtime_class": null,
+              "node_selector": {
+                "sandbox": "cua"
+              },
+              "workload": {
+                "kind": "Deployment",
+                "resource": "deployment",
+                "name": "target-cua"
+              },
+              "owner_chain": [
+                {
+                  "kind": "ReplicaSet",
+                  "name": "target-cua-868d864fbc"
+                },
+                {
+                  "kind": "Deployment",
+                  "name": "target-cua"
+                }
+              ],
+              "warnings": []
+            },
+            "workload_api_version": "apps/v1",
+            "workload_kind": "Deployment",
+            "workload_name": "target-cua",
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "app": "target-cua",
+                "role": "target"
+              }
+            },
+            "template_labels": {
+              "app": "target-cua",
+              "role": "target"
+            },
+            "service_account": "default",
+            "runtime_class": null,
+            "node_selector": {
+              "sandbox": "cua"
+            },
+            "pod_security_context": {},
+            "automount_service_account_token": null,
+            "containers": [
+              {
+                "name": "cua",
+                "image": "docker.io/trycua/cua-xfce@sha256:b4aae4f4a4092b1a1dda4157f863eebded72a2cd02e8d0667e1aba95ac82777e",
+                "ports": [
+                  {
+                    "containerPort": 5901,
+                    "name": "vnc",
+                    "protocol": "TCP"
+                  },
+                  {
+                    "containerPort": 6901,
+                    "name": "novnc",
+                    "protocol": "TCP"
+                  },
+                  {
+                    "containerPort": 8000,
+                    "name": "app",
+                    "protocol": "TCP"
+                  }
+                ],
+                "security_context": null,
+                "readiness_probe": {
+                  "failureThreshold": 12,
+                  "httpGet": {
+                    "path": "/",
+                    "port": 6901,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 20,
+                  "periodSeconds": 5,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "liveness_probe": {
+                  "failureThreshold": 6,
+                  "httpGet": {
+                    "path": "/",
+                    "port": 6901,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 30,
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                }
+              },
+              {
+                "name": "crewai-agent",
+                "image": "ghcr.io/farshadrahaei/crewai-sandbox-app:v1",
+                "ports": [
+                  {
+                    "containerPort": 8080,
+                    "name": "crewai",
+                    "protocol": "TCP"
+                  }
+                ],
+                "security_context": null,
+                "readiness_probe": {
+                  "failureThreshold": 3,
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": 8080,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 5,
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "liveness_probe": {
+                  "failureThreshold": 3,
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": 8080,
+                    "scheme": "HTTP"
+                  },
+                  "initialDelaySeconds": 15,
+                  "periodSeconds": 20,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                }
+              }
+            ],
+            "init_containers": [],
+            "pods_before": [
+              {
+                "name": "target-cua-868d864fbc-77phz",
+                "uid": "8a7df1ef-051a-4c6e-8fee-0f0ddc28da04",
+                "phase": "Running"
+              }
+            ],
+            "connectivity_expectations": [
+              {
+                "source_policy": "allow-llm-gateway-egress",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "protocol": "TCP",
+                "reason": "captured from concrete NetworkPolicy egress ipBlock before remediation"
+              }
+            ]
+          },
+          "patch": {
+            "spec": {
+              "template": {
+                "spec": {
+                  "containers": [
+                    {
+                      "name": "cua",
+                      "securityContext": {
+                        "privileged": false,
+                        "capabilities": {
+                          "drop": [
+                            "ALL"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "status": "failed",
+          "phase": "rollout",
+          "kubectl": "deployment.apps/target-cua patched",
+          "rollout_status": "warning",
+          "rollout_message": "Waiting for deployment \"target-cua\" rollout to finish: 1 old replicas are pending termination...\n",
+          "rollback_attempted": true,
+          "rollback_status": "started",
+          "rollback_message": "deployment.apps/target-cua rolled back\n",
+          "workload_revalidation": {
+            "schema": "agentfence-workload-revalidation-v1",
+            "status": "unhealthy",
+            "healthy": false,
+            "resource": "deployment",
+            "name": "target-cua",
+            "expected_containers": [
+              "cua",
+              "crewai-agent"
+            ],
+            "requires_pod_recreation": false,
+            "rollout_status": "complete",
+            "rollout_message": "deployment \"target-cua\" successfully rolled out\n",
+            "target_refresh": {
+              "kind": "target_refresh",
+              "status": "unchanged",
+              "before": {
+                "target_pod": "target-cua-6495587c9c-chfgc",
+                "target_container": "cua",
+                "target_ip": "192.168.8.211"
+              },
+              "after": {
+                "target_pod": "target-cua-6495587c9c-chfgc",
+                "target_container": "cua",
+                "target_ip": "192.168.8.211"
+              }
+            },
+            "pod_count": 2,
+            "running_pod_count": 2,
+            "pod_recreated": true,
+            "container_readiness": [
+              {
+                "pod": "target-cua-6495587c9c-chfgc",
+                "missing_containers": [],
+                "not_ready_containers": [],
+                "all_expected_ready": true
+              },
+              {
+                "pod": "target-cua-8656b9f6f4-bkrmc",
+                "missing_containers": [],
+                "not_ready_containers": [
+                  "cua"
+                ],
+                "all_expected_ready": false
+              }
+            ],
+            "reason": "one or more expected containers were missing or not ready"
+          },
+          "verification": {
+            "status": "not_applicable",
+            "reason": "record status is failed"
+          },
+          "resolved_probe_ids": []
+        },
+        {
+          "kind": "compatibility_guard",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.ID.RUN_AS_UID_ZERO",
+          "title": "Run workload as non-root",
+          "action_type": "auto_fix",
+          "recommendation": "Generate a pod/container securityContext with runAsNonRoot and an explicit non-zero UID/GID.",
+          "reason": "mechanically patchable but unsafe to apply blindly; some images must start as root and drop privileges internally"
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.ID.ROOTFS_WRITE_OK",
+          "title": "Mount root filesystem read-only",
+          "action_type": "hybrid",
+          "recommendation": "Generate readOnlyRootFilesystem plus manual writable-path migration guidance."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE",
+          "title": "Review service reachability from sibling pods",
+          "action_type": "manual_recommendation",
+          "recommendation": "Inventory required callers, ports, and authentication expectations before applying least-privilege NetworkPolicy changes."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.FS.HOST_SYS_VISIBLE",
+          "title": "Prevent host /sys visibility",
+          "action_type": "hybrid",
+          "recommendation": "Generate hostPath/sysfs removal or read-only restriction guidance."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC",
+          "title": "Block host filesystem traversal through /proc",
+          "action_type": "hybrid",
+          "recommendation": "Generate hostPID false, hostPath removal, and containment validation steps."
+        },
+        {
+          "kind": "compatibility_guard",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.DEVICE.RAW_SOCKET_USABLE",
+          "title": "Drop raw socket capability",
+          "action_type": "auto_fix",
+          "recommendation": "Generate capability drop for NET_RAW.",
+          "reason": "mechanically patchable but unsafe to apply blindly; some images must start as root and drop privileges internally"
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT",
+          "title": "Review user namespace root mapping",
+          "action_type": "manual_recommendation",
+          "recommendation": "Generate runtime/user namespace remapping guidance and validation commands."
+        },
+        {
+          "kind": "compatibility_guard",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE",
+          "title": "Minimize Linux capability bounding set",
+          "action_type": "auto_fix",
+          "recommendation": "Generate capabilities.drop: [ALL] with explicit allowlist guidance.",
+          "reason": "mechanically patchable but unsafe to apply blindly; some images must start as root and drop privileges internally"
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.SIDE.HOST_DMI_LEAKED",
+          "title": "Mask host DMI information",
+          "action_type": "manual_recommendation",
+          "recommendation": "Generate sysfs/DMI masking or runtime isolation guidance."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE",
+          "title": "Assess high-resolution timer exposure",
+          "action_type": "manual_recommendation",
+          "recommendation": "Generate side-channel mitigation guidance, runtime selection notes, and workload-specific tradeoffs."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED",
+          "title": "Reduce cache topology leakage",
+          "action_type": "manual_recommendation",
+          "recommendation": "Generate runtime isolation and scheduling guidance; include residual-risk explanation."
+        }
+      ],
+      "note": "Automatic remediation applies bounded workload securityContext, seccomp RuntimeDefault, service-account, namespace-isolation, and NetworkPolicy changes; workload-level patches capture pre-fix config, require rollout/workload revalidation, then post-remediation analysis runs again."
+    },
+    "workload_revalidations": [
+      {
+        "schema": "agentfence-workload-revalidation-v1",
+        "status": "healthy",
+        "healthy": true,
+        "resource": "deployment",
+        "name": "target-cua",
+        "expected_containers": [
+          "cua",
+          "crewai-agent"
+        ],
+        "requires_pod_recreation": true,
+        "rollout_status": "complete",
+        "rollout_message": "deployment \"target-cua\" successfully rolled out\n",
+        "target_refresh": {
+          "kind": "target_refresh",
+          "status": "updated",
+          "before": {
+            "target_pod": "target-cua-868d864fbc-77phz",
+            "target_container": "cua",
+            "target_ip": "192.168.8.210"
+          },
+          "after": {
+            "target_pod": "target-cua-775fcc9dc7-kx5rn",
+            "target_container": "cua",
+            "target_ip": "192.168.8.194"
+          }
+        },
+        "pod_count": 2,
+        "running_pod_count": 2,
+        "pod_recreated": true,
+        "container_readiness": [
+          {
+            "pod": "target-cua-775fcc9dc7-kx5rn",
+            "missing_containers": [],
+            "not_ready_containers": [],
+            "all_expected_ready": true
+          },
+          {
+            "pod": "target-cua-868d864fbc-77phz",
+            "missing_containers": [],
+            "not_ready_containers": [],
+            "all_expected_ready": true
+          }
+        ],
+        "connectivity_checks": [
+          {
+            "pod": "target-cua-775fcc9dc7-kx5rn",
+            "container": "crewai-agent",
+            "host": "10.128.0.15",
+            "port": 31080,
+            "source_policy": "allow-llm-gateway-egress",
+            "status": "reachable",
+            "output": "OK"
+          },
+          {
+            "pod": "target-cua-775fcc9dc7-kx5rn",
+            "container": "cua",
+            "host": "10.128.0.15",
+            "port": 31080,
+            "source_policy": "allow-llm-gateway-egress",
+            "status": "reachable",
+            "output": "OK"
+          }
+        ]
+      },
+      {
+        "schema": "agentfence-workload-revalidation-v1",
+        "status": "healthy",
+        "healthy": true,
+        "resource": "deployment",
+        "name": "target-cua",
+        "expected_containers": [
+          "cua",
+          "crewai-agent"
+        ],
+        "requires_pod_recreation": true,
+        "rollout_status": "complete",
+        "rollout_message": "deployment \"target-cua\" successfully rolled out\n",
+        "target_refresh": {
+          "kind": "target_refresh",
+          "status": "updated",
+          "before": {
+            "target_pod": "target-cua-775fcc9dc7-kx5rn",
+            "target_container": "cua",
+            "target_ip": "192.168.8.194"
+          },
+          "after": {
+            "target_pod": "target-cua-6495587c9c-chfgc",
+            "target_container": "cua",
+            "target_ip": "192.168.8.211"
+          }
+        },
+        "pod_count": 2,
+        "running_pod_count": 2,
+        "pod_recreated": true,
+        "container_readiness": [
+          {
+            "pod": "target-cua-6495587c9c-chfgc",
+            "missing_containers": [],
+            "not_ready_containers": [],
+            "all_expected_ready": true
+          },
+          {
+            "pod": "target-cua-775fcc9dc7-kx5rn",
+            "missing_containers": [],
+            "not_ready_containers": [],
+            "all_expected_ready": true
+          }
+        ],
+        "connectivity_checks": [
+          {
+            "pod": "target-cua-6495587c9c-chfgc",
+            "container": "crewai-agent",
+            "host": "10.128.0.15",
+            "port": 31080,
+            "source_policy": "allow-llm-gateway-egress",
+            "status": "reachable",
+            "output": "OK"
+          },
+          {
+            "pod": "target-cua-6495587c9c-chfgc",
+            "container": "cua",
+            "host": "10.128.0.15",
+            "port": 31080,
+            "source_policy": "allow-llm-gateway-egress",
+            "status": "reachable",
+            "output": "OK"
+          }
+        ]
+      },
+      {
+        "schema": "agentfence-workload-revalidation-v1",
+        "status": "unhealthy",
+        "healthy": false,
+        "resource": "deployment",
+        "name": "target-cua",
+        "expected_containers": [
+          "cua",
+          "crewai-agent"
+        ],
+        "requires_pod_recreation": false,
+        "rollout_status": "complete",
+        "rollout_message": "deployment \"target-cua\" successfully rolled out\n",
+        "target_refresh": {
+          "kind": "target_refresh",
+          "status": "unchanged",
+          "before": {
+            "target_pod": "target-cua-6495587c9c-chfgc",
+            "target_container": "cua",
+            "target_ip": "192.168.8.211"
+          },
+          "after": {
+            "target_pod": "target-cua-6495587c9c-chfgc",
+            "target_container": "cua",
+            "target_ip": "192.168.8.211"
+          }
+        },
+        "pod_count": 2,
+        "running_pod_count": 2,
+        "pod_recreated": true,
+        "container_readiness": [
+          {
+            "pod": "target-cua-6495587c9c-chfgc",
+            "missing_containers": [],
+            "not_ready_containers": [],
+            "all_expected_ready": true
+          },
+          {
+            "pod": "target-cua-8656b9f6f4-bkrmc",
+            "missing_containers": [],
+            "not_ready_containers": [
+              "cua"
+            ],
+            "all_expected_ready": false
+          }
+        ],
+        "reason": "one or more expected containers were missing or not ready"
+      }
+    ],
+    "runtime_seccomp_diagnostics": [
+      {
+        "schema": "agentfence-runtime-seccomp-diagnostic-v1",
+        "runtime": {
+          "runtime_class": null,
+          "handler": "default",
+          "family": "runc"
+        },
+        "pod_seccomp_profile": "RuntimeDefault",
+        "container_seccomp_profiles": {
+          "cua": "RuntimeDefault",
+          "crewai-agent": "RuntimeDefault"
+        },
+        "expected_containers": [
+          "cua",
+          "crewai-agent"
+        ],
+        "all_expected_containers_configured": true,
+        "process_seccomp_status": [
+          {
+            "pod": "target-cua-775fcc9dc7-kx5rn",
+            "container": "cua",
+            "status": "captured",
+            "seccomp_mode": 2,
+            "output": "CapBnd:\t00000000a80425fb\nNoNewPrivs:\t0\nSeccomp:\t2"
+          },
+          {
+            "pod": "target-cua-775fcc9dc7-kx5rn",
+            "container": "crewai-agent",
+            "status": "captured",
+            "seccomp_mode": 2,
+            "output": "CapBnd:\t00000000a80425fb\nNoNewPrivs:\t0\nSeccomp:\t2"
+          }
+        ],
+        "process_seccomp_active": true,
+        "gvisor_runtime_verified": false,
+        "runtime_config_required": false,
+        "node_config_changed": false,
+        "recommendation": ""
+      }
+    ],
+    "rollback_bundle_recorded": true,
+    "rollback_bundle_path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-cua-fresh_target-cua-868d864fbc-77phz_20260516T143445Z",
+    "backup_status": "verified_with_warnings",
+    "restore_ready": true,
+    "pvc_data": {
+      "pvc_count": 0,
+      "pvc_names": [],
+      "data_status": "not_applicable",
+      "snapshot_api_available": false,
+      "warning": ""
+    },
+    "mutation_gate": {
+      "status": "open",
+      "reason": "restore checkpoint verified before remediation guidance was emitted"
+    },
+    "notes": ""
+  },
+  "base_result_counts": {
+    "pass": 13,
+    "fail": 26,
+    "skip": 0
+  }
+}

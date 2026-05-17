@@ -1,0 +1,1829 @@
+{
+  "schema": "agentfence-f1-f5-v2",
+  "status": "complete",
+  "generated_at_utc": "2026-05-16T16:18:18.194722+00:00",
+  "action": "analyze-remediation",
+  "namespace": "sandbox-kata-fresh",
+  "error": null,
+  "F1_runtime_placement": {
+    "status": "captured",
+    "target_pod": "target-kata-cb4f6fd97-sqv8t",
+    "target_container": "app",
+    "node": null,
+    "runtime_class": null,
+    "node_selector": null,
+    "attacker_pod": "attacker-kata-5674447fcd-p4sr8"
+  },
+  "F2_attack_path_containment": {
+    "status": "captured",
+    "source": "post_remediation",
+    "counts": {
+      "pass": 7,
+      "fail": 32,
+      "skip": 0
+    },
+    "unsafe_probe_ids": [
+      "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC",
+      "AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT",
+      "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK",
+      "AgentFence.SIDE.HOST_DMI_LEAKED",
+      "AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE",
+      "AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED"
+    ],
+    "review_only_probe_ids": [
+      "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE"
+    ],
+    "skipped_probe_ids": []
+  },
+  "F3_remediation_effectiveness": {
+    "status": "improved",
+    "metrics_before": {
+      "issue_count": 11,
+      "score_raw": 15.5,
+      "tbe_issue_count": 0,
+      "tbe_score_raw": 0,
+      "tbe_score_normalized": 0.0,
+      "catalog_max_tbe": 7.0,
+      "ele_issue_count": 11,
+      "ele_score_raw": 15.5,
+      "ele_score_normalized": 2.3134,
+      "catalog_max_ele": 67.0,
+      "score_normalized": 0.9254,
+      "headline_alpha": 0.6,
+      "catalog_version": "1.3.0",
+      "by_severity": {
+        "high": 3,
+        "medium": 5,
+        "low": 3
+      },
+      "skipped": []
+    },
+    "metrics_after": {
+      "issue_count": 6,
+      "score_raw": 4.5,
+      "tbe_issue_count": 0,
+      "tbe_score_raw": 0,
+      "tbe_score_normalized": 0.0,
+      "catalog_max_tbe": 7.0,
+      "ele_issue_count": 6,
+      "ele_score_raw": 4.5,
+      "ele_score_normalized": 0.6716,
+      "catalog_max_ele": 67.0,
+      "score_normalized": 0.2687,
+      "headline_alpha": 0.6,
+      "catalog_version": "1.3.0",
+      "by_severity": {
+        "medium": 3,
+        "low": 3
+      },
+      "skipped": []
+    },
+    "issue_count_before": 11,
+    "issue_count_after": 6,
+    "headline_before": 0.9254,
+    "headline_after": 0.2687,
+    "remediation_actionable_count": 12
+  },
+  "F4_artifact_consistency": {
+    "status": "captured",
+    "artifacts": [
+      {
+        "label": "main_json",
+        "path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/agentfence_analyze-remediation_sandbox-kata-fresh_20260516T161818Z.json",
+        "exists_at_generation": true
+      },
+      {
+        "label": "main_markdown",
+        "path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/agentfence_analyze-remediation_sandbox-kata-fresh_20260516T161818Z.md",
+        "exists_at_generation": true
+      },
+      {
+        "label": "f1_f5_json",
+        "path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/agentfence_f1_f5_analyze-remediation_sandbox-kata-fresh_20260516T161818Z.json",
+        "exists_at_generation": true
+      },
+      {
+        "label": "f1_f5_markdown",
+        "path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/agentfence_f1_f5_analyze-remediation_sandbox-kata-fresh_20260516T161818Z.md",
+        "exists_at_generation": true
+      },
+      {
+        "label": "rollback_bundle",
+        "path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-kata-fresh_target-kata-cb4f6fd97-sqv8t_20260516T154048Z",
+        "exists_at_generation": true
+      }
+    ],
+    "backup_checkpoint": {
+      "status": "verified_with_warnings",
+      "bundle_dir": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-kata-fresh_target-kata-cb4f6fd97-sqv8t_20260516T154048Z",
+      "manifest_path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-kata-fresh_target-kata-cb4f6fd97-sqv8t_20260516T154048Z/backup_manifest.json",
+      "validation_report": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-kata-fresh_target-kata-cb4f6fd97-sqv8t_20260516T154048Z/validation_report.json",
+      "restore_script": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-kata-fresh_target-kata-cb4f6fd97-sqv8t_20260516T154048Z/restore.sh"
+    }
+  },
+  "F5_recoverability": {
+    "status": "restore_checkpoint_ready",
+    "health": {
+      "schema": "agentfence-remediation-apply-v1",
+      "status": "partial",
+      "dry_run": false,
+      "applied_count": 3,
+      "failed_count": 2,
+      "manual_count": 10,
+      "records": [
+        {
+          "kind": "node_sysctl_hardening",
+          "status": "not_applicable",
+          "reason": "node hardening preflight found all desired sysctl values already enabled; no node changes applied",
+          "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+          "probe_ids": [
+            "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE",
+            "AgentFence.KERNEL.DMESG_VISIBLE",
+            "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE",
+            "AgentFence.KERNEL.USERFAULTFD_REACHABLE"
+          ],
+          "unsafe_probe_ids": [
+            "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE",
+            "AgentFence.KERNEL.DMESG_VISIBLE",
+            "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE"
+          ],
+          "sysctls": {
+            "AgentFence.KERNEL.DMESG_VISIBLE": {
+              "sysctl": "kernel.dmesg_restrict",
+              "value": "1",
+              "title": "Restrict kernel dmesg"
+            },
+            "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": {
+              "sysctl": "kernel.perf_event_paranoid",
+              "value": "4",
+              "title": "Restrict perf_event_open"
+            },
+            "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE": {
+              "sysctl": "kernel.unprivileged_bpf_disabled",
+              "value": "2",
+              "title": "Disable unprivileged BPF"
+            },
+            "AgentFence.KERNEL.USERFAULTFD_REACHABLE": {
+              "sysctl": "vm.unprivileged_userfaultfd",
+              "value": "0",
+              "title": "Restrict unprivileged userfaultfd"
+            }
+          },
+          "sysctl_states": {
+            "kernel.dmesg_restrict": {
+              "current": "1"
+            },
+            "kernel.perf_event_paranoid": {
+              "current": "4"
+            },
+            "kernel.unprivileged_bpf_disabled": {
+              "current": "2"
+            },
+            "vm.unprivileged_userfaultfd": {
+              "current": "0"
+            }
+          },
+          "desired_values_met": {
+            "AgentFence.KERNEL.DMESG_VISIBLE": true,
+            "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": true,
+            "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE": true,
+            "AgentFence.KERNEL.USERFAULTFD_REACHABLE": true
+          },
+          "node_config_changed": false,
+          "node_config_already_hardened": true,
+          "preflight": {
+            "kind": "node_runtime_hardening_preflight",
+            "status": "already_hardened",
+            "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+            "runtime": {
+              "runtime_class": "kata-qemu",
+              "handler": "kata-qemu",
+              "family": "kata"
+            },
+            "sysctls": {
+              "AgentFence.KERNEL.DMESG_VISIBLE": {
+                "sysctl": "kernel.dmesg_restrict",
+                "value": "1",
+                "title": "Restrict kernel dmesg"
+              },
+              "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": {
+                "sysctl": "kernel.perf_event_paranoid",
+                "value": "4",
+                "title": "Restrict perf_event_open"
+              },
+              "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE": {
+                "sysctl": "kernel.unprivileged_bpf_disabled",
+                "value": "2",
+                "title": "Disable unprivileged BPF"
+              },
+              "AgentFence.KERNEL.USERFAULTFD_REACHABLE": {
+                "sysctl": "vm.unprivileged_userfaultfd",
+                "value": "0",
+                "title": "Restrict unprivileged userfaultfd"
+              }
+            },
+            "sysctl_states": {
+              "kernel.dmesg_restrict": {
+                "current": "1"
+              },
+              "kernel.perf_event_paranoid": {
+                "current": "4"
+              },
+              "kernel.unprivileged_bpf_disabled": {
+                "current": "2"
+              },
+              "vm.unprivileged_userfaultfd": {
+                "current": "0"
+              }
+            },
+            "desired_values_met": {
+              "AgentFence.KERNEL.DMESG_VISIBLE": true,
+              "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": true,
+              "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE": true,
+              "AgentFence.KERNEL.USERFAULTFD_REACHABLE": true
+            },
+            "kata_guest_seccomp": {
+              "path": "/opt/kata/share/defaults/kata-containers/runtimes/qemu/configuration-qemu.toml",
+              "disable_guest_seccomp": "false"
+            },
+            "changes_needed": false,
+            "change_reasons": [],
+            "node_runtime_command": {
+              "status": "complete",
+              "exit_code": 0,
+              "debug_pod": "node-debugger-worker-kata-1.us-central1-a.c.asl-0502-093447.internal-9vf2w",
+              "debug_pod_phase": "Succeeded",
+              "stdout": "Creating debugging pod node-debugger-worker-kata-1.us-central1-a.c.asl-0502-093447.internal-9vf2w with container debugger on node worker-kata-1.us-central1-a.c.asl-0502-093447.internal.\n",
+              "stderr": "Warning: metadata.name: this is used in the Pod's hostname, which can result in surprising behavior; a DNS label is recommended: [must be no more than 63 characters must not contain dots]\n",
+              "logs": "AGENTFENCE_AUDIT_SYSCTL kernel.dmesg_restrict value=1\nAGENTFENCE_AUDIT_SYSCTL kernel.perf_event_paranoid value=4\nAGENTFENCE_AUDIT_SYSCTL kernel.unprivileged_bpf_disabled value=2\nAGENTFENCE_AUDIT_SYSCTL vm.unprivileged_userfaultfd value=0\nAGENTFENCE_AUDIT_KATA_CONFIG path=/opt/kata/share/defaults/kata-containers/runtimes/qemu/configuration-qemu.toml disable_guest_seccomp=false\nAGENTFENCE_AUDIT_COMPLETE\n"
+            }
+          }
+        },
+        {
+          "kind": "workload_hardening_patch",
+          "stage": "seccomp_runtime_default",
+          "risk_level": "low",
+          "resource": "deployment",
+          "name": "target-kata",
+          "probe_ids": [
+            "AgentFence.IDENTITY.SECCOMP_BYPASS_OK"
+          ],
+          "artifact_kinds": [
+            "pod_security_context_patch"
+          ],
+          "workload": {
+            "target_pod": "target-kata-cb4f6fd97-sqv8t",
+            "target_container": "app",
+            "service_account": "default",
+            "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+            "runtime_class": "kata-qemu",
+            "node_selector": {
+              "katacontainers.io/kata-runtime": "true",
+              "sandbox": "kata"
+            },
+            "workload": {
+              "kind": "Deployment",
+              "resource": "deployment",
+              "name": "target-kata"
+            },
+            "owner_chain": [
+              {
+                "kind": "ReplicaSet",
+                "name": "target-kata-cb4f6fd97"
+              },
+              {
+                "kind": "Deployment",
+                "name": "target-kata"
+              }
+            ],
+            "warnings": []
+          },
+          "workload_config_before": {
+            "schema": "agentfence-workload-config-before-autofix-v1",
+            "captured_at_utc": "2026-05-16T15:41:29.372892+00:00",
+            "namespace": "sandbox-kata-fresh",
+            "target_pod": "target-kata-cb4f6fd97-sqv8t",
+            "target_container": "app",
+            "workload_reference": {
+              "target_pod": "target-kata-cb4f6fd97-sqv8t",
+              "target_container": "app",
+              "service_account": "default",
+              "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+              "runtime_class": "kata-qemu",
+              "node_selector": {
+                "katacontainers.io/kata-runtime": "true",
+                "sandbox": "kata"
+              },
+              "workload": {
+                "kind": "Deployment",
+                "resource": "deployment",
+                "name": "target-kata"
+              },
+              "owner_chain": [
+                {
+                  "kind": "ReplicaSet",
+                  "name": "target-kata-cb4f6fd97"
+                },
+                {
+                  "kind": "Deployment",
+                  "name": "target-kata"
+                }
+              ],
+              "warnings": []
+            },
+            "workload_api_version": "apps/v1",
+            "workload_kind": "Deployment",
+            "workload_name": "target-kata",
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "app": "target-kata",
+                "role": "target"
+              }
+            },
+            "template_labels": {
+              "app": "target-kata",
+              "role": "target"
+            },
+            "service_account": "default",
+            "runtime_class": "kata-qemu",
+            "node_selector": {
+              "sandbox": "kata"
+            },
+            "pod_security_context": {},
+            "automount_service_account_token": null,
+            "containers": [
+              {
+                "name": "app",
+                "image": "ghcr.io/farshadrahaei/crewai-sandbox-app:v1",
+                "ports": [
+                  {
+                    "containerPort": 8000,
+                    "protocol": "TCP"
+                  }
+                ],
+                "security_context": null,
+                "readiness_probe": null,
+                "liveness_probe": null
+              }
+            ],
+            "init_containers": [],
+            "pods_before": [
+              {
+                "name": "target-kata-cb4f6fd97-sqv8t",
+                "uid": "33edb0b3-4417-40e9-b319-34c937796809",
+                "phase": "Running"
+              }
+            ],
+            "connectivity_expectations": [
+              {
+                "source_policy": "allow-llm-gateway-egress",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "protocol": "TCP",
+                "reason": "captured from concrete NetworkPolicy egress ipBlock before remediation"
+              }
+            ]
+          },
+          "patch": {
+            "spec": {
+              "template": {
+                "spec": {
+                  "securityContext": {
+                    "seccompProfile": {
+                      "type": "RuntimeDefault"
+                    }
+                  },
+                  "containers": [
+                    {
+                      "name": "app",
+                      "securityContext": {
+                        "seccompProfile": {
+                          "type": "RuntimeDefault"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "status": "applied",
+          "kubectl": "deployment.apps/target-kata patched",
+          "changed": true,
+          "rollout_status": "complete",
+          "rollout_message": "Waiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\nWaiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\ndeployment \"target-kata\" successfully rolled out\n",
+          "workload_revalidation": {
+            "schema": "agentfence-workload-revalidation-v1",
+            "status": "healthy",
+            "healthy": true,
+            "resource": "deployment",
+            "name": "target-kata",
+            "expected_containers": [
+              "app"
+            ],
+            "requires_pod_recreation": true,
+            "rollout_status": "complete",
+            "rollout_message": "deployment \"target-kata\" successfully rolled out\n",
+            "target_refresh": {
+              "kind": "target_refresh",
+              "status": "updated",
+              "before": {
+                "target_pod": "target-kata-cb4f6fd97-sqv8t",
+                "target_container": "app",
+                "target_ip": "192.168.192.132"
+              },
+              "after": {
+                "target_pod": "target-kata-56c48f76f4-2b7rw",
+                "target_container": "app",
+                "target_ip": "192.168.192.134"
+              }
+            },
+            "pod_count": 1,
+            "running_pod_count": 1,
+            "pod_recreated": true,
+            "container_readiness": [
+              {
+                "pod": "target-kata-56c48f76f4-2b7rw",
+                "missing_containers": [],
+                "not_ready_containers": [],
+                "all_expected_ready": true
+              }
+            ],
+            "connectivity_checks": [
+              {
+                "pod": "target-kata-56c48f76f4-2b7rw",
+                "container": "app",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "source_policy": "allow-llm-gateway-egress",
+                "status": "reachable",
+                "output": "OK"
+              }
+            ]
+          },
+          "runtime_seccomp_diagnostic": {
+            "schema": "agentfence-runtime-seccomp-diagnostic-v1",
+            "runtime": {
+              "runtime_class": "kata-qemu",
+              "handler": "kata-qemu",
+              "family": "kata"
+            },
+            "pod_seccomp_profile": "RuntimeDefault",
+            "container_seccomp_profiles": {
+              "app": "RuntimeDefault"
+            },
+            "expected_containers": [
+              "app"
+            ],
+            "all_expected_containers_configured": true,
+            "process_seccomp_status": [
+              {
+                "pod": "target-kata-56c48f76f4-2b7rw",
+                "container": "app",
+                "status": "captured",
+                "seccomp_mode": 2,
+                "output": "CapBnd:\t00000000a80425fb\nNoNewPrivs:\t0\nSeccomp:\t2"
+              }
+            ],
+            "process_seccomp_active": true,
+            "gvisor_runtime_verified": false,
+            "runtime_config_required": false,
+            "node_config_changed": false,
+            "recommendation": "Kata accepted the workload seccomp profile but did not expose active process seccomp. Enable guest seccomp for the Kata runtime, for example set disable_guest_seccomp = false in the active Kata configuration for this handler, restart the runtime/containerd path, then recreate the workload pods and rerun AgentFence."
+          },
+          "verification": {
+            "status": "verified",
+            "probe_ids": [
+              "AgentFence.IDENTITY.SECCOMP_BYPASS_OK"
+            ],
+            "resolved_probe_ids": [
+              "AgentFence.IDENTITY.SECCOMP_BYPASS_OK"
+            ],
+            "still_unsafe_probe_ids": [],
+            "new_unsafe_probe_ids": [],
+            "score_raw_before": 15.5,
+            "score_raw_after": 5.5,
+            "changed": true
+          },
+          "resolved_probe_ids": [
+            "AgentFence.IDENTITY.SECCOMP_BYPASS_OK"
+          ]
+        },
+        {
+          "kind": "workload_hardening_patch",
+          "stage": "no_new_privileges",
+          "risk_level": "guarded",
+          "resource": "deployment",
+          "name": "target-kata",
+          "probe_ids": [
+            "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK"
+          ],
+          "artifact_kinds": [
+            "pod_security_context_patch"
+          ],
+          "workload": {
+            "target_pod": "target-kata-cb4f6fd97-sqv8t",
+            "target_container": "app",
+            "service_account": "default",
+            "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+            "runtime_class": "kata-qemu",
+            "node_selector": {
+              "katacontainers.io/kata-runtime": "true",
+              "sandbox": "kata"
+            },
+            "workload": {
+              "kind": "Deployment",
+              "resource": "deployment",
+              "name": "target-kata"
+            },
+            "owner_chain": [
+              {
+                "kind": "ReplicaSet",
+                "name": "target-kata-cb4f6fd97"
+              },
+              {
+                "kind": "Deployment",
+                "name": "target-kata"
+              }
+            ],
+            "warnings": []
+          },
+          "workload_config_before": {
+            "schema": "agentfence-workload-config-before-autofix-v1",
+            "captured_at_utc": "2026-05-16T15:41:29.372892+00:00",
+            "namespace": "sandbox-kata-fresh",
+            "target_pod": "target-kata-cb4f6fd97-sqv8t",
+            "target_container": "app",
+            "workload_reference": {
+              "target_pod": "target-kata-cb4f6fd97-sqv8t",
+              "target_container": "app",
+              "service_account": "default",
+              "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+              "runtime_class": "kata-qemu",
+              "node_selector": {
+                "katacontainers.io/kata-runtime": "true",
+                "sandbox": "kata"
+              },
+              "workload": {
+                "kind": "Deployment",
+                "resource": "deployment",
+                "name": "target-kata"
+              },
+              "owner_chain": [
+                {
+                  "kind": "ReplicaSet",
+                  "name": "target-kata-cb4f6fd97"
+                },
+                {
+                  "kind": "Deployment",
+                  "name": "target-kata"
+                }
+              ],
+              "warnings": []
+            },
+            "workload_api_version": "apps/v1",
+            "workload_kind": "Deployment",
+            "workload_name": "target-kata",
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "app": "target-kata",
+                "role": "target"
+              }
+            },
+            "template_labels": {
+              "app": "target-kata",
+              "role": "target"
+            },
+            "service_account": "default",
+            "runtime_class": "kata-qemu",
+            "node_selector": {
+              "sandbox": "kata"
+            },
+            "pod_security_context": {},
+            "automount_service_account_token": null,
+            "containers": [
+              {
+                "name": "app",
+                "image": "ghcr.io/farshadrahaei/crewai-sandbox-app:v1",
+                "ports": [
+                  {
+                    "containerPort": 8000,
+                    "protocol": "TCP"
+                  }
+                ],
+                "security_context": null,
+                "readiness_probe": null,
+                "liveness_probe": null
+              }
+            ],
+            "init_containers": [],
+            "pods_before": [
+              {
+                "name": "target-kata-cb4f6fd97-sqv8t",
+                "uid": "33edb0b3-4417-40e9-b319-34c937796809",
+                "phase": "Running"
+              }
+            ],
+            "connectivity_expectations": [
+              {
+                "source_policy": "allow-llm-gateway-egress",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "protocol": "TCP",
+                "reason": "captured from concrete NetworkPolicy egress ipBlock before remediation"
+              }
+            ]
+          },
+          "patch": {
+            "spec": {
+              "template": {
+                "spec": {
+                  "containers": [
+                    {
+                      "name": "app",
+                      "securityContext": {
+                        "allowPrivilegeEscalation": false
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "status": "rolled_back",
+          "kubectl": "deployment.apps/target-kata patched",
+          "changed": true,
+          "rollout_status": "complete",
+          "rollout_message": "Waiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\nWaiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\ndeployment \"target-kata\" successfully rolled out\n",
+          "workload_revalidation": {
+            "schema": "agentfence-workload-revalidation-v1",
+            "status": "healthy",
+            "healthy": true,
+            "resource": "deployment",
+            "name": "target-kata",
+            "expected_containers": [
+              "app"
+            ],
+            "requires_pod_recreation": true,
+            "rollout_status": "complete",
+            "rollout_message": "deployment \"target-kata\" successfully rolled out\n",
+            "target_refresh": {
+              "kind": "target_refresh",
+              "status": "updated",
+              "before": {
+                "target_pod": "target-kata-56c48f76f4-2b7rw",
+                "target_container": "app",
+                "target_ip": "192.168.192.134"
+              },
+              "after": {
+                "target_pod": "target-kata-84fd8bc754-sfz8m",
+                "target_container": "app",
+                "target_ip": "192.168.192.129"
+              }
+            },
+            "pod_count": 1,
+            "running_pod_count": 1,
+            "pod_recreated": true,
+            "container_readiness": [
+              {
+                "pod": "target-kata-84fd8bc754-sfz8m",
+                "missing_containers": [],
+                "not_ready_containers": [],
+                "all_expected_ready": true
+              }
+            ],
+            "connectivity_checks": [
+              {
+                "pod": "target-kata-84fd8bc754-sfz8m",
+                "container": "app",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "source_policy": "allow-llm-gateway-egress",
+                "status": "reachable",
+                "output": "OK"
+              }
+            ]
+          },
+          "verification": {
+            "status": "rolled_back",
+            "probe_ids": [
+              "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK"
+            ],
+            "resolved_probe_ids": [],
+            "still_unsafe_probe_ids": [
+              "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK"
+            ],
+            "new_unsafe_probe_ids": [],
+            "score_raw_before": 5.5,
+            "score_raw_after": 5.5,
+            "changed": true,
+            "rollback_reasons": [
+              "related probes did not improve"
+            ],
+            "rollback": {
+              "status": "complete",
+              "undo": "deployment.apps/target-kata rolled back",
+              "rollout": "Waiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\nWaiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\ndeployment \"target-kata\" successfully rolled out\n"
+            }
+          },
+          "resolved_probe_ids": [],
+          "target_refresh_after_rollback": {
+            "kind": "target_refresh",
+            "status": "updated",
+            "before": {
+              "target_pod": "target-kata-84fd8bc754-sfz8m",
+              "target_container": "app",
+              "target_ip": "192.168.192.129"
+            },
+            "after": {
+              "target_pod": "target-kata-56c48f76f4-lvgnc",
+              "target_container": "app",
+              "target_ip": "192.168.192.136"
+            }
+          }
+        },
+        {
+          "kind": "workload_hardening_patch",
+          "stage": "capability_minimization",
+          "risk_level": "guarded",
+          "resource": "deployment",
+          "name": "target-kata",
+          "probe_ids": [
+            "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE"
+          ],
+          "artifact_kinds": [
+            "capabilities_drop_patch",
+            "device_access_review_patch"
+          ],
+          "workload": {
+            "target_pod": "target-kata-cb4f6fd97-sqv8t",
+            "target_container": "app",
+            "service_account": "default",
+            "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+            "runtime_class": "kata-qemu",
+            "node_selector": {
+              "katacontainers.io/kata-runtime": "true",
+              "sandbox": "kata"
+            },
+            "workload": {
+              "kind": "Deployment",
+              "resource": "deployment",
+              "name": "target-kata"
+            },
+            "owner_chain": [
+              {
+                "kind": "ReplicaSet",
+                "name": "target-kata-cb4f6fd97"
+              },
+              {
+                "kind": "Deployment",
+                "name": "target-kata"
+              }
+            ],
+            "warnings": []
+          },
+          "workload_config_before": {
+            "schema": "agentfence-workload-config-before-autofix-v1",
+            "captured_at_utc": "2026-05-16T15:41:29.372892+00:00",
+            "namespace": "sandbox-kata-fresh",
+            "target_pod": "target-kata-cb4f6fd97-sqv8t",
+            "target_container": "app",
+            "workload_reference": {
+              "target_pod": "target-kata-cb4f6fd97-sqv8t",
+              "target_container": "app",
+              "service_account": "default",
+              "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+              "runtime_class": "kata-qemu",
+              "node_selector": {
+                "katacontainers.io/kata-runtime": "true",
+                "sandbox": "kata"
+              },
+              "workload": {
+                "kind": "Deployment",
+                "resource": "deployment",
+                "name": "target-kata"
+              },
+              "owner_chain": [
+                {
+                  "kind": "ReplicaSet",
+                  "name": "target-kata-cb4f6fd97"
+                },
+                {
+                  "kind": "Deployment",
+                  "name": "target-kata"
+                }
+              ],
+              "warnings": []
+            },
+            "workload_api_version": "apps/v1",
+            "workload_kind": "Deployment",
+            "workload_name": "target-kata",
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "app": "target-kata",
+                "role": "target"
+              }
+            },
+            "template_labels": {
+              "app": "target-kata",
+              "role": "target"
+            },
+            "service_account": "default",
+            "runtime_class": "kata-qemu",
+            "node_selector": {
+              "sandbox": "kata"
+            },
+            "pod_security_context": {},
+            "automount_service_account_token": null,
+            "containers": [
+              {
+                "name": "app",
+                "image": "ghcr.io/farshadrahaei/crewai-sandbox-app:v1",
+                "ports": [
+                  {
+                    "containerPort": 8000,
+                    "protocol": "TCP"
+                  }
+                ],
+                "security_context": null,
+                "readiness_probe": null,
+                "liveness_probe": null
+              }
+            ],
+            "init_containers": [],
+            "pods_before": [
+              {
+                "name": "target-kata-cb4f6fd97-sqv8t",
+                "uid": "33edb0b3-4417-40e9-b319-34c937796809",
+                "phase": "Running"
+              }
+            ],
+            "connectivity_expectations": [
+              {
+                "source_policy": "allow-llm-gateway-egress",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "protocol": "TCP",
+                "reason": "captured from concrete NetworkPolicy egress ipBlock before remediation"
+              }
+            ]
+          },
+          "patch": {
+            "spec": {
+              "template": {
+                "spec": {
+                  "containers": [
+                    {
+                      "name": "app",
+                      "securityContext": {
+                        "privileged": false,
+                        "capabilities": {
+                          "drop": [
+                            "ALL"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "status": "rolled_back",
+          "kubectl": "deployment.apps/target-kata patched",
+          "changed": true,
+          "rollout_status": "complete",
+          "rollout_message": "Waiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\nWaiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\ndeployment \"target-kata\" successfully rolled out\n",
+          "workload_revalidation": {
+            "schema": "agentfence-workload-revalidation-v1",
+            "status": "healthy",
+            "healthy": true,
+            "resource": "deployment",
+            "name": "target-kata",
+            "expected_containers": [
+              "app"
+            ],
+            "requires_pod_recreation": true,
+            "rollout_status": "complete",
+            "rollout_message": "deployment \"target-kata\" successfully rolled out\n",
+            "target_refresh": {
+              "kind": "target_refresh",
+              "status": "updated",
+              "before": {
+                "target_pod": "target-kata-56c48f76f4-lvgnc",
+                "target_container": "app",
+                "target_ip": "192.168.192.136"
+              },
+              "after": {
+                "target_pod": "target-kata-7b74c56d7c-fjvgx",
+                "target_container": "app",
+                "target_ip": "192.168.192.133"
+              }
+            },
+            "pod_count": 1,
+            "running_pod_count": 1,
+            "pod_recreated": true,
+            "container_readiness": [
+              {
+                "pod": "target-kata-7b74c56d7c-fjvgx",
+                "missing_containers": [],
+                "not_ready_containers": [],
+                "all_expected_ready": true
+              }
+            ],
+            "connectivity_checks": [
+              {
+                "pod": "target-kata-7b74c56d7c-fjvgx",
+                "container": "app",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "source_policy": "allow-llm-gateway-egress",
+                "status": "reachable",
+                "output": "OK"
+              }
+            ]
+          },
+          "verification": {
+            "status": "rolled_back",
+            "probe_ids": [
+              "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE"
+            ],
+            "resolved_probe_ids": [],
+            "still_unsafe_probe_ids": [],
+            "new_unsafe_probe_ids": [
+              "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC",
+              "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK",
+              "AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT",
+              "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE",
+              "AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE",
+              "AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED"
+            ],
+            "score_raw_before": 9.0,
+            "score_raw_after": 4.5,
+            "changed": true,
+            "rollback_reasons": [
+              "new unsafe probes appeared"
+            ],
+            "rollback": {
+              "status": "complete",
+              "undo": "deployment.apps/target-kata rolled back",
+              "rollout": "Waiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\nWaiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\ndeployment \"target-kata\" successfully rolled out\n"
+            }
+          },
+          "resolved_probe_ids": [],
+          "target_refresh_after_rollback": {
+            "kind": "target_refresh",
+            "status": "updated",
+            "before": {
+              "target_pod": "target-kata-7b74c56d7c-fjvgx",
+              "target_container": "app",
+              "target_ip": "192.168.192.133"
+            },
+            "after": {
+              "target_pod": "target-kata-56c48f76f4-5f5xn",
+              "target_container": "app",
+              "target_ip": "192.168.192.135"
+            }
+          }
+        },
+        {
+          "kind": "workload_hardening_patch",
+          "stage": "kernel_surface_hardening",
+          "risk_level": "guarded",
+          "resource": "deployment",
+          "name": "target-kata",
+          "probe_ids": [
+            "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE",
+            "AgentFence.KERNEL.DMESG_VISIBLE"
+          ],
+          "artifact_kinds": [
+            "kernel_surface_hardening_patch"
+          ],
+          "workload": {
+            "target_pod": "target-kata-cb4f6fd97-sqv8t",
+            "target_container": "app",
+            "service_account": "default",
+            "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+            "runtime_class": "kata-qemu",
+            "node_selector": {
+              "katacontainers.io/kata-runtime": "true",
+              "sandbox": "kata"
+            },
+            "workload": {
+              "kind": "Deployment",
+              "resource": "deployment",
+              "name": "target-kata"
+            },
+            "owner_chain": [
+              {
+                "kind": "ReplicaSet",
+                "name": "target-kata-cb4f6fd97"
+              },
+              {
+                "kind": "Deployment",
+                "name": "target-kata"
+              }
+            ],
+            "warnings": []
+          },
+          "workload_config_before": {
+            "schema": "agentfence-workload-config-before-autofix-v1",
+            "captured_at_utc": "2026-05-16T15:41:29.372892+00:00",
+            "namespace": "sandbox-kata-fresh",
+            "target_pod": "target-kata-cb4f6fd97-sqv8t",
+            "target_container": "app",
+            "workload_reference": {
+              "target_pod": "target-kata-cb4f6fd97-sqv8t",
+              "target_container": "app",
+              "service_account": "default",
+              "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+              "runtime_class": "kata-qemu",
+              "node_selector": {
+                "katacontainers.io/kata-runtime": "true",
+                "sandbox": "kata"
+              },
+              "workload": {
+                "kind": "Deployment",
+                "resource": "deployment",
+                "name": "target-kata"
+              },
+              "owner_chain": [
+                {
+                  "kind": "ReplicaSet",
+                  "name": "target-kata-cb4f6fd97"
+                },
+                {
+                  "kind": "Deployment",
+                  "name": "target-kata"
+                }
+              ],
+              "warnings": []
+            },
+            "workload_api_version": "apps/v1",
+            "workload_kind": "Deployment",
+            "workload_name": "target-kata",
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "app": "target-kata",
+                "role": "target"
+              }
+            },
+            "template_labels": {
+              "app": "target-kata",
+              "role": "target"
+            },
+            "service_account": "default",
+            "runtime_class": "kata-qemu",
+            "node_selector": {
+              "sandbox": "kata"
+            },
+            "pod_security_context": {},
+            "automount_service_account_token": null,
+            "containers": [
+              {
+                "name": "app",
+                "image": "ghcr.io/farshadrahaei/crewai-sandbox-app:v1",
+                "ports": [
+                  {
+                    "containerPort": 8000,
+                    "protocol": "TCP"
+                  }
+                ],
+                "security_context": null,
+                "readiness_probe": null,
+                "liveness_probe": null
+              }
+            ],
+            "init_containers": [],
+            "pods_before": [
+              {
+                "name": "target-kata-cb4f6fd97-sqv8t",
+                "uid": "33edb0b3-4417-40e9-b319-34c937796809",
+                "phase": "Running"
+              }
+            ],
+            "connectivity_expectations": [
+              {
+                "source_policy": "allow-llm-gateway-egress",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "protocol": "TCP",
+                "reason": "captured from concrete NetworkPolicy egress ipBlock before remediation"
+              }
+            ]
+          },
+          "patch": {
+            "spec": {
+              "template": {
+                "spec": {
+                  "securityContext": {
+                    "seccompProfile": {
+                      "type": "RuntimeDefault"
+                    }
+                  },
+                  "containers": [
+                    {
+                      "name": "app",
+                      "securityContext": {
+                        "seccompProfile": {
+                          "type": "RuntimeDefault"
+                        },
+                        "privileged": false,
+                        "capabilities": {
+                          "drop": [
+                            "ALL"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "status": "applied_with_verification_warning",
+          "kubectl": "deployment.apps/target-kata patched",
+          "changed": true,
+          "rollout_status": "complete",
+          "rollout_message": "Waiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\nWaiting for deployment \"target-kata\" rollout to finish: 1 old replicas are pending termination...\ndeployment \"target-kata\" successfully rolled out\n",
+          "workload_revalidation": {
+            "schema": "agentfence-workload-revalidation-v1",
+            "status": "healthy",
+            "healthy": true,
+            "resource": "deployment",
+            "name": "target-kata",
+            "expected_containers": [
+              "app"
+            ],
+            "requires_pod_recreation": true,
+            "rollout_status": "complete",
+            "rollout_message": "deployment \"target-kata\" successfully rolled out\n",
+            "target_refresh": {
+              "kind": "target_refresh",
+              "status": "updated",
+              "before": {
+                "target_pod": "target-kata-56c48f76f4-5f5xn",
+                "target_container": "app",
+                "target_ip": "192.168.192.135"
+              },
+              "after": {
+                "target_pod": "target-kata-7b74c56d7c-h78r8",
+                "target_container": "app",
+                "target_ip": "192.168.192.139"
+              }
+            },
+            "pod_count": 2,
+            "running_pod_count": 1,
+            "pod_recreated": true,
+            "container_readiness": [
+              {
+                "pod": "target-kata-7b74c56d7c-h78r8",
+                "missing_containers": [],
+                "not_ready_containers": [],
+                "all_expected_ready": true
+              }
+            ],
+            "connectivity_checks": [
+              {
+                "pod": "target-kata-7b74c56d7c-h78r8",
+                "container": "app",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "source_policy": "allow-llm-gateway-egress",
+                "status": "reachable",
+                "output": "OK"
+              }
+            ]
+          },
+          "verification": {
+            "status": "verified_with_warnings",
+            "probe_ids": [
+              "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE",
+              "AgentFence.KERNEL.DMESG_VISIBLE"
+            ],
+            "resolved_probe_ids": [
+              "AgentFence.KERNEL.DMESG_VISIBLE"
+            ],
+            "still_unsafe_probe_ids": [],
+            "new_unsafe_probe_ids": [
+              "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC",
+              "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK",
+              "AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT",
+              "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE",
+              "AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE",
+              "AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED"
+            ],
+            "score_raw_before": 9.0,
+            "score_raw_after": 4.5,
+            "changed": true,
+            "verification_warnings": [
+              "new unsafe probes appeared during workload-hardening verification, but related probes improved and the raw score decreased"
+            ]
+          },
+          "resolved_probe_ids": [
+            "AgentFence.KERNEL.DMESG_VISIBLE"
+          ],
+          "verification_warnings": [
+            "new unsafe probes appeared during workload-hardening verification, but related probes improved and the raw score decreased"
+          ]
+        },
+        {
+          "kind": "workload_hardening_patch",
+          "stage": "namespace_isolation",
+          "risk_level": "guarded",
+          "resource": "deployment",
+          "name": "target-kata",
+          "probe_ids": [
+            "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC"
+          ],
+          "artifact_kinds": [
+            "namespace_isolation_patch"
+          ],
+          "workload": {
+            "target_pod": "target-kata-cb4f6fd97-sqv8t",
+            "target_container": "app",
+            "service_account": "default",
+            "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+            "runtime_class": "kata-qemu",
+            "node_selector": {
+              "katacontainers.io/kata-runtime": "true",
+              "sandbox": "kata"
+            },
+            "workload": {
+              "kind": "Deployment",
+              "resource": "deployment",
+              "name": "target-kata"
+            },
+            "owner_chain": [
+              {
+                "kind": "ReplicaSet",
+                "name": "target-kata-cb4f6fd97"
+              },
+              {
+                "kind": "Deployment",
+                "name": "target-kata"
+              }
+            ],
+            "warnings": []
+          },
+          "workload_config_before": {
+            "schema": "agentfence-workload-config-before-autofix-v1",
+            "captured_at_utc": "2026-05-16T15:41:29.372892+00:00",
+            "namespace": "sandbox-kata-fresh",
+            "target_pod": "target-kata-cb4f6fd97-sqv8t",
+            "target_container": "app",
+            "workload_reference": {
+              "target_pod": "target-kata-cb4f6fd97-sqv8t",
+              "target_container": "app",
+              "service_account": "default",
+              "node": "worker-kata-1.us-central1-a.c.asl-0502-093447.internal",
+              "runtime_class": "kata-qemu",
+              "node_selector": {
+                "katacontainers.io/kata-runtime": "true",
+                "sandbox": "kata"
+              },
+              "workload": {
+                "kind": "Deployment",
+                "resource": "deployment",
+                "name": "target-kata"
+              },
+              "owner_chain": [
+                {
+                  "kind": "ReplicaSet",
+                  "name": "target-kata-cb4f6fd97"
+                },
+                {
+                  "kind": "Deployment",
+                  "name": "target-kata"
+                }
+              ],
+              "warnings": []
+            },
+            "workload_api_version": "apps/v1",
+            "workload_kind": "Deployment",
+            "workload_name": "target-kata",
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "app": "target-kata",
+                "role": "target"
+              }
+            },
+            "template_labels": {
+              "app": "target-kata",
+              "role": "target"
+            },
+            "service_account": "default",
+            "runtime_class": "kata-qemu",
+            "node_selector": {
+              "sandbox": "kata"
+            },
+            "pod_security_context": {},
+            "automount_service_account_token": null,
+            "containers": [
+              {
+                "name": "app",
+                "image": "ghcr.io/farshadrahaei/crewai-sandbox-app:v1",
+                "ports": [
+                  {
+                    "containerPort": 8000,
+                    "protocol": "TCP"
+                  }
+                ],
+                "security_context": null,
+                "readiness_probe": null,
+                "liveness_probe": null
+              }
+            ],
+            "init_containers": [],
+            "pods_before": [
+              {
+                "name": "target-kata-cb4f6fd97-sqv8t",
+                "uid": "33edb0b3-4417-40e9-b319-34c937796809",
+                "phase": "Running"
+              }
+            ],
+            "connectivity_expectations": [
+              {
+                "source_policy": "allow-llm-gateway-egress",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "protocol": "TCP",
+                "reason": "captured from concrete NetworkPolicy egress ipBlock before remediation"
+              }
+            ]
+          },
+          "patch": {
+            "spec": {
+              "template": {
+                "spec": {
+                  "hostPID": false,
+                  "hostIPC": false,
+                  "hostNetwork": false
+                }
+              }
+            }
+          },
+          "status": "applied",
+          "kubectl": "deployment.apps/target-kata patched (no change)",
+          "changed": false,
+          "rollout_status": "complete",
+          "rollout_message": "deployment \"target-kata\" successfully rolled out\n",
+          "workload_revalidation": {
+            "schema": "agentfence-workload-revalidation-v1",
+            "status": "healthy",
+            "healthy": true,
+            "resource": "deployment",
+            "name": "target-kata",
+            "expected_containers": [
+              "app"
+            ],
+            "requires_pod_recreation": false,
+            "rollout_status": "complete",
+            "rollout_message": "deployment \"target-kata\" successfully rolled out\n",
+            "target_refresh": {
+              "kind": "target_refresh",
+              "status": "unchanged",
+              "before": {
+                "target_pod": "target-kata-7b74c56d7c-h78r8",
+                "target_container": "app",
+                "target_ip": "192.168.192.139"
+              },
+              "after": {
+                "target_pod": "target-kata-7b74c56d7c-h78r8",
+                "target_container": "app",
+                "target_ip": "192.168.192.139"
+              }
+            },
+            "pod_count": 1,
+            "running_pod_count": 1,
+            "pod_recreated": true,
+            "container_readiness": [
+              {
+                "pod": "target-kata-7b74c56d7c-h78r8",
+                "missing_containers": [],
+                "not_ready_containers": [],
+                "all_expected_ready": true
+              }
+            ],
+            "connectivity_checks": [
+              {
+                "pod": "target-kata-7b74c56d7c-h78r8",
+                "container": "app",
+                "host": "10.128.0.15",
+                "port": 31080,
+                "source_policy": "allow-llm-gateway-egress",
+                "status": "reachable",
+                "output": "OK"
+              }
+            ]
+          },
+          "verification": {
+            "status": "no_change_unresolved",
+            "probe_ids": [
+              "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC"
+            ],
+            "resolved_probe_ids": [],
+            "still_unsafe_probe_ids": [
+              "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC"
+            ],
+            "new_unsafe_probe_ids": [],
+            "score_raw_before": 4.5,
+            "score_raw_after": 4.5,
+            "changed": false
+          },
+          "resolved_probe_ids": []
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE",
+          "title": "Review service reachability from sibling pods",
+          "action_type": "manual_recommendation",
+          "recommendation": "Inventory required callers, ports, and authentication expectations before applying least-privilege NetworkPolicy changes."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE",
+          "title": "Constrain eBPF program loading",
+          "action_type": "hybrid",
+          "recommendation": "Generate seccomp/capability restrictions and manual kernel lockdown guidance."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE",
+          "title": "Restrict perf event access",
+          "action_type": "manual_recommendation",
+          "recommendation": "Generate node sysctl/runtime guidance for perf restrictions."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC",
+          "title": "Block host filesystem traversal through /proc",
+          "action_type": "hybrid",
+          "recommendation": "Generate hostPID false, hostPath removal, and containment validation steps."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT",
+          "title": "Review user namespace root mapping",
+          "action_type": "manual_recommendation",
+          "recommendation": "Generate runtime/user namespace remapping guidance and validation commands."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK",
+          "title": "Disallow privilege escalation",
+          "action_type": "auto_fix",
+          "recommendation": "Generate allowPrivilegeEscalation: false patch.",
+          "reason": "automatic remediation is available but was not safe to apply automatically",
+          "runtime_seccomp_diagnostic": null
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE",
+          "title": "Minimize Linux capability bounding set",
+          "action_type": "auto_fix",
+          "recommendation": "Generate capabilities.drop: [ALL] with explicit allowlist guidance.",
+          "reason": "automatic remediation is available but was not safe to apply automatically",
+          "runtime_seccomp_diagnostic": null
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.SIDE.HOST_DMI_LEAKED",
+          "title": "Mask host DMI information",
+          "action_type": "manual_recommendation",
+          "recommendation": "Generate sysfs/DMI masking or runtime isolation guidance."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE",
+          "title": "Assess high-resolution timer exposure",
+          "action_type": "manual_recommendation",
+          "recommendation": "Generate side-channel mitigation guidance, runtime selection notes, and workload-specific tradeoffs."
+        },
+        {
+          "kind": "manual_recommendation",
+          "status": "manual_recommendation",
+          "probe_id": "AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED",
+          "title": "Reduce cache topology leakage",
+          "action_type": "manual_recommendation",
+          "recommendation": "Generate runtime isolation and scheduling guidance; include residual-risk explanation."
+        }
+      ],
+      "note": "Automatic remediation applies bounded workload securityContext, seccomp RuntimeDefault, service-account, namespace-isolation, and NetworkPolicy changes; workload-level patches capture pre-fix config, require rollout/workload revalidation, then post-remediation analysis runs again."
+    },
+    "workload_revalidations": [
+      {
+        "schema": "agentfence-workload-revalidation-v1",
+        "status": "healthy",
+        "healthy": true,
+        "resource": "deployment",
+        "name": "target-kata",
+        "expected_containers": [
+          "app"
+        ],
+        "requires_pod_recreation": true,
+        "rollout_status": "complete",
+        "rollout_message": "deployment \"target-kata\" successfully rolled out\n",
+        "target_refresh": {
+          "kind": "target_refresh",
+          "status": "updated",
+          "before": {
+            "target_pod": "target-kata-cb4f6fd97-sqv8t",
+            "target_container": "app",
+            "target_ip": "192.168.192.132"
+          },
+          "after": {
+            "target_pod": "target-kata-56c48f76f4-2b7rw",
+            "target_container": "app",
+            "target_ip": "192.168.192.134"
+          }
+        },
+        "pod_count": 1,
+        "running_pod_count": 1,
+        "pod_recreated": true,
+        "container_readiness": [
+          {
+            "pod": "target-kata-56c48f76f4-2b7rw",
+            "missing_containers": [],
+            "not_ready_containers": [],
+            "all_expected_ready": true
+          }
+        ],
+        "connectivity_checks": [
+          {
+            "pod": "target-kata-56c48f76f4-2b7rw",
+            "container": "app",
+            "host": "10.128.0.15",
+            "port": 31080,
+            "source_policy": "allow-llm-gateway-egress",
+            "status": "reachable",
+            "output": "OK"
+          }
+        ]
+      },
+      {
+        "schema": "agentfence-workload-revalidation-v1",
+        "status": "healthy",
+        "healthy": true,
+        "resource": "deployment",
+        "name": "target-kata",
+        "expected_containers": [
+          "app"
+        ],
+        "requires_pod_recreation": true,
+        "rollout_status": "complete",
+        "rollout_message": "deployment \"target-kata\" successfully rolled out\n",
+        "target_refresh": {
+          "kind": "target_refresh",
+          "status": "updated",
+          "before": {
+            "target_pod": "target-kata-56c48f76f4-2b7rw",
+            "target_container": "app",
+            "target_ip": "192.168.192.134"
+          },
+          "after": {
+            "target_pod": "target-kata-84fd8bc754-sfz8m",
+            "target_container": "app",
+            "target_ip": "192.168.192.129"
+          }
+        },
+        "pod_count": 1,
+        "running_pod_count": 1,
+        "pod_recreated": true,
+        "container_readiness": [
+          {
+            "pod": "target-kata-84fd8bc754-sfz8m",
+            "missing_containers": [],
+            "not_ready_containers": [],
+            "all_expected_ready": true
+          }
+        ],
+        "connectivity_checks": [
+          {
+            "pod": "target-kata-84fd8bc754-sfz8m",
+            "container": "app",
+            "host": "10.128.0.15",
+            "port": 31080,
+            "source_policy": "allow-llm-gateway-egress",
+            "status": "reachable",
+            "output": "OK"
+          }
+        ]
+      },
+      {
+        "schema": "agentfence-workload-revalidation-v1",
+        "status": "healthy",
+        "healthy": true,
+        "resource": "deployment",
+        "name": "target-kata",
+        "expected_containers": [
+          "app"
+        ],
+        "requires_pod_recreation": true,
+        "rollout_status": "complete",
+        "rollout_message": "deployment \"target-kata\" successfully rolled out\n",
+        "target_refresh": {
+          "kind": "target_refresh",
+          "status": "updated",
+          "before": {
+            "target_pod": "target-kata-56c48f76f4-lvgnc",
+            "target_container": "app",
+            "target_ip": "192.168.192.136"
+          },
+          "after": {
+            "target_pod": "target-kata-7b74c56d7c-fjvgx",
+            "target_container": "app",
+            "target_ip": "192.168.192.133"
+          }
+        },
+        "pod_count": 1,
+        "running_pod_count": 1,
+        "pod_recreated": true,
+        "container_readiness": [
+          {
+            "pod": "target-kata-7b74c56d7c-fjvgx",
+            "missing_containers": [],
+            "not_ready_containers": [],
+            "all_expected_ready": true
+          }
+        ],
+        "connectivity_checks": [
+          {
+            "pod": "target-kata-7b74c56d7c-fjvgx",
+            "container": "app",
+            "host": "10.128.0.15",
+            "port": 31080,
+            "source_policy": "allow-llm-gateway-egress",
+            "status": "reachable",
+            "output": "OK"
+          }
+        ]
+      },
+      {
+        "schema": "agentfence-workload-revalidation-v1",
+        "status": "healthy",
+        "healthy": true,
+        "resource": "deployment",
+        "name": "target-kata",
+        "expected_containers": [
+          "app"
+        ],
+        "requires_pod_recreation": true,
+        "rollout_status": "complete",
+        "rollout_message": "deployment \"target-kata\" successfully rolled out\n",
+        "target_refresh": {
+          "kind": "target_refresh",
+          "status": "updated",
+          "before": {
+            "target_pod": "target-kata-56c48f76f4-5f5xn",
+            "target_container": "app",
+            "target_ip": "192.168.192.135"
+          },
+          "after": {
+            "target_pod": "target-kata-7b74c56d7c-h78r8",
+            "target_container": "app",
+            "target_ip": "192.168.192.139"
+          }
+        },
+        "pod_count": 2,
+        "running_pod_count": 1,
+        "pod_recreated": true,
+        "container_readiness": [
+          {
+            "pod": "target-kata-7b74c56d7c-h78r8",
+            "missing_containers": [],
+            "not_ready_containers": [],
+            "all_expected_ready": true
+          }
+        ],
+        "connectivity_checks": [
+          {
+            "pod": "target-kata-7b74c56d7c-h78r8",
+            "container": "app",
+            "host": "10.128.0.15",
+            "port": 31080,
+            "source_policy": "allow-llm-gateway-egress",
+            "status": "reachable",
+            "output": "OK"
+          }
+        ]
+      },
+      {
+        "schema": "agentfence-workload-revalidation-v1",
+        "status": "healthy",
+        "healthy": true,
+        "resource": "deployment",
+        "name": "target-kata",
+        "expected_containers": [
+          "app"
+        ],
+        "requires_pod_recreation": false,
+        "rollout_status": "complete",
+        "rollout_message": "deployment \"target-kata\" successfully rolled out\n",
+        "target_refresh": {
+          "kind": "target_refresh",
+          "status": "unchanged",
+          "before": {
+            "target_pod": "target-kata-7b74c56d7c-h78r8",
+            "target_container": "app",
+            "target_ip": "192.168.192.139"
+          },
+          "after": {
+            "target_pod": "target-kata-7b74c56d7c-h78r8",
+            "target_container": "app",
+            "target_ip": "192.168.192.139"
+          }
+        },
+        "pod_count": 1,
+        "running_pod_count": 1,
+        "pod_recreated": true,
+        "container_readiness": [
+          {
+            "pod": "target-kata-7b74c56d7c-h78r8",
+            "missing_containers": [],
+            "not_ready_containers": [],
+            "all_expected_ready": true
+          }
+        ],
+        "connectivity_checks": [
+          {
+            "pod": "target-kata-7b74c56d7c-h78r8",
+            "container": "app",
+            "host": "10.128.0.15",
+            "port": 31080,
+            "source_policy": "allow-llm-gateway-egress",
+            "status": "reachable",
+            "output": "OK"
+          }
+        ]
+      }
+    ],
+    "runtime_seccomp_diagnostics": [
+      {
+        "schema": "agentfence-runtime-seccomp-diagnostic-v1",
+        "runtime": {
+          "runtime_class": "kata-qemu",
+          "handler": "kata-qemu",
+          "family": "kata"
+        },
+        "pod_seccomp_profile": "RuntimeDefault",
+        "container_seccomp_profiles": {
+          "app": "RuntimeDefault"
+        },
+        "expected_containers": [
+          "app"
+        ],
+        "all_expected_containers_configured": true,
+        "process_seccomp_status": [
+          {
+            "pod": "target-kata-56c48f76f4-2b7rw",
+            "container": "app",
+            "status": "captured",
+            "seccomp_mode": 2,
+            "output": "CapBnd:\t00000000a80425fb\nNoNewPrivs:\t0\nSeccomp:\t2"
+          }
+        ],
+        "process_seccomp_active": true,
+        "gvisor_runtime_verified": false,
+        "runtime_config_required": false,
+        "node_config_changed": false,
+        "recommendation": "Kata accepted the workload seccomp profile but did not expose active process seccomp. Enable guest seccomp for the Kata runtime, for example set disable_guest_seccomp = false in the active Kata configuration for this handler, restart the runtime/containerd path, then recreate the workload pods and rerun AgentFence."
+      }
+    ],
+    "rollback_bundle_recorded": true,
+    "rollback_bundle_path": "/Users/farshad/Library/Mobile Documents/com~apple~CloudDocs/Documents/Personal Folder/Graduate School/Marquette/Keyang/AI Security and Privacy/agentfence-plus-complete/generated_outputs/rollback_bundle_sandbox-kata-fresh_target-kata-cb4f6fd97-sqv8t_20260516T154048Z",
+    "backup_status": "verified_with_warnings",
+    "restore_ready": true,
+    "pvc_data": {
+      "pvc_count": 0,
+      "pvc_names": [],
+      "data_status": "not_applicable",
+      "snapshot_api_available": false,
+      "warning": ""
+    },
+    "mutation_gate": {
+      "status": "open",
+      "reason": "restore checkpoint verified before remediation guidance was emitted"
+    },
+    "notes": ""
+  },
+  "base_result_counts": {
+    "pass": 12,
+    "fail": 27,
+    "skip": 0
+  }
+}
