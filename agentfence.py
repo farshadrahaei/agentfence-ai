@@ -1,3445 +1,7183 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Combined sandbox audit.
+AgentFence — single-file audit: 39 unified probes, one catalog, one scorer.
 
-Supports three modes in one file:
-  1) internal  : run inside the target pod/workload
-  2) remote    : run from a workstation or control host with kubectl access
-  3) both      : run remote checks and then invoke this same file inside the
-                 target pod to collect the internal audit as well
+Semantics: status "pass" = UNSAFE (attack/threat succeeded). "fail" = safe. "skip" = no score.
 
-Design goals:
-- Keep the internal audit pure stdlib.
-- Preserve the remote kubectl-driven reachability audit.
-- Normalize output into one JSON schema.
+Scoring (disjoint layers — each scored probe in exactly one group, catalog v1.3.0):
+  - TBE (Trust-boundary exposure): host-adjacent subset → tbe_* metrics.
+  - ELE (Execution-local exposure): all remaining scored probes → ele_* metrics.
+  - Review-only findings remain reported but do not affect issue_count, raw score, or headline.
+  - Totals: issue_count / score_raw = scored passes (equals tbe_score_raw + ele_score_raw).
+  - Headline: score_normalized = α·tbe_norm + (1−α)·ele_norm (default α=0.6).
 
-Examples:
-  # inside target pod
-  python3 combined_audit.py internal --out internal.json
-
-  # from workstation with kubectl
-  python3 combined_audit.py remote -n cua --target-selector app=cua --out remote.json
-
-  # from workstation, collect both remote + internal in one run
-  python3 combined_audit.py both -n cua --target-selector app=cua --out combined.json
-
-  # generate remediation guidance from an existing audit JSON
-  python3 combined_audit.py remediate --input combined.json --out remediation.json
+All modes use: results = run_all_probes(ctx); metrics = summarize_results(results, α).
 """
+from __future__ import annotations
 
 import argparse
-import copy
 import datetime
+import hashlib
+import ipaddress
 import json
+import math
 import os
+import pathlib
 import platform
 import re
 import shlex
-import socket
-import ssl
-import stat
-import subprocess
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple
 
-# --------------------------- shared helpers ---------------------------------
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-def now_utc_iso():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+CATALOG_VERSION = "1.3.0"
+DEFAULT_HEADLINE_ALPHA = 0.6
+ACTIVE_KUBE_CONTEXT: Optional[str] = None
+AI_KEYCHAIN_SERVICE = os.environ.get("AGENTFENCE_OPENAI_KEYCHAIN_SERVICE", "AgentFence OpenAI API Key").strip() or "AgentFence OpenAI API Key"
+AI_KEYCHAIN_ACCOUNT = os.environ.get("AGENTFENCE_OPENAI_KEYCHAIN_ACCOUNT", "default").strip() or "default"
 
+SEVERITY_WEIGHTS = {"critical": 5.0, "high": 3.0, "medium": 1.0, "low": 0.5}
 
-def shell(cmd, timeout=10, check=False):
-    try:
-        out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=timeout)
-        return out.decode("utf-8", "replace")
-    except subprocess.CalledProcessError as e:
-        if check:
-            raise
-        return e.output.decode("utf-8", "replace")
-    except Exception as e:
-        if check:
-            raise
-        return f"__ERR__ {type(e).__name__}: {e}"
+Status = Literal["pass", "fail", "skip"]
+Severity = Literal["critical", "high", "medium", "low"]
+RemediationAction = Literal["auto_fix", "hybrid", "manual_recommendation"]
 
 
-def read_text(path, max_bytes=1_000_000):
-    try:
-        with open(path, "rb") as f:
-            return f.read(max_bytes).decode("utf-8", "replace")
-    except Exception as e:
-        return f"__ERR__ {e}"
+@dataclass
+class ProbeSpec:
+    id: str
+    severity: Severity
+    origin_note: str = ""  # documentation only (classic vs new)
 
 
-def file_exists(path):
-    try:
-        return os.path.exists(path)
-    except Exception:
-        return False
+@dataclass
+class TestResult:
+    id: str
+    severity: Severity
+    status: Status
+    evidence: str = ""
+    matched_clause: str = ""
+    duration_ms: int = 0
 
 
-def bool_field(ok, evidence=""):
-    return {"ok": bool(ok), "evidence": evidence or ""}
+@dataclass
+class ScoreBundle:
+    """Disjoint TBE + ELE; totals match full catalog (no double counting)."""
+    issue_count: int  # scored unsafe probes only; review-only findings are reported separately
+    score_raw: float  # sum scored weights (= tbe_score_raw + ele_score_raw)
+    # TBE — Trust-boundary exposure (layer 1)
+    tbe_issue_count: int = 0
+    tbe_score_raw: float = 0.0
+    tbe_score_normalized: float = 0.0
+    catalog_max_tbe: float = 0.0
+    # ELE — Execution-local exposure (layer 2)
+    ele_issue_count: int = 0
+    ele_score_raw: float = 0.0
+    ele_score_normalized: float = 0.0
+    catalog_max_ele: float = 0.0
+    # Headline: blend of disjoint normalized layers
+    score_normalized: float = 0.0
+    headline_alpha: float = DEFAULT_HEADLINE_ALPHA
+    catalog_version: str = CATALOG_VERSION
+    by_severity: Dict[str, int] = field(default_factory=dict)
+    skipped: List[str] = field(default_factory=list)
 
 
-def tcp_connect(host, port, timeout=2.0):
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True, "tcp_connect_ok"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+@dataclass
+class RunContext:
+    namespace: str
+    kubeconfig: str
+    target_pod: str
+    target_container: str
+    attacker_pod: str
+    attacker_container: str
+    target_ip: str
+    dry_run: bool = False
+    probe_timeout: int = 25
+    allow_node_runtime_remediation: bool = False
 
 
-def http_head_local(host="127.0.0.1", port=6901, path="/", timeout=2.0):
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as s:
-            req = f"HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-            s.sendall(req.encode("utf-8"))
-            data = s.recv(2048).decode("utf-8", "replace")
-        m = re.search(r"HTTP/1\.[01]\s+(\d+)", data)
-        code = int(m.group(1)) if m else None
-        return code == 200, f"HTTP {code}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+@dataclass(frozen=True)
+class RemediationRecipe:
+    probe_id: str
+    issue_id: str
+    title: str
+    risk: str
+    action_type: RemediationAction
+    recommendation: str
+    validation: str
+    operator_steps: Tuple[str, ...]
+    dry_run_artifact: str = ""
 
 
-def websocket_upgrade_local(host="127.0.0.1", port=6901, path="/websockify", timeout=2.0):
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as s:
-            req = (
-                f"GET {path} HTTP/1.1\r\n"
-                f"Host: {host}:{port}\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                "Sec-WebSocket-Key: x\r\n"
-                "Sec-WebSocket-Version: 13\r\n\r\n"
-            )
-            s.sendall(req.encode("utf-8"))
-            data = s.recv(2048).decode("utf-8", "replace")
-        first = data.splitlines()[0] if data else ""
-        m = re.search(r"HTTP/1\.[01]\s+(\d+)", data)
-        code = int(m.group(1)) if m else None
-        return code == 101, f"{first or 'no_reply'}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+# Single unified catalog (39 probes). No separate manifest/battery execution paths.
+CATALOG: List[ProbeSpec] = [
+    ProbeSpec("AgentFence.ID.RUN_AS_UID_ZERO", "high", "classic: RUN_AS_ROOT"),
+    ProbeSpec("AgentFence.ID.ROOTFS_WRITE_OK", "high", "classic: ROOTFS_RW"),
+    ProbeSpec("AgentFence.ID.SA_TOKEN_READABLE", "high", "classic: SERVICE_ACCOUNT_TOKEN"),
+    ProbeSpec("AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE", "high", "classic: REMOTE_REACHABILITY"),
+    ProbeSpec("AgentFence.HOSTPATH.SENSITIVE_WRITE_OK", "high", "classic: SENSITIVE_PATHS_WRITABLE"),
+    ProbeSpec("AgentFence.KERNEL.KEXEC_REACHABLE", "high", "battery"),
+    ProbeSpec("AgentFence.KERNEL.INIT_MODULE_REACHABLE", "high", "battery"),
+    ProbeSpec("AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE", "high", "battery"),
+    ProbeSpec("AgentFence.KERNEL.USERFAULTFD_REACHABLE", "high", "battery"),
+    ProbeSpec("AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE", "high", "battery"),
+    ProbeSpec("AgentFence.KERNEL.KALLSYMS_VISIBLE", "high", "battery"),
+    ProbeSpec("AgentFence.KERNEL.DMESG_VISIBLE", "high", "battery"),
+    ProbeSpec("AgentFence.FS.HOST_PROC_VISIBLE", "medium", "battery"),
+    ProbeSpec("AgentFence.FS.HOST_SYS_VISIBLE", "medium", "battery"),
+    ProbeSpec("AgentFence.FS.KCORE_READABLE", "medium", "battery"),
+    ProbeSpec("AgentFence.FS.HOST_DEVICES_VISIBLE", "medium", "battery"),
+    ProbeSpec("AgentFence.FS.ROOTFS_HOST_SHARED", "medium", "battery"),
+    ProbeSpec("AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC", "medium", "battery"),
+    ProbeSpec("AgentFence.DEVICE.KVM_PRESENT", "high", "battery"),
+    ProbeSpec("AgentFence.DEVICE.TUN_TAP_PRESENT", "high", "battery"),
+    ProbeSpec("AgentFence.DEVICE.USB_PRESENT", "high", "battery"),
+    ProbeSpec("AgentFence.DEVICE.RAW_SOCKET_USABLE", "high", "battery"),
+    ProbeSpec("AgentFence.NS.PID_NS_SHARES_HOST", "medium", "battery"),
+    ProbeSpec("AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT", "medium", "battery"),
+    ProbeSpec("AgentFence.NS.IPC_NS_SHARES_HOST", "medium", "battery"),
+    ProbeSpec("AgentFence.NS.NET_NS_SHARES_HOST", "medium", "battery"),
+    ProbeSpec("AgentFence.NS.UTS_NS_SHARES_HOST", "medium", "battery"),
+    ProbeSpec("AgentFence.NET.HOST_NETWORK_REACHABLE", "high", "battery"),
+    ProbeSpec("AgentFence.NET.IMDS_REACHABLE", "high", "battery"),
+    ProbeSpec("AgentFence.NET.KUBELET_API_REACHABLE", "high", "battery"),
+    ProbeSpec("AgentFence.NET.APISERVER_DIRECT_REACHABLE", "high", "battery"),
+    ProbeSpec("AgentFence.IDENTITY.SECCOMP_BYPASS_OK", "medium", "battery"),
+    ProbeSpec("AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK", "medium", "battery"),
+    ProbeSpec("AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE", "medium", "battery"),
+    ProbeSpec("AgentFence.IDENTITY.PROCFS_HIDEPID_LAX", "medium", "battery"),
+    ProbeSpec("AgentFence.SIDE.HOST_CPUINFO_LEAKED", "low", "battery"),
+    ProbeSpec("AgentFence.SIDE.HOST_DMI_LEAKED", "low", "battery"),
+    ProbeSpec("AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE", "low", "battery"),
+    ProbeSpec("AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED", "low", "battery"),
+]
+
+LEGACY_PROBE_PREFIX = "AF" + "PLUS."
+PROBE_ID_ALIASES: Dict[str, str] = {
+    p.id.replace("AgentFence.", LEGACY_PROBE_PREFIX): p.id for p in CATALOG
+}
 
 
-def rfb_greeting_local(host="127.0.0.1", port=5901, timeout=2.0, nbytes=12):
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as s:
-            s.settimeout(timeout)
-            data = s.recv(nbytes)
-        ok = data.startswith(b"RFB")
-        try:
-            preview = data.decode("ascii", "replace")
-        except Exception:
-            preview = data.hex()
-        return ok, f"banner={preview}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+def canonical_probe_id(probe_id: Any) -> str:
+    pid = str(probe_id or "")
+    return PROBE_ID_ALIASES.get(pid, pid)
 
 
-def find_mount_opts(path):
-    try:
-        best = ("", "")
-        with open("/proc/mounts", "r") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) < 4:
-                    continue
-                mp, opts = parts[1], parts[3]
-                if path.startswith(mp.rstrip("/")) and len(mp) > len(best[0]):
-                    best = (mp, opts)
-        return best[1]
-    except Exception as e:
-        return f"__ERR__ {e}"
+def canonical_test_result(result: TestResult) -> TestResult:
+    pid = canonical_probe_id(result.id)
+    if pid == result.id:
+        return result
+    return TestResult(
+        id=pid,
+        severity=result.severity,
+        status=result.status,
+        evidence=result.evidence,
+        matched_clause=result.matched_clause,
+        duration_ms=result.duration_ms,
+    )
 
 
-def cap_eff_mask():
-    try:
-        st = read_text("/proc/self/status")
-        m = re.search(r"^CapEff:\s*([0-9a-fA-F]+)", st, re.M)
-        if not m:
-            return 0, "missing CapEff"
-        return int(m.group(1), 16), ""
-    except Exception as e:
-        return 0, f"__ERR__ {e}"
+REVIEW_ONLY_PROBE_IDS: frozenset[str] = frozenset(
+    {"AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE"}
+)
 
 
-CAP_NAMES = [
-    "CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_DAC_READ_SEARCH","CAP_FOWNER","CAP_FSETID",
-    "CAP_KILL","CAP_SETGID","CAP_SETUID","CAP_SETPCAP","CAP_LINUX_IMMUTABLE",
-    "CAP_NET_BIND_SERVICE","CAP_NET_BROADCAST","CAP_NET_ADMIN","CAP_NET_RAW",
-    "CAP_IPC_LOCK","CAP_IPC_OWNER","CAP_SYS_MODULE","CAP_SYS_RAWIO","CAP_SYS_CHROOT",
-    "CAP_SYS_PTRACE","CAP_SYS_PACCT","CAP_SYS_ADMIN","CAP_SYS_BOOT","CAP_SYS_NICE",
-    "CAP_SYS_RESOURCE","CAP_SYS_TIME","CAP_SYS_TTY_CONFIG","CAP_MKNOD",
-    "CAP_LEASE","CAP_AUDIT_WRITE","CAP_AUDIT_CONTROL","CAP_SETFCAP",
-    "CAP_MAC_OVERRIDE","CAP_MAC_ADMIN","CAP_SYSLOG","CAP_WAKE_ALARM",
-    "CAP_BLOCK_SUSPEND","CAP_AUDIT_READ","CAP_PERFMON","CAP_BPF","CAP_CHECKPOINT_RESTORE"
-] + [f"CAP_{i}" for i in range(41, 64)]
+def is_review_only_probe(probe_id: Any) -> bool:
+    return canonical_probe_id(probe_id) in REVIEW_ONLY_PROBE_IDS
 
 
-def caps_set(mask):
-    out = []
-    for i, name in enumerate(CAP_NAMES):
-        if mask & (1 << i):
-            out.append(name)
-    return out
+def is_scored_probe(probe_id: Any) -> bool:
+    return not is_review_only_probe(probe_id)
 
 
-def count_ok(d):
-    return sum(1 for v in d.values() if isinstance(v, dict) and v.get("ok") is True)
+# TBE — Trust-boundary exposure (disjoint layer 1). ELE is all other scored catalog probes.
+TBE_PROBE_IDS: frozenset[str] = frozenset(
+    {
+        "AgentFence.DEVICE.RAW_SOCKET_USABLE",
+        "AgentFence.HOSTPATH.SENSITIVE_WRITE_OK",
+        "AgentFence.FS.HOST_SYS_VISIBLE",
+    }
+)
 
 
-def count_total(d):
-    return sum(1 for v in d.values() if isinstance(v, dict) and "ok" in v)
+def _rr(
+    probe_id: str,
+    issue_id: str,
+    title: str,
+    risk: str,
+    action_type: RemediationAction,
+    recommendation: str,
+    validation: str,
+    operator_steps: Tuple[str, ...],
+    dry_run_artifact: str = "",
+) -> RemediationRecipe:
+    return RemediationRecipe(
+        probe_id=probe_id,
+        issue_id=issue_id,
+        title=title,
+        risk=risk,
+        action_type=action_type,
+        recommendation=recommendation,
+        validation=validation,
+        operator_steps=operator_steps,
+        dry_run_artifact=dry_run_artifact,
+    )
 
 
+REMEDIATION_RECIPES: Dict[str, RemediationRecipe] = {
+    "AgentFence.ID.RUN_AS_UID_ZERO": _rr(
+        "AgentFence.ID.RUN_AS_UID_ZERO",
+        "RUN_AS_ROOT",
+        "Run workload as non-root",
+        "Root execution increases post-compromise impact.",
+        "auto_fix",
+        "Generate a pod/container securityContext with runAsNonRoot and an explicit non-zero UID/GID.",
+        "Re-run AgentFence.ID.RUN_AS_UID_ZERO and confirm uid != 0.",
+        ("Review image file ownership.", "Set runAsNonRoot: true.", "Set runAsUser/runAsGroup to a workload-owned ID."),
+        "pod_security_context_patch",
+    ),
+    "AgentFence.ID.ROOTFS_WRITE_OK": _rr(
+        "AgentFence.ID.ROOTFS_WRITE_OK",
+        "ROOTFS_RW",
+        "Mount root filesystem read-only",
+        "Writable root filesystems make tampering and persistence easier.",
+        "hybrid",
+        "Generate readOnlyRootFilesystem plus manual writable-path migration guidance.",
+        "Re-run AgentFence.ID.ROOTFS_WRITE_OK and confirm writes under / fail.",
+        ("Inventory writes to /tmp, caches, logs, and workspace paths.", "Move mutable paths to explicit volumes.", "Enable readOnlyRootFilesystem."),
+        "readonly_rootfs_patch",
+    ),
+    "AgentFence.ID.SA_TOKEN_READABLE": _rr(
+        "AgentFence.ID.SA_TOKEN_READABLE",
+        "SERVICE_ACCOUNT_TOKEN",
+        "Reduce service account token exposure",
+        "Readable tokens expand Kubernetes API blast radius.",
+        "auto_fix",
+        "Generate automountServiceAccountToken: false or least-privilege ServiceAccount guidance.",
+        "Re-run AgentFence.ID.SA_TOKEN_READABLE and confirm token bytes are zero or absent.",
+        ("Confirm whether the workload needs Kubernetes API access.", "Disable automount when not needed.", "Use dedicated least-privilege RBAC when needed."),
+        "service_account_patch",
+    ),
+    "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE": _rr(
+        "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE",
+        "REMOTE_REACHABILITY",
+        "Review service reachability from sibling pods",
+        "Reachability from a sibling pod may be legitimate workload communication or unintended lateral exposure; AgentFence needs operator intent before scoring or mutating this path.",
+        "manual_recommendation",
+        "Inventory required callers, ports, and authentication expectations before applying least-privilege NetworkPolicy changes.",
+        "Re-run remote reachability after defining allowed callers and confirm only approved paths respond.",
+        ("Inventory required listeners and peer workloads.", "Document allowed ingress sources, ports, and authentication gates.", "Apply an allowlist NetworkPolicy only after confirming workload intent."),
+    ),
+    "AgentFence.HOSTPATH.SENSITIVE_WRITE_OK": _rr(
+        "AgentFence.HOSTPATH.SENSITIVE_WRITE_OK",
+        "HOSTPATH_SENSITIVE_WRITE",
+        "Remove writable sensitive hostPath access",
+        "Writable hostPath mounts can collapse the container/host boundary.",
+        "hybrid",
+        "Generate hostPath removal/read-only guidance and a replacement plan for required host access.",
+        "Re-run hostPath write probe and confirm writes fail or hostPath is absent.",
+        ("Identify the mounted host path and business need.", "Remove the hostPath or mount it read-only.", "Replace broad host access with a narrow API or sidecar."),
+        "hostpath_review_patch",
+    ),
+    "AgentFence.KERNEL.KEXEC_REACHABLE": _rr(
+        "AgentFence.KERNEL.KEXEC_REACHABLE",
+        "KEXEC_REACHABLE",
+        "Block kexec kernel-loading surface",
+        "Reachable kexec paths expose high-impact kernel attack surface.",
+        "hybrid",
+        "Generate seccomp/capability hardening and manual runtime/node policy validation.",
+        "Re-run AgentFence.KERNEL.KEXEC_REACHABLE and confirm EPERM or ENOSYS.",
+        ("Drop privileged mode and dangerous capabilities.", "Enable seccomp RuntimeDefault.", "Review node runtime policy for kexec restrictions."),
+        "kernel_surface_hardening_patch",
+    ),
+    "AgentFence.KERNEL.INIT_MODULE_REACHABLE": _rr(
+        "AgentFence.KERNEL.INIT_MODULE_REACHABLE",
+        "INIT_MODULE_REACHABLE",
+        "Block module loading surface",
+        "Kernel module loading can lead to host-level compromise.",
+        "hybrid",
+        "Generate capability/seccomp hardening and manual module-loading policy guidance.",
+        "Re-run AgentFence.KERNEL.INIT_MODULE_REACHABLE and confirm blocked syscall behavior.",
+        ("Drop SYS_MODULE and privileged mode.", "Enable RuntimeDefault seccomp.", "Validate node policy prevents module loading from workloads."),
+        "kernel_surface_hardening_patch",
+    ),
+    "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE": _rr(
+        "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE",
+        "BPF_PROG_LOAD_REACHABLE",
+        "Constrain eBPF program loading",
+        "eBPF loading expands kernel-facing attack surface.",
+        "hybrid",
+        "Generate seccomp/capability restrictions and manual kernel lockdown guidance.",
+        "Re-run AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE and confirm EPERM or ENOSYS.",
+        ("Drop BPF, SYS_ADMIN, and privileged mode where present.", "Use seccomp RuntimeDefault or stricter profiles.", "Review node eBPF policy."),
+        "kernel_surface_hardening_patch",
+    ),
+    "AgentFence.KERNEL.USERFAULTFD_REACHABLE": _rr(
+        "AgentFence.KERNEL.USERFAULTFD_REACHABLE",
+        "USERFAULTFD_REACHABLE",
+        "Restrict userfaultfd exposure",
+        "userfaultfd can strengthen kernel exploitation primitives.",
+        "manual_recommendation",
+        "Generate runtime/seccomp/kernel sysctl guidance because mitigation is node/runtime specific.",
+        "Re-run AgentFence.KERNEL.USERFAULTFD_REACHABLE and confirm blocked access.",
+        ("Review runtime seccomp profile.", "Set node/userfaultfd restrictions where supported.", "Prefer sandbox/VM runtimes for untrusted workloads."),
+    ),
+    "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": _rr(
+        "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE",
+        "PERF_EVENT_OPEN_REACHABLE",
+        "Restrict perf event access",
+        "perf_event_open can expose side-channel and kernel attack surface.",
+        "manual_recommendation",
+        "Generate node sysctl/runtime guidance for perf restrictions.",
+        "Re-run AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE and confirm EPERM, EACCES, or ENOSYS.",
+        ("Review kernel.perf_event_paranoid on nodes.", "Use runtime policies that block perf_event_open.", "Validate observability tools still work."),
+    ),
+    "AgentFence.KERNEL.KALLSYMS_VISIBLE": _rr(
+        "AgentFence.KERNEL.KALLSYMS_VISIBLE",
+        "KALLSYMS_VISIBLE",
+        "Hide kernel symbols",
+        "Visible kernel addresses weaken exploit resistance.",
+        "manual_recommendation",
+        "Generate host kernel pointer/kallsyms restriction guidance and capability review.",
+        "Re-run AgentFence.KERNEL.KALLSYMS_VISIBLE and confirm zeroed or unavailable addresses.",
+        ("Review kptr_restrict and kernel symbol exposure.", "Drop capabilities that expose kernel internals.", "Prefer stronger runtime isolation for untrusted workloads."),
+    ),
+    "AgentFence.KERNEL.DMESG_VISIBLE": _rr(
+        "AgentFence.KERNEL.DMESG_VISIBLE",
+        "DMESG_VISIBLE",
+        "Restrict kernel log visibility",
+        "Kernel logs can leak host and exploit-relevant details.",
+        "hybrid",
+        "Generate capability/seccomp hardening and manual node dmesg_restrict guidance.",
+        "Re-run AgentFence.KERNEL.DMESG_VISIBLE and confirm permission denial or empty output.",
+        ("Drop SYSLOG/SYS_ADMIN-like access.", "Enable RuntimeDefault seccomp.", "Set node kernel.dmesg_restrict where appropriate."),
+        "kernel_surface_hardening_patch",
+    ),
+    "AgentFence.FS.HOST_PROC_VISIBLE": _rr(
+        "AgentFence.FS.HOST_PROC_VISIBLE",
+        "HOST_PROC_VISIBLE",
+        "Prevent host /proc visibility",
+        "Host process visibility enables host reconnaissance and escape planning.",
+        "hybrid",
+        "Generate hostPID false and mount isolation guidance.",
+        "Re-run AgentFence.FS.HOST_PROC_VISIBLE and confirm host init/kubelet is not visible.",
+        ("Set hostPID: false.", "Remove broad /proc host mounts.", "Validate application process discovery still works."),
+        "namespace_isolation_patch",
+    ),
+    "AgentFence.FS.HOST_SYS_VISIBLE": _rr(
+        "AgentFence.FS.HOST_SYS_VISIBLE",
+        "HOST_SYS_VISIBLE",
+        "Prevent host /sys visibility",
+        "Host sysfs visibility leaks hardware and node state.",
+        "hybrid",
+        "Generate hostPath/sysfs removal or read-only restriction guidance.",
+        "Re-run AgentFence.FS.HOST_SYS_VISIBLE and confirm sensitive sysfs paths are hidden.",
+        ("Remove /sys hostPath mounts.", "Use read-only narrow mounts only when required.", "Review device plugin needs."),
+        "hostpath_review_patch",
+    ),
+    "AgentFence.FS.KCORE_READABLE": _rr(
+        "AgentFence.FS.KCORE_READABLE",
+        "KCORE_READABLE",
+        "Block /proc/kcore reads",
+        "Readable kernel memory interfaces can expose severe host data.",
+        "hybrid",
+        "Generate privileged/capability removal guidance and manual node/runtime policy validation.",
+        "Re-run AgentFence.FS.KCORE_READABLE and confirm permission denial.",
+        ("Remove privileged mode.", "Drop dangerous capabilities.", "Validate runtime blocks kernel memory interfaces."),
+        "kernel_surface_hardening_patch",
+    ),
+    "AgentFence.FS.HOST_DEVICES_VISIBLE": _rr(
+        "AgentFence.FS.HOST_DEVICES_VISIBLE",
+        "HOST_DEVICES_VISIBLE",
+        "Remove visible host block devices",
+        "Host device visibility increases data exposure and escape risk.",
+        "hybrid",
+        "Generate device mount removal guidance and manual replacement plan for required devices.",
+        "Re-run AgentFence.FS.HOST_DEVICES_VISIBLE and confirm host block devices are absent.",
+        ("Remove broad device mounts.", "Use device plugins with narrow allocation.", "Document any required hardware access."),
+        "device_access_review_patch",
+    ),
+    "AgentFence.FS.ROOTFS_HOST_SHARED": _rr(
+        "AgentFence.FS.ROOTFS_HOST_SHARED",
+        "ROOTFS_HOST_SHARED",
+        "Separate container rootfs from host rootfs",
+        "Shared rootfs semantics indicate weak filesystem isolation.",
+        "manual_recommendation",
+        "Generate runtime/storage isolation guidance because rootfs sharing is environment specific.",
+        "Re-run AgentFence.FS.ROOTFS_HOST_SHARED and confirm the container root is not host-shared.",
+        ("Review container runtime storage configuration.", "Remove host root bind mounts.", "Prefer sandbox/VM runtime isolation for untrusted workloads."),
+    ),
+    "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC": _rr(
+        "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC",
+        "HOST_FS_REACHABLE_VIA_PROC",
+        "Block host filesystem traversal through /proc",
+        "Host filesystem reachability through /proc can expose sensitive host files.",
+        "hybrid",
+        "Generate hostPID false, hostPath removal, and containment validation steps.",
+        "Re-run AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC and confirm host files are not reachable.",
+        ("Set hostPID: false.", "Remove broad hostPath mounts.", "Validate /proc/1/root does not expose host paths."),
+        "namespace_isolation_patch",
+    ),
+    "AgentFence.DEVICE.KVM_PRESENT": _rr(
+        "AgentFence.DEVICE.KVM_PRESENT",
+        "KVM_DEVICE_PRESENT",
+        "Review /dev/kvm exposure",
+        "/dev/kvm exposes virtualization controls and must be tightly scoped.",
+        "hybrid",
+        "Generate /dev/kvm device removal guidance and manual VM/sandbox requirement review.",
+        "Re-run AgentFence.DEVICE.KVM_PRESENT and confirm /dev/kvm is absent unless explicitly required.",
+        ("Confirm whether nested virtualization is required.", "Remove /dev/kvm from general workloads.", "Constrain to dedicated sandbox nodes when required."),
+        "device_access_review_patch",
+    ),
+    "AgentFence.DEVICE.TUN_TAP_PRESENT": _rr(
+        "AgentFence.DEVICE.TUN_TAP_PRESENT",
+        "TUN_TAP_PRESENT",
+        "Review TUN/TAP device exposure",
+        "TUN/TAP access can bypass expected network controls.",
+        "hybrid",
+        "Generate /dev/net/tun and NET_ADMIN removal guidance with networking compatibility checks.",
+        "Re-run AgentFence.DEVICE.TUN_TAP_PRESENT and confirm the device is absent when not required.",
+        ("Remove /dev/net/tun unless required.", "Drop NET_ADMIN.", "Validate VPN/proxy use cases separately."),
+        "device_access_review_patch",
+    ),
+    "AgentFence.DEVICE.USB_PRESENT": _rr(
+        "AgentFence.DEVICE.USB_PRESENT",
+        "USB_DEVICE_PRESENT",
+        "Remove USB device exposure",
+        "USB device exposure expands host hardware attack surface.",
+        "hybrid",
+        "Generate USB device mount removal guidance and manual hardware access replacement plan.",
+        "Re-run AgentFence.DEVICE.USB_PRESENT and confirm USB paths are absent.",
+        ("Remove USB bus mounts.", "Use narrow device plugins where hardware is required.", "Document operational exceptions."),
+        "device_access_review_patch",
+    ),
+    "AgentFence.DEVICE.RAW_SOCKET_USABLE": _rr(
+        "AgentFence.DEVICE.RAW_SOCKET_USABLE",
+        "RAW_SOCKET_USABLE",
+        "Drop raw socket capability",
+        "Raw sockets enable packet crafting and stronger lateral probes.",
+        "auto_fix",
+        "Generate capability drop for NET_RAW.",
+        "Re-run AgentFence.DEVICE.RAW_SOCKET_USABLE and confirm raw socket creation is denied.",
+        ("Drop NET_RAW or ALL capabilities.", "Re-add only documented required capabilities.", "Validate network diagnostics alternatives."),
+        "capabilities_drop_patch",
+    ),
+    "AgentFence.NS.PID_NS_SHARES_HOST": _rr(
+        "AgentFence.NS.PID_NS_SHARES_HOST",
+        "HOST_PID_ENABLED",
+        "Disable host PID namespace",
+        "Host PID namespace sharing exposes host processes.",
+        "auto_fix",
+        "Generate hostPID: false patch.",
+        "Re-run AgentFence.NS.PID_NS_SHARES_HOST and confirm hostPID=false.",
+        ("Set hostPID: false.", "Validate process monitoring alternatives.", "Redeploy and re-run namespace probes."),
+        "namespace_isolation_patch",
+    ),
+    "AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT": _rr(
+        "AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT",
+        "USER_NS_ROOT_MAPS_HOST_ROOT",
+        "Review user namespace root mapping",
+        "Root-to-root user namespace mapping weakens UID isolation.",
+        "manual_recommendation",
+        "Generate runtime/user namespace remapping guidance and validation commands.",
+        "Re-run AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT and confirm root is not mapped to host root.",
+        ("Enable user namespace remapping where supported.", "Review runtime configuration.", "Prefer non-root workload identity even with remapping."),
+    ),
+    "AgentFence.NS.IPC_NS_SHARES_HOST": _rr(
+        "AgentFence.NS.IPC_NS_SHARES_HOST",
+        "HOST_IPC_ENABLED",
+        "Disable host IPC namespace",
+        "Host IPC sharing exposes host IPC primitives.",
+        "auto_fix",
+        "Generate hostIPC: false patch.",
+        "Re-run AgentFence.NS.IPC_NS_SHARES_HOST and confirm hostIPC=false.",
+        ("Set hostIPC: false.", "Validate shared-memory use cases.", "Redeploy and re-run namespace probes."),
+        "namespace_isolation_patch",
+    ),
+    "AgentFence.NS.NET_NS_SHARES_HOST": _rr(
+        "AgentFence.NS.NET_NS_SHARES_HOST",
+        "HOST_NETWORK_ENABLED",
+        "Disable host network namespace",
+        "Host networking bypasses pod network isolation.",
+        "auto_fix",
+        "Generate hostNetwork: false patch plus Service/NetworkPolicy replacement guidance.",
+        "Re-run AgentFence.NS.NET_NS_SHARES_HOST and confirm hostNetwork=false.",
+        ("Set hostNetwork: false.", "Expose required ports through Services.", "Apply least-privilege NetworkPolicy."),
+        "namespace_isolation_patch",
+    ),
+    "AgentFence.NS.UTS_NS_SHARES_HOST": _rr(
+        "AgentFence.NS.UTS_NS_SHARES_HOST",
+        "HOST_UTS_RISK",
+        "Isolate hostname/UTS context",
+        "Host-like UTS exposure can reveal or couple node identity.",
+        "hybrid",
+        "Generate hostNetwork false or hostname isolation guidance and manual compatibility review.",
+        "Re-run AgentFence.NS.UTS_NS_SHARES_HOST and confirm isolated UTS behavior.",
+        ("Remove hostNetwork when possible.", "Avoid host aliases that reveal node identity.", "Validate service discovery behavior."),
+        "namespace_isolation_patch",
+    ),
+    "AgentFence.NET.HOST_NETWORK_REACHABLE": _rr(
+        "AgentFence.NET.HOST_NETWORK_REACHABLE",
+        "HOST_NETWORK_REACHABLE",
+        "Restrict node network reachability",
+        "Reachable node services increase lateral and node-adjacent risk.",
+        "hybrid",
+        "Generate egress NetworkPolicy restrictions and manual node-admin surface review.",
+        "Re-run AgentFence.NET.HOST_NETWORK_REACHABLE and confirm node admin ports are blocked.",
+        ("Inventory required node egress.", "Block node-admin ports by policy/firewall.", "Validate operational monitoring paths."),
+        "egress_network_policy_manifest",
+    ),
+    "AgentFence.NET.IMDS_REACHABLE": _rr(
+        "AgentFence.NET.IMDS_REACHABLE",
+        "IMDS_REACHABLE",
+        "Block cloud metadata access",
+        "Metadata access can expose node or cloud credentials.",
+        "auto_fix",
+        "Generate target-scoped metadata-service egress deny policy with post-apply validation.",
+        "Re-run AgentFence.NET.IMDS_REACHABLE and confirm metadata endpoint is blocked.",
+        ("Block 169.254.169.254 and provider equivalents.", "Use workload identity.", "Validate applications do not depend on node metadata."),
+        "metadata_egress_policy_manifest",
+    ),
+    "AgentFence.NET.KUBELET_API_REACHABLE": _rr(
+        "AgentFence.NET.KUBELET_API_REACHABLE",
+        "KUBELET_API_REACHABLE",
+        "Block kubelet API reachability",
+        "Kubelet API reachability exposes node administrative surface.",
+        "hybrid",
+        "Generate egress NetworkPolicy for kubelet/node ports and manual node firewall/RBAC guidance.",
+        "Re-run AgentFence.NET.KUBELET_API_REACHABLE and confirm kubelet API is unreachable.",
+        ("Block kubelet ports from workloads.", "Review node firewall rules.", "Validate metrics collection through approved paths."),
+        "egress_network_policy_manifest",
+    ),
+    "AgentFence.NET.APISERVER_DIRECT_REACHABLE": _rr(
+        "AgentFence.NET.APISERVER_DIRECT_REACHABLE",
+        "APISERVER_DIRECT_REACHABLE",
+        "Review Kubernetes API reachability",
+        "Direct API reachability plus credentials can expand blast radius.",
+        "hybrid",
+        "Generate ServiceAccount/RBAC and egress policy guidance; manual review if API access is legitimate.",
+        "Re-run AgentFence.NET.APISERVER_DIRECT_REACHABLE and confirm only approved API access remains.",
+        ("Disable unnecessary ServiceAccount tokens.", "Apply least-privilege RBAC.", "Restrict API egress where policy allows."),
+        "service_account_and_egress_patch",
+    ),
+    "AgentFence.IDENTITY.SECCOMP_BYPASS_OK": _rr(
+        "AgentFence.IDENTITY.SECCOMP_BYPASS_OK",
+        "SECCOMP_BYPASS_OK",
+        "Enable seccomp filtering",
+        "Missing or weak seccomp leaves privileged syscall surface exposed.",
+        "auto_fix",
+        "Generate seccompProfile.type: RuntimeDefault or stricter profile recommendation.",
+        "Re-run AgentFence.IDENTITY.SECCOMP_BYPASS_OK and confirm blocked syscall behavior or runtime-specific mediation evidence.",
+        ("Set seccompProfile.type: RuntimeDefault.", "Use Localhost profiles for stricter workloads after validation.", "Redeploy and re-run identity probes."),
+        "pod_security_context_patch",
+    ),
+    "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK": _rr(
+        "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK",
+        "NO_NEW_PRIVS_DISABLED",
+        "Disallow privilege escalation",
+        "NoNewPrivs disabled allows privilege-gaining execution paths.",
+        "auto_fix",
+        "Generate allowPrivilegeEscalation: false patch.",
+        "Re-run AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK and confirm NoNewPrivs is enabled.",
+        ("Set allowPrivilegeEscalation: false.", "Remove setuid helpers where possible.", "Validate startup behavior."),
+        "pod_security_context_patch",
+    ),
+    "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE": _rr(
+        "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE",
+        "CAP_BOUNDING_PERMISSIVE",
+        "Minimize Linux capability bounding set",
+        "Dangerous capabilities increase kernel and network attack surface.",
+        "auto_fix",
+        "Generate capabilities.drop: [ALL] with explicit allowlist guidance.",
+        "Re-run AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE and confirm dangerous caps are absent.",
+        ("Drop ALL capabilities.", "Re-add only documented capabilities.", "Validate workload diagnostics and networking."),
+        "capabilities_drop_patch",
+    ),
+    "AgentFence.IDENTITY.PROCFS_HIDEPID_LAX": _rr(
+        "AgentFence.IDENTITY.PROCFS_HIDEPID_LAX",
+        "PROCFS_HIDEPID_LAX",
+        "Reduce process visibility",
+        "Broad procfs process visibility aids reconnaissance.",
+        "manual_recommendation",
+        "Generate runtime/node procfs isolation guidance and validation commands.",
+        "Re-run AgentFence.IDENTITY.PROCFS_HIDEPID_LAX and confirm only expected processes are visible.",
+        ("Review runtime procfs masking.", "Avoid hostPID.", "Use sandbox/VM runtimes for untrusted workloads."),
+    ),
+    "AgentFence.SIDE.HOST_CPUINFO_LEAKED": _rr(
+        "AgentFence.SIDE.HOST_CPUINFO_LEAKED",
+        "HOST_CPUINFO_LEAKED",
+        "Reduce CPU information leakage",
+        "CPU details can support fingerprinting and side-channel planning.",
+        "manual_recommendation",
+        "Generate runtime isolation guidance and note that full mitigation may require sandbox/VM runtime selection.",
+        "Re-run AgentFence.SIDE.HOST_CPUINFO_LEAKED and compare exposed CPU details.",
+        ("Prefer sandbox/VM runtime for untrusted workloads.", "Review CPU masking support.", "Document residual side-channel risk."),
+    ),
+    "AgentFence.SIDE.HOST_DMI_LEAKED": _rr(
+        "AgentFence.SIDE.HOST_DMI_LEAKED",
+        "HOST_DMI_LEAKED",
+        "Mask host DMI information",
+        "DMI data reveals host and platform details.",
+        "manual_recommendation",
+        "Generate sysfs/DMI masking or runtime isolation guidance.",
+        "Re-run AgentFence.SIDE.HOST_DMI_LEAKED and confirm DMI paths are absent or masked.",
+        ("Remove DMI sysfs mounts.", "Review runtime masking options.", "Prefer sandbox/VM runtime isolation."),
+    ),
+    "AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE": _rr(
+        "AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE",
+        "HIGH_RES_TIMER_AVAILABLE",
+        "Assess high-resolution timer exposure",
+        "High-resolution timers can strengthen timing side channels.",
+        "manual_recommendation",
+        "Generate side-channel mitigation guidance, runtime selection notes, and workload-specific tradeoffs.",
+        "Re-run AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE and record timer resolution.",
+        ("Assess threat model for timing channels.", "Prefer stronger runtime isolation for hostile code.", "Consider scheduling and noise controls where practical."),
+    ),
+    "AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED": _rr(
+        "AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED",
+        "HOST_CACHE_TOPOLOGY_LEAKED",
+        "Reduce cache topology leakage",
+        "Cache topology details can assist side-channel analysis.",
+        "manual_recommendation",
+        "Generate runtime isolation and scheduling guidance; include residual-risk explanation.",
+        "Re-run AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED and confirm reduced topology exposure where possible.",
+        ("Prefer sandbox/VM runtime isolation.", "Use dedicated nodes for hostile workloads.", "Document residual cache side-channel risk."),
+    ),
+}
 
 
-def shell_rc(cmd, timeout=10):
-    try:
-        out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=timeout)
-        return 0, out.decode("utf-8", "replace")
-    except subprocess.CalledProcessError as e:
-        return e.returncode, e.output.decode("utf-8", "replace")
-    except Exception as e:
-        return 999, f"__ERR__ {type(e).__name__}: {e}"
+def catalog_max() -> float:
+    return sum(SEVERITY_WEIGHTS[p.severity] for p in CATALOG if is_scored_probe(p.id))
 
 
-def parse_json_from_mixed_output(text):
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    lines = [line for line in (text or "").splitlines() if line.strip()]
-    for line in reversed(lines):
-        try:
-            return json.loads(line)
-        except Exception:
-            continue
+def catalog_max_tbe() -> float:
+    return sum(SEVERITY_WEIGHTS[p.severity] for p in CATALOG if p.id in TBE_PROBE_IDS and is_scored_probe(p.id))
+
+
+def catalog_max_ele() -> float:
+    return sum(SEVERITY_WEIGHTS[p.severity] for p in CATALOG if p.id not in TBE_PROBE_IDS and is_scored_probe(p.id))
+
+
+def summarize_results(
+    results: List[TestResult], headline_alpha: float = DEFAULT_HEADLINE_ALPHA
+) -> ScoreBundle:
+    """TBE and ELE are disjoint; each probe counted in at most one layer raw sum."""
+    normalized_results = [canonical_test_result(r) for r in results]
+    passed = [
+        r
+        for r in normalized_results
+        if r.status == "pass" and is_scored_probe(r.id)
+    ]
+    passed_tbe = [r for r in passed if r.id in TBE_PROBE_IDS]
+    passed_ele = [r for r in passed if r.id not in TBE_PROBE_IDS]
+    skipped = [r.id for r in normalized_results if r.status == "skip"]
+    raw_total = sum(SEVERITY_WEIGHTS[r.severity] for r in passed)
+    raw_tbe = sum(SEVERITY_WEIGHTS[r.severity] for r in passed_tbe)
+    raw_ele = sum(SEVERITY_WEIGHTS[r.severity] for r in passed_ele)
+    if not math.isclose(raw_total, raw_tbe + raw_ele, rel_tol=0, abs_tol=1e-4):
+        raise RuntimeError(f"TBE/ELE partition mismatch {raw_total=} {raw_tbe=} {raw_ele=}")
+    mx_t = catalog_max_tbe()
+    mx_e = catalog_max_ele()
+    tbe_norm = (raw_tbe / mx_t * 10.0) if mx_t > 0 else 0.0
+    ele_norm = (raw_ele / mx_e * 10.0) if mx_e > 0 else 0.0
+    a = max(0.0, min(1.0, float(headline_alpha)))
+    headline = a * tbe_norm + (1.0 - a) * ele_norm
+    by_sev: Dict[str, int] = {}
+    for r in passed:
+        by_sev[r.severity] = by_sev.get(r.severity, 0) + 1
+    return ScoreBundle(
+        issue_count=len(passed),
+        score_raw=round(raw_total, 4),
+        tbe_issue_count=len(passed_tbe),
+        tbe_score_raw=round(raw_tbe, 4),
+        tbe_score_normalized=round(tbe_norm, 4),
+        catalog_max_tbe=round(mx_t, 4),
+        ele_issue_count=len(passed_ele),
+        ele_score_raw=round(raw_ele, 4),
+        ele_score_normalized=round(ele_norm, 4),
+        catalog_max_ele=round(mx_e, 4),
+        score_normalized=round(headline, 4),
+        headline_alpha=a,
+        catalog_version=CATALOG_VERSION,
+        by_severity=by_sev,
+        skipped=skipped,
+    )
+
+
+def score_bundle_from_dict(mb: Dict[str, Any]) -> ScoreBundle:
+    """Deserialize metrics dict (v1.2.0+; partial legacy support)."""
+    a = float(mb.get("headline_alpha", DEFAULT_HEADLINE_ALPHA))
+    if "tbe_score_raw" in mb:
+        tbe_n = float(mb.get("tbe_score_normalized", 0))
+        ele_n = float(mb.get("ele_score_normalized", 0))
+        head = float(mb.get("score_normalized", a * tbe_n + (1.0 - a) * ele_n))
+        return ScoreBundle(
+            issue_count=int(mb.get("issue_count", 0)),
+            score_raw=float(mb.get("score_raw", 0)),
+            tbe_issue_count=int(mb.get("tbe_issue_count", 0)),
+            tbe_score_raw=float(mb.get("tbe_score_raw", 0)),
+            tbe_score_normalized=float(mb.get("tbe_score_normalized", 0)),
+            catalog_max_tbe=float(mb.get("catalog_max_tbe", catalog_max_tbe())),
+            ele_issue_count=int(mb.get("ele_issue_count", 0)),
+            ele_score_raw=float(mb.get("ele_score_raw", 0)),
+            ele_score_normalized=float(mb.get("ele_score_normalized", 0)),
+            catalog_max_ele=float(mb.get("catalog_max_ele", catalog_max_ele())),
+            score_normalized=head,
+            headline_alpha=a,
+            catalog_version=str(mb.get("catalog_version", CATALOG_VERSION)),
+            by_severity=dict(mb.get("by_severity") or {}),
+            skipped=list(mb.get("skipped") or []),
+        )
+    # legacy v1.1
+    mx = float(mb.get("catalog_max", 77))
+    raw = float(mb.get("score_raw", 0))
+    exp_n = float(mb.get("exposure_score_normalized", (raw / mx * 10.0) if mx else 0))
+    mx_h = float(mb.get("catalog_max_isolation", 31))
+    raw_i = float(mb.get("isolation_score_raw", 0))
+    iso_n = float(
+        mb.get("isolation_score_normalized", (raw_i / mx_h * 10.0) if mx_h else 0)
+    )
+    head = float(mb.get("score_normalized", a * iso_n + (1.0 - a) * exp_n))
+    iso_issues = int(mb.get("isolation_issue_count", 0))
+    total_issues = int(mb.get("issue_count", 0))
+    ele_issues = max(0, total_issues - iso_issues)
+    return ScoreBundle(
+        issue_count=total_issues,
+        score_raw=raw,
+        tbe_issue_count=iso_issues,
+        tbe_score_raw=raw_i,
+        tbe_score_normalized=iso_n,
+        catalog_max_tbe=mx_h,
+        ele_issue_count=ele_issues,
+        ele_score_raw=max(0.0, raw - raw_i),
+        ele_score_normalized=exp_n,
+        catalog_max_ele=mx,
+        score_normalized=head,
+        headline_alpha=a,
+        catalog_version=str(mb.get("catalog_version", CATALOG_VERSION)),
+        by_severity=dict(mb.get("by_severity") or {}),
+        skipped=list(mb.get("skipped") or []),
+    )
+
+
+def recipe_to_dict(recipe: RemediationRecipe) -> Dict[str, Any]:
+    return {
+        "probe_id": recipe.probe_id,
+        "issue_id": recipe.issue_id,
+        "title": recipe.title,
+        "risk": recipe.risk,
+        "action_type": recipe.action_type,
+        "recommendation": recipe.recommendation,
+        "validation": recipe.validation,
+        "operator_steps": list(recipe.operator_steps),
+        "dry_run_artifact": recipe.dry_run_artifact,
+    }
+
+
+def dry_run_artifact_for_recipe(
+    recipe: RemediationRecipe, context: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    if recipe.action_type == "manual_recommendation":
+        return None
+    context = context or {}
+    target = context.get("target_pod") or context.get("workload") or "<workload>"
+    namespace = context.get("namespace") or "default"
+    artifact_kind = recipe.dry_run_artifact or "manual_patch"
+    return {
+        "artifact_kind": artifact_kind,
+        "namespace": namespace,
+        "target": target,
+        "mode": "dry_run",
+        "description": recipe.recommendation,
+        "apply_gate": "requires explicit execution approval before mutation",
+    }
+
+
+def remediation_item_from_result(
+    result: TestResult, context: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    result = canonical_test_result(result)
+    recipe = REMEDIATION_RECIPES[result.id]
+    review_only = is_review_only_probe(result.id)
+    if result.status == "pass" and review_only:
+        disposition = "needs_review"
+    elif result.status == "pass":
+        disposition = "needs_action"
+    elif result.status == "fail":
+        disposition = "not_needed"
+    else:
+        disposition = "not_assessed"
+    item = {
+        "probe_id": result.id,
+        "issue_id": recipe.issue_id,
+        "severity": result.severity,
+        "status": disposition,
+        "action_type": recipe.action_type,
+        "title": recipe.title,
+        "risk": recipe.risk,
+        "matched_clause": result.matched_clause,
+        "evidence": result.evidence,
+        "recommendation": recipe.recommendation,
+        "validation": recipe.validation,
+        "operator_steps": list(recipe.operator_steps),
+        "review_only": review_only,
+        "score_contributes": not review_only,
+        "auto_applicable": (not review_only) and recipe.action_type in ("auto_fix", "hybrid"),
+        "manual_recommendation": recipe.action_type in ("manual_recommendation", "hybrid"),
+    }
+    artifact = dry_run_artifact_for_recipe(recipe, context)
+    if artifact:
+        item["dry_run_artifact"] = artifact
+    if result.status == "skip":
+        item["note"] = "Probe was not assessed; this recipe applies if the probe later confirms unsafe behavior."
+    elif result.status == "fail":
+        item["note"] = "Probe is currently safe; remediation is not needed for this finding."
+    elif review_only:
+        item["note"] = "Review-only communication exposure observed; no score or automatic remediation is applied until workload intent is declared."
+    else:
+        item["note"] = "Unsafe behavior confirmed; apply the recommended remediation path."
+    return item
+
+
+def build_remediation_plan(
+    results: List[TestResult], context: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    items = [remediation_item_from_result(r, context) for r in results]
+    actionable = [i for i in items if i["status"] in ("needs_action", "needs_review")]
+    return {
+        "schema": "agentfence-remediation-plan-v2",
+        "coverage": {
+            "catalog_count": len(CATALOG),
+            "recipe_count": len(REMEDIATION_RECIPES),
+            "complete": set(REMEDIATION_RECIPES) == {p.id for p in CATALOG},
+        },
+        "count": len(items),
+        "actionable_count": len(actionable),
+        "items": items,
+        "actionable_items": actionable,
+        "note": "Every AgentFence probe has either auto_fix, hybrid, or manual_recommendation coverage; review-only communication exposure is reported but unscored.",
+    }
+
+
+def checkpoint_allows_mutation(checkpoint: Optional[Dict[str, Any]], dry_run: bool) -> bool:
+    if dry_run:
+        return True
+    return (checkpoint or {}).get("status") in ("verified", "verified_with_warnings")
+
+
+def target_match_labels(ctx: RunContext) -> Dict[str, str]:
+    pod = load_target_pod_json(ctx)
+    labels = ((pod or {}).get("metadata") or {}).get("labels") or {}
+    stable = {
+        k: str(v)
+        for k, v in labels.items()
+        if k
+        not in (
+            "pod-template-hash",
+            "controller-revision-hash",
+            "statefulset.kubernetes.io/pod-name",
+            "batch.kubernetes.io/controller-uid",
+            "controller-uid",
+        )
+    }
+    if stable:
+        return stable
+    return {str(k): str(v) for k, v in labels.items()}
+
+
+def workload_template_patch(resource: str, pod_spec_patch: Dict[str, Any]) -> Dict[str, Any]:
+    if resource == "cronjob":
+        return {
+            "spec": {
+                "jobTemplate": {
+                    "spec": {
+                        "template": {
+                            "spec": pod_spec_patch,
+                        }
+                    }
+                }
+            }
+        }
+    return {"spec": {"template": {"spec": pod_spec_patch}}}
+
+
+def merge_capabilities_drop_all(sc: Dict[str, Any]) -> None:
+    caps = dict(sc.get("capabilities") or {})
+    existing = caps.get("drop") or []
+    merged = sorted(set([str(x) for x in existing] + ["ALL"]))
+    caps["drop"] = merged
+    sc["capabilities"] = caps
+
+
+def workload_allows_auto_security_context(pod_spec: Dict[str, Any]) -> Tuple[bool, str]:
+    containers = pod_spec.get("containers") or []
+    init_containers = pod_spec.get("initContainers") or []
+    if len(containers) != 1 or init_containers:
+        return False, "multi-container or init-container workloads need per-container compatibility review"
+    return True, "single-container workload with no init containers"
+
+
+def _container_declares_kube_api_dependency(container: Dict[str, Any]) -> Optional[str]:
+    for env in container.get("env") or []:
+        name = str(env.get("name") or "")
+        value = str(env.get("value") or "")
+        if name.startswith("KUBE") or "kubernetes.default.svc" in value:
+            return f"container env {name!r} suggests Kubernetes API use"
+    for mount in container.get("volumeMounts") or []:
+        path = str(mount.get("mountPath") or "")
+        if path.startswith("/var/run/secrets/kubernetes.io/serviceaccount"):
+            return "container explicitly mounts the service-account token path"
     return None
 
 
-def is_inside_kubernetes():
-    return bool(os.environ.get("KUBERNETES_SERVICE_HOST")) or os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token")
+def _service_account_subject_matches(
+    subject: Dict[str, Any], namespace: str, service_account: str
+) -> bool:
+    if subject.get("kind") != "ServiceAccount":
+        return False
+    if subject.get("name") != service_account:
+        return False
+    subject_ns = subject.get("namespace")
+    return subject_ns in (None, "", namespace)
 
 
-def has_kubectl():
-    return shutil.which("kubectl") is not None
-
-
-def kubectl_get_json(ns, resource, name=None, extra_args="", timeout=30):
-    target = f"{resource} {shlex.quote(name)}" if name else resource
-    cmd = f"kubectl -n {shlex.quote(ns)} get {target} -o json {extra_args}".strip()
-    rc, out = shell_rc(cmd, timeout=timeout)
-    if rc != 0:
-        raise RuntimeError(out.strip() or f"kubectl get failed: {cmd}")
-    return json.loads(out)
-
-
-def kubectl_api_json(cmd, timeout=30):
-    rc, out = shell_rc(cmd, timeout=timeout)
-    if rc != 0:
-        raise RuntimeError(out.strip() or cmd)
-    return json.loads(out)
-
-
-def parse_bool_ok(v):
-    return isinstance(v, dict) and v.get("ok") is True
-
-
-def writable_paths(paths):
-    writable = []
-    for path in paths:
-        try:
-            if os.path.exists(path) and os.access(path, os.W_OK):
-                writable.append(path)
-        except Exception:
-            continue
-    return writable
-
-
-def find_setid_binaries(search_roots, max_hits=25):
-    hits = []
-    for root in search_roots:
-        if not os.path.isdir(root):
-            continue
-        for cur_root, _, files in os.walk(root):
-            for name in files:
-                full = os.path.join(cur_root, name)
-                try:
-                    mode = os.stat(full).st_mode
-                except Exception:
-                    continue
-                if mode & stat.S_ISUID or mode & stat.S_ISGID:
-                    hits.append(full)
-                    if len(hits) >= max_hits:
-                        return hits
-    return hits
-
-
-def risky_device_nodes():
-    nodes = []
-    for path in ("/dev/kmsg", "/dev/mem", "/dev/kmem"):
-        try:
-            if os.path.exists(path) and os.access(path, os.R_OK | os.W_OK):
-                nodes.append(path)
-        except Exception:
-            continue
-    return nodes
-
-# --------------------------- internal audit ---------------------------------
-
-def sandbox_checks(timeout):
-    res = {}
-    env = os.environ
-    has_pw = any(k in env for k in ("VNC_PW", "VNC_PASSWORD"))
-    res["no_vnc_password_in_env"] = bool_field(not has_pw, f"vars={'present' if has_pw else 'absent'}")
-
-    uid = os.geteuid() if hasattr(os, "geteuid") else 0
-    res["running_as_non_root"] = bool_field(uid != 0, f"euid={uid}")
-
-    root_opts = find_mount_opts("/")
-    res["rootfs_readonly"] = bool_field(isinstance(root_opts, str) and "ro" in root_opts, f"root_mount_opts={root_opts}")
-    writable = writable_paths(("/etc", "/bin", "/sbin", "/usr", "/root"))
-    res["sensitive_paths_readonly"] = bool_field(len(writable) == 0, f"writable={','.join(writable) or 'none'}")
-
-    setid_hits = find_setid_binaries(("/bin", "/sbin", "/usr/bin", "/usr/sbin"))
-    res["setid_binaries_absent"] = bool_field(len(setid_hits) == 0, f"found={','.join(setid_hits[:10]) or 'none'}")
-
-    mounts_txt = read_text("/proc/mounts", 2_000_000)
-    bad_mounts = []
-    for needle in ("/var/run/docker.sock", "/run/containerd/containerd.sock"):
-        if needle in mounts_txt:
-            bad_mounts.append(needle)
-    res["host_engine_sockets_absent"] = bool_field(len(bad_mounts) == 0, f"found={','.join(bad_mounts) or 'none'}")
-
-    blocked_all = True
-    evs = []
-    for host, port in (("169.254.169.254", 80), ("169.254.170.2", 80)):
-        okc, _ = tcp_connect(host, port, timeout=min(timeout, 1.0))
-        if okc:
-            blocked_all = False
-        evs.append(f"{host}:{port} reach={okc}")
-    res["cloud_imds_blocked"] = bool_field(blocked_all, "; ".join(evs))
-    risky_nodes = risky_device_nodes()
-    res["risky_device_nodes_absent"] = bool_field(len(risky_nodes) == 0, f"found={','.join(risky_nodes) or 'none'}")
-
-    return res
-
-
-def https_get(host, port=443, path="/version", cafile=None, timeout=3.0):
-    try:
-        ctx = ssl.create_default_context(cafile=cafile) if cafile and os.path.exists(cafile) else ssl.create_default_context()
-        ctx.check_hostname = False
-        with socket.create_connection((host, port), timeout=timeout) as s:
-            with ctx.wrap_socket(s, server_hostname=host) as ss:
-                req = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-                ss.sendall(req.encode("utf-8"))
-                data = ss.recv(4096).decode("utf-8", "replace")
-                m = re.search(r"HTTP/1\.[01]\s+(\d+)", data)
-                code = int(m.group(1)) if m else None
-                first = data.splitlines()[0] if data else ""
-                return True, f"HTTP {code} {first}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-
-def kubernetes_checks(timeout):
-    res = {}
-    svc_host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
-    svc_port = int(os.environ.get("KUBERNETES_SERVICE_PORT", "443"))
-    sa_dir = "/var/run/secrets/kubernetes.io/serviceaccount"
-    sa_token = os.path.join(sa_dir, "token")
-    sa_ca = os.path.join(sa_dir, "ca.crt")
-    ns_file = os.path.join(sa_dir, "namespace")
-
-    res["sa_token_present"] = bool_field(not file_exists(sa_token), f"exists={file_exists(sa_token)}")
-    res["sa_ca_present"] = bool_field(not file_exists(sa_ca), f"exists={file_exists(sa_ca)}")
-    res["sa_namespace_present"] = bool_field(not file_exists(ns_file), f"exists={file_exists(ns_file)}")
-    ro_opts = find_mount_opts(sa_dir)
-    res["sa_mount_readonly"] = bool_field(("ro" in ro_opts) if isinstance(ro_opts, str) else False, f"mount_opts={ro_opts}")
-
-    status = read_text("/proc/self/status")
-    m = re.search(r"^Seccomp:\s*(\d+)", status, re.M)
-    seccomp_mode = int(m.group(1)) if m else None
-    res["seccomp_enforced"] = bool_field(seccomp_mode == 2, f"Seccomp={seccomp_mode}")
-
-    m = re.search(r"^NoNewPrivs:\s*(\d+)", status, re.M)
-    nnp = int(m.group(1)) if m else 0
-    res["no_new_privs"] = bool_field(nnp == 1, f"NoNewPrivs={nnp}")
-
-    apparmor = read_text("/proc/self/attr/current").strip()
-    res["apparmor_profile"] = bool_field(apparmor not in ("", "unconfined"), f"profile='{apparmor}'")
-
-    mask, cap_err = cap_eff_mask()
-    caps = caps_set(mask)
-    dangerous = {"CAP_SYS_ADMIN", "CAP_SYS_PTRACE", "CAP_NET_ADMIN", "CAP_BPF", "CAP_SYS_MODULE", "CAP_SYS_TIME", "CAP_SYS_BOOT", "CAP_SYS_RAWIO"}
-    present = sorted(list(set(caps) & dangerous))
-    res["dangerous_caps_absent"] = bool_field(len(present) == 0, f"present={','.join(present) or 'none'};mask=0x{mask:x} {cap_err}".strip())
-
-    root_opts = find_mount_opts("/")
-    res["rootfs_readonly"] = bool_field(isinstance(root_opts, str) and "ro" in root_opts, f"root_mount_opts={root_opts}")
-
-    mounts_txt = read_text("/proc/mounts", 2_000_000)
-    suspicious = []
-    for needle in ("/var/run/docker.sock", "/run/containerd/containerd.sock", "/lib/modules", "/var/lib/kubelet", "/etc/kubernetes"):
-        if needle in mounts_txt:
-            suspicious.append(needle)
-    res["host_mounts_absent"] = bool_field(len(suspicious) == 0, f"found={','.join(suspicious) or 'none'}")
-
-    ok, ev = tcp_connect(svc_host, svc_port, timeout=timeout)
-    res["egress_api_tcp_443"] = bool_field(not ok, f"reachable={ok}; {ev}")
-    ok, ev = https_get(svc_host, svc_port, "/version", cafile=sa_ca if file_exists(sa_ca) else None, timeout=max(timeout, 3.0))
-    res["egress_api_https_version"] = bool_field(not ok, f"reachable={ok}; {ev}")
-
-    blocked_all = True
-    evs = []
-    for host, port in (("169.254.169.254", 80), ("169.254.170.2", 80)):
-        okc, _ = tcp_connect(host, port, timeout=min(timeout, 1.0))
-        if okc:
-            blocked_all = False
-        evs.append(f"{host}:{port} reach={okc}")
-    res["imds_blocked"] = bool_field(blocked_all, "; ".join(evs))
-
-    res["net_raw_absent"] = bool_field("CAP_NET_RAW" not in caps, f"CAP_NET_RAW={'CAP_NET_RAW' in caps}")
-    return res
-
-
-def collect_internal(timeout=2.0):
-    meta = {
-        "ts_utc": now_utc_iso(),
-        "python_version": sys.version.split()[0],
-        "platform": platform.platform(),
-        "hostname": platform.node(),
-        "cwd": os.getcwd(),
-        "uid": os.geteuid() if hasattr(os, "geteuid") else None,
-        "env_hints": {
-            "KUBERNETES_SERVICE_HOST": os.environ.get("KUBERNETES_SERVICE_HOST"),
-            "HOSTNAME": os.environ.get("HOSTNAME"),
-        },
-    }
-
-    results = {}
-    kuberes = {}
-    try:
-        results.update(sandbox_checks(timeout=timeout))
-    except Exception as e:
-        results["collector_error"] = bool_field(False, f"{type(e).__name__}: {e}")
-
-    try:
-        kuberes.update(kubernetes_checks(timeout=timeout))
-    except Exception as e:
-        kuberes["collector_error"] = bool_field(False, f"{type(e).__name__}: {e}")
-
-    total_checks = count_total(results) + count_total(kuberes)
-    passed = count_ok(results) + count_ok(kuberes)
-
-    obj = {
-        "meta": meta,
-        "results": results,
-        "kubernetes": kuberes,
-        "summary": {"passed": passed, "total": total_checks},
-    }
-    obj["remediation"] = remediation_from_audit(obj)
-    return obj
-
-
-# --------------------------- remote audit -----------------------------------
-
-DEFAULT_PORTS = [22, 80, 443, 5901, 6080, 6901, 8000, 8080, 8443, 10250, 10255]
-
-
-def kubectl_jsonpath(ns, pod, jp, timeout=20):
-    cmd = f"kubectl -n {shlex.quote(ns)} get pod {shlex.quote(pod)} -o jsonpath={shlex.quote(jp)}"
-    return shell(cmd, timeout=timeout, check=False).strip()
-
-
-def first_running_pod_by_selector(ns, selector, timeout=20):
-    cmd = (
-        f"kubectl -n {shlex.quote(ns)} get pods -l {shlex.quote(selector)} "
-        f"--field-selector=status.phase=Running -o jsonpath={{.items[0].metadata.name}}"
+def service_account_has_rbac_binding(ctx: RunContext, service_account: str) -> Tuple[bool, str]:
+    role_bindings = kubectl_get_json(
+        ctx.kubeconfig,
+        ["get", "rolebindings.rbac.authorization.k8s.io", "-n", ctx.namespace],
     )
-    out = shell(cmd, timeout=timeout, check=False).strip()
-    return out or None
+    if role_bindings is None:
+        return True, "unable to inspect namespaced RoleBindings"
+    for rb in role_bindings.get("items") or []:
+        for subject in rb.get("subjects") or []:
+            if _service_account_subject_matches(subject, ctx.namespace, service_account):
+                name = ((rb.get("metadata") or {}).get("name")) or "<unnamed>"
+                return True, f"service account is referenced by RoleBinding {name}"
 
-
-def pod_exists(ns, pod, timeout=20):
-    out = shell(f"kubectl -n {shlex.quote(ns)} get pod {shlex.quote(pod)} -o name", timeout=timeout, check=False)
-    return f"pod/{pod}" in out
-
-
-def ensure_attacker_pod(ns, prefer_name="attacker", create_if_missing=True):
-    if pod_exists(ns, prefer_name):
-        return prefer_name, False
-    existing = first_running_pod_by_selector(ns, "role=attacker")
-    if existing:
-        return existing, False
-    existing = first_running_pod_by_selector(ns, "app=attacker")
-    if existing:
-        return existing, False
-    if not create_if_missing:
-        raise RuntimeError(f"attacker pod '{prefer_name}' not found")
-    tmp_name = "atk-tmp-" + str(int(time.time()))
-    shell(
-        f"kubectl -n {shlex.quote(ns)} run {shlex.quote(tmp_name)} "
-        f"--image=nicolaka/netshoot --restart=Never --labels=app=attacker,role=attacker "
-        f"--requests=cpu=100m,memory=128Mi --limits=cpu=250m,memory=256Mi -- tail -f /dev/null",
-        check=True,
-        timeout=120,
+    cluster_role_bindings = kubectl_get_json(
+        ctx.kubeconfig,
+        ["get", "clusterrolebindings.rbac.authorization.k8s.io"],
     )
-    shell(f"kubectl -n {shlex.quote(ns)} wait --for=condition=Ready pod/{shlex.quote(tmp_name)} --timeout=120s", check=True, timeout=130)
-    return tmp_name, True
+    if cluster_role_bindings is None:
+        return True, "unable to inspect ClusterRoleBindings"
+    for crb in cluster_role_bindings.get("items") or []:
+        for subject in crb.get("subjects") or []:
+            if _service_account_subject_matches(subject, ctx.namespace, service_account):
+                name = ((crb.get("metadata") or {}).get("name")) or "<unnamed>"
+                return True, f"service account is referenced by ClusterRoleBinding {name}"
+    return False, "no RoleBinding or ClusterRoleBinding references the service account"
 
 
-def degraded_remote_result(reason, detail=""):
-    return {"ok": False, "skipped": True, "reason": reason, "detail": detail or ""}
+def workload_allows_auto_service_account_token(
+    ctx: RunContext, pod_spec: Dict[str, Any]
+) -> Tuple[bool, str]:
+    automount = pod_spec.get("automountServiceAccountToken")
+    if automount is False:
+        return False, "service-account token automount is already disabled"
+    if automount is True:
+        return False, "service-account token automount is explicitly enabled in the workload"
+
+    service_account = str(pod_spec.get("serviceAccountName") or "default")
+    if service_account != "default":
+        return False, f"dedicated service account {service_account!r} needs API-use review"
+
+    for volume in pod_spec.get("volumes") or []:
+        projected_sources = ((volume.get("projected") or {}).get("sources")) or []
+        if any("serviceAccountToken" in source for source in projected_sources):
+            return False, "workload declares an explicit projected service-account token"
+
+    for container in (pod_spec.get("containers") or []) + (pod_spec.get("initContainers") or []):
+        reason = _container_declares_kube_api_dependency(container)
+        if reason:
+            return False, reason
+
+    has_binding, reason = service_account_has_rbac_binding(ctx, service_account)
+    if has_binding:
+        return False, reason
+    return True, "default service account has no explicit API dependency or RBAC binding"
 
 
-def attacker_exec(ns, atk_pod, cmd, timeout=60):
-    return shell(f"kubectl -n {shlex.quote(ns)} exec {shlex.quote(atk_pod)} -- sh -lc {shlex.quote(cmd)}", timeout=timeout, check=False)
-
-
-def probe_http_head(ns, atk_pod, ip, port, path="/"):
-    out = attacker_exec(ns, atk_pod, f"curl -sI --max-time 3 http://{ip}:{port}{path} | head -n 1")
-    return {"ok": bool(out.strip()), "status_line": out.strip()}
-
-
-def probe_ws_upgrade(ns, atk_pod, ip, port, path="/websockify"):
-    req = (
-        f"printf 'GET {path} HTTP/1.1\\r\\nHost: {ip}:{port}\\r\\nUpgrade: websocket\\r\\n"
-        f"Connection: Upgrade\\r\\nSec-WebSocket-Key: x\\r\\nSec-WebSocket-Version: 13\\r\\n\\r\\n' "
-        f"| nc -v -w 2 {ip} {port} | head -n 2"
-    )
-    out = attacker_exec(ns, atk_pod, req)
-    return {"raw": out, "switching_protocols_101": ("101" in out and "Switching Protocols" in out)}
-
-
-def probe_nc(ns, atk_pod, ip, port):
-    out = attacker_exec(ns, atk_pod, f"nc -vz -w 1 {ip} {port} 2>&1 || true")
-    reachable = any(s in out.lower() for s in ["succeeded", "open"])
-    return {"port": port, "reachable": reachable, "nc_output": out.strip()}
-
-
-def ensure_python_in_attacker(ns, atk_pod):
-    attacker_exec(ns, atk_pod, "command -v python3 >/dev/null 2>&1 || apk add --no-cache python3 >/dev/null 2>&1 || true")
-
-
-def rfb_probe(ns, atk_pod, ip, port=5901, timeout=2, proofsafe=True):
-    ensure_python_in_attacker(ns, atk_pod)
-    py = """\
-import socket, sys, json, struct
-ip=sys.argv[1]; port=int(sys.argv[2]); to=float(sys.argv[3]); proof = (sys.argv[4]=='1')
-out = {}
-try:
-    s=socket.create_connection((ip,port), to); s.settimeout(to)
-    banner = s.recv(12)
-    if len(banner) < 12:
-        out['error']='short_banner'; print(json.dumps(out)); sys.exit(0)
-    out['banner']=banner.decode(errors='ignore').strip()
-    ver = banner.strip().split(b' ')[-1]
-    s.sendall(b'RFB ' + ver + b'\\n')
-    n = s.recv(1)
-    if not n:
-        out['error']='no_security_types'; print(json.dumps(out)); sys.exit(0)
-    n = n[0]
-    types = list(s.recv(n))
-    out['types']=types
-    none_available = 1 in types
-    out['none_available'] = none_available
-    if none_available and proof:
-        s.sendall(bytes([1]))
-        s.settimeout(to)
-        secres = s.recv(4)
-        if len(secres)==4:
-            (code,) = struct.unpack('!I', secres)
-            if code != 0:
-                out['error']=f'security_result_nonzero_{code}'
-                out['classification']='unauthenticated_vnc'
-                print(json.dumps(out)); sys.exit(0)
-        s.sendall(b'\\x01')
-        hdr = s.recv(24)
-        if len(hdr) < 24:
-            out['error']='short_serverinit_header'
-            out['classification']='unauthenticated_vnc'
-            print(json.dumps(out)); sys.exit(0)
-        w,h = struct.unpack('!HH', hdr[:4])
-        nameLen = struct.unpack('!I', s.recv(4))[0]
-        name = s.recv(nameLen).decode(errors='ignore')
-        out['proofsafe_serverinit'] = {'width': int(w), 'height': int(h), 'name': name}
-        out['classification'] = 'proofsafe_serverinit_ok'
-    else:
-        out['classification'] = 'unauthenticated_vnc' if none_available else 'password_required'
-except Exception as e:
-    out['error']=str(e)
-    out['classification']='error'
-print(json.dumps(out))
-"""
-    proof_flag = "1" if proofsafe else "0"
-    cmd = (
-        f"kubectl -n {shlex.quote(ns)} exec {shlex.quote(atk_pod)} -- "
-        f"python3 -c {shlex.quote(py)} {shlex.quote(ip)} {int(port)} {float(timeout)} {proof_flag}"
-    )
-    out = shell(cmd, check=False, timeout=90)
-    try:
-        return json.loads(out)
-    except Exception:
-        return {"classification": "error", "error": "json_parse", "raw": out}
-
-
-def optional_internal_introspection(ns, pod):
-    data = {"ok": False}
-    ps = shell(
-        f"kubectl -n {shlex.quote(ns)} exec {shlex.quote(pod)} -- sh -lc "
-        + shlex.quote('ps aux | egrep -i "novnc|websock|tigervnc|vncserver|computer_server" | grep -v egrep || true'),
-        check=False,
-        timeout=60,
-    )
-    ls = shell(
-        f"kubectl -n {shlex.quote(ns)} exec {shlex.quote(pod)} -- sh -lc "
-        + shlex.quote('ss -lntp || netstat -tlnp || true'),
-        check=False,
-        timeout=60,
-    )
-    env = shell(
-        f"kubectl -n {shlex.quote(ns)} exec {shlex.quote(pod)} -- sh -lc "
-        + shlex.quote('env | egrep -i "VNC|NOVNC|COMPUTER" || true'),
-        check=False,
-        timeout=60,
-    )
-    data["processes"] = ps.strip()
-    data["listening"] = ls.strip()
-    data["env"] = env.strip()
-    data["ok"] = True
-    return data
-
-
-def internal_python_stdin_launcher(timeout):
-    argv = json.dumps(["combined_audit_with_remediation.py", "internal", "--timeout", str(float(timeout)), "--stdout-json"])
-    return (
-        "python3 -c "
-        + shlex.quote(
-            "import sys; "
-            f"sys.argv={argv}; "
-            "src=sys.stdin.read(); "
-            "ns={'__name__':'__main__','__file__':'combined_audit_with_remediation.py'}; "
-            "exec(compile(src, 'combined_audit_with_remediation.py', 'exec'), ns, ns)"
-        )
-    )
-
-
-def run_internal_via_kubectl(ns, pod, timeout=2.0):
-    script_text = read_text(os.path.abspath(__file__), max_bytes=5_000_000)
-    remote_cmd = internal_python_stdin_launcher(timeout)
-    try:
-        proc = subprocess.run(
-            ["kubectl", "-n", ns, "exec", "-i", pod, "--", "sh", "-lc", remote_cmd],
-            input=script_text.encode("utf-8"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=300,
-            check=False,
-        )
-        out = proc.stdout.decode("utf-8", "replace")
-        parsed = parse_json_from_mixed_output(out)
-        if parsed is not None:
-            return parsed
-        return {"error": "internal_exec_parse_failed", "raw": out}
-    except Exception as e:
-        return {"error": f"internal_exec_failed: {type(e).__name__}: {e}"}
-
-
-def collect_remote(ns, selector, timeout=2.0, include_introspection=True, include_internal_audit=False):
-    ts = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    meta = {
-        "ts_utc": ts,
-        "namespace": ns,
-        "target_selector": selector,
-        "tool": "combined_sandbox_audit",
-        "host": os.uname().sysname + " " + os.uname().release,
-    }
-
-    target_pod = first_running_pod_by_selector(ns, selector)
-    if not target_pod:
-        raise RuntimeError(f"No running target pod found with selector: {selector}")
-
-    target_ip = kubectl_jsonpath(ns, target_pod, "{.status.podIP}") or ""
-    img = kubectl_jsonpath(ns, target_pod, "{.spec.containers[0].image}") or ""
-    image_id = kubectl_jsonpath(ns, target_pod, "{.status.containerStatuses[0].imageID}") or ""
-    node = kubectl_jsonpath(ns, target_pod, "{.spec.nodeName}") or ""
-
-    meta.update({
-        "target_pod": target_pod,
-        "target_ip": target_ip,
-        "node": node,
-        "image": img,
-        "imageID": image_id,
-    })
-    try:
-        discovered = discover_workload_from_pod(ns, target_pod)
-        meta.update({
-            "workload_name": discovered.get("workload_name"),
-            "workload_kind": (discovered.get("workload_kind") or "").lower(),
-            "container_names": discovered.get("container_names", []),
-            "service_account_name": discovered.get("service_account_name"),
-            "selector_labels": discovered.get("selector_labels", {}),
-        })
-        if discovered.get("selector"):
-            meta["target_selector"] = discovered.get("selector")
-    except Exception as e:
-        meta["discovery_error"] = str(e)
-
-    attacker_name = None
-    created_tmp = False
-    attacker_error = None
-    try:
-        attacker_name, created_tmp = ensure_attacker_pod(ns, prefer_name="attacker", create_if_missing=True)
-        meta["attacker_pod"] = attacker_name
-        meta["attacker_created_tmp"] = created_tmp
-    except Exception as e:
-        attacker_error = f"{type(e).__name__}: {e}"
-        meta["attacker_pod"] = None
-        meta["attacker_created_tmp"] = False
-        meta["attacker_setup_error"] = attacker_error
-
-    results = {
-        "scanned_ports": [],
-        "novnc_http_6901": {},
-        "novnc_ws_6901": {},
-        "vnc_rfb_5901": {},
-        "internal_introspection": {},
-        "internal_audit": {},
-        "classification": "unknown",
-    }
-
-    if attacker_name:
-        for p in DEFAULT_PORTS:
-            if not target_ip:
-                results["scanned_ports"].append({"port": p, "reachable": False, "nc_output": "no target_ip"})
-                continue
-            results["scanned_ports"].append(probe_nc(ns, attacker_name, target_ip, p))
-
-        if target_ip:
-            results["novnc_http_6901"] = probe_http_head(ns, attacker_name, target_ip, 6901, path="/")
-            results["novnc_ws_6901"] = probe_ws_upgrade(ns, attacker_name, target_ip, 6901, path="/websockify")
-            results["vnc_rfb_5901"] = rfb_probe(ns, attacker_name, target_ip, port=5901, timeout=timeout, proofsafe=True)
-    else:
-        for p in DEFAULT_PORTS:
-            results["scanned_ports"].append({"port": p, "reachable": False, "nc_output": f"skipped: {attacker_error or 'no attacker pod available'}"})
-        results["novnc_http_6901"] = degraded_remote_result("attacker_unavailable", attacker_error)
-        results["novnc_ws_6901"] = degraded_remote_result("attacker_unavailable", attacker_error)
-        results["vnc_rfb_5901"] = {"classification": "skipped_attacker_unavailable", "error": attacker_error or "no attacker pod available"}
-
-    if include_introspection:
-        try:
-            results["internal_introspection"] = optional_internal_introspection(ns, target_pod)
-        except Exception as e:
-            results["internal_introspection"] = {"ok": False, "error": str(e)}
-
-    if include_internal_audit:
-        try:
-            results["internal_audit"] = run_internal_via_kubectl(ns, target_pod, timeout=timeout)
-        except Exception as e:
-            results["internal_audit"] = {"error": str(e)}
-
-    rfb_class = (results.get("vnc_rfb_5901") or {}).get("classification", "")
-    reachable_6901 = bool(results.get("novnc_http_6901", {}).get("ok")) and "200" in (results.get("novnc_http_6901", {}).get("status_line", ""))
-    ws_ok = bool(results.get("novnc_ws_6901", {}).get("switching_protocols_101"))
-    vnc5901_open = any(x for x in results["scanned_ports"] if x["port"] == 5901 and x["reachable"])
-
-    if not attacker_name:
-        results["classification"] = "remote_probe_skipped_attacker_unavailable"
-    elif rfb_class in ("proofsafe_serverinit_ok", "unauthenticated_vnc"):
-        results["classification"] = "remotely_reachable_from_pod_and_unauthenticated_vnc"
-    elif rfb_class == "password_required":
-        results["classification"] = "remotely_reachable_from_pod_but_password_required"
-    elif reachable_6901 and ws_ok and vnc5901_open:
-        results["classification"] = "remotely_reachable_from_pod_partial_signals"
-    else:
-        results["classification"] = "not_reachable_or_insufficient_signals"
-
-    if created_tmp:
-        try:
-            shell(f"kubectl -n {shlex.quote(ns)} delete pod {shlex.quote(attacker_name)} --grace-period=0 --force", check=False, timeout=60)
-        except Exception:
-            pass
-
-    obj = {"meta": meta, "results": results}
-    obj["remediation"] = remediation_from_audit(obj)
-    return obj
-
-
-
-
-
-
-def autodetect_namespace(default="default"):
-    ns_file = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-    if os.path.exists(ns_file):
-        val = read_text(ns_file, 4096).strip()
-        if val and not val.startswith("__ERR__"):
-            return val
-    ctx_ns = shell("kubectl config view --minify --output 'jsonpath={..namespace}'", timeout=10).strip() if has_kubectl() else ""
-    return ctx_ns or default
-
-
-def list_running_pods(ns, timeout=30):
-    obj = kubectl_get_json(ns, 'pods', extra_args='--field-selector=status.phase=Running', timeout=timeout)
-    return obj.get('items', [])
-
-
-def pod_matches_selector(pod, selector):
-    labels = ((pod or {}).get('metadata') or {}).get('labels') or {}
-    for part in (selector or '').split(','):
-        part = part.strip()
-        if not part:
-            continue
-        if '=' not in part:
+def selector_matches_labels(selector: Dict[str, Any], labels: Dict[str, str]) -> bool:
+    if not selector:
+        return True
+    for key, value in (selector.get("matchLabels") or {}).items():
+        if str(labels.get(key)) != str(value):
             return False
-        k, v = part.split('=', 1)
-        if labels.get(k.strip()) != v.strip():
+    for expr in selector.get("matchExpressions") or []:
+        key = str(expr.get("key") or "")
+        op = str(expr.get("operator") or "")
+        values = {str(v) for v in expr.get("values") or []}
+        present = key in labels
+        current = str(labels.get(key) or "")
+        if op == "In" and current not in values:
+            return False
+        if op == "NotIn" and current in values:
+            return False
+        if op == "Exists" and not present:
+            return False
+        if op == "DoesNotExist" and present:
             return False
     return True
 
 
-def labels_to_selector(labels):
-    if not labels:
-        return ''
-    ordered = sorted(labels.items())
-    return ','.join(f"{k}={v}" for k, v in ordered)
+def selector_to_label_arg(selector: Dict[str, Any]) -> str:
+    parts = []
+    for key, value in (selector.get("matchLabels") or {}).items():
+        parts.append(f"{key}={value}")
+    return ",".join(parts)
 
 
-def discover_workload_from_pod(ns, pod_name, timeout=30):
-    pod = kubectl_get_json(ns, 'pod', pod_name, timeout=timeout)
-    md = pod.get('metadata', {})
-    spec = pod.get('spec', {})
-    status = pod.get('status', {})
-    out = {
-        'namespace': ns,
-        'pod_name': pod_name,
-        'pod_ip': status.get('podIP', ''),
-        'node_name': spec.get('nodeName', ''),
-        'service_account_name': spec.get('serviceAccountName') or 'default',
-        'container_names': [c.get('name') for c in spec.get('containers', []) if c.get('name')],
-        'pod_labels': md.get('labels', {}) or {},
-        'workload_kind': None,
-        'workload_name': None,
-        'selector_labels': {},
-    }
-    owners = md.get('ownerReferences') or []
-    if not owners:
-        out['workload_kind'] = 'Pod'
-        out['workload_name'] = pod_name
-        out['selector_labels'] = {k:v for k,v in out['pod_labels'].items() if k not in ('pod-template-hash','controller-revision-hash')}
-        return out
-    owner = owners[0]
-    kind = owner.get('kind')
-    name = owner.get('name')
-    if kind == 'ReplicaSet' and name:
-        rs = kubectl_get_json(ns, 'replicaset', name, timeout=timeout)
-        rs_owners = (rs.get('metadata', {}).get('ownerReferences') or [])
-        if rs_owners and rs_owners[0].get('kind') == 'Deployment':
-            kind = 'Deployment'
-            name = rs_owners[0].get('name')
-            dep = kubectl_get_json(ns, 'deployment', name, timeout=timeout)
-            out['selector_labels'] = (((dep.get('spec', {}) or {}).get('selector', {}) or {}).get('matchLabels') or {})
-        else:
-            out['selector_labels'] = (((rs.get('spec', {}) or {}).get('selector', {}) or {}).get('matchLabels') or {})
-    elif kind == 'StatefulSet' and name:
-        ss = kubectl_get_json(ns, 'statefulset', name, timeout=timeout)
-        out['selector_labels'] = (((ss.get('spec', {}) or {}).get('selector', {}) or {}).get('matchLabels') or {})
-    elif kind == 'DaemonSet' and name:
-        ds = kubectl_get_json(ns, 'daemonset', name, timeout=timeout)
-        out['selector_labels'] = (((ds.get('spec', {}) or {}).get('selector', {}) or {}).get('matchLabels') or {})
-    else:
-        out['selector_labels'] = {k:v for k,v in out['pod_labels'].items() if k not in ('pod-template-hash','controller-revision-hash')}
-    out['workload_kind'] = kind or 'Pod'
-    out['workload_name'] = name or pod_name
-    if not out['selector_labels']:
-        out['selector_labels'] = {k:v for k,v in out['pod_labels'].items() if k not in ('pod-template-hash','controller-revision-hash')}
-    return out
+def _tcp_ip_from_cidr(cidr: str) -> Optional[str]:
+    try:
+        net = ipaddress.ip_network(str(cidr), strict=False)
+    except ValueError:
+        return None
+    if net.version == 4 and net.prefixlen == 32:
+        return str(net.network_address)
+    if net.version == 6 and net.prefixlen == 128:
+        return str(net.network_address)
+    return None
 
 
-def autodiscover_remote_target(ns=None, selector=None, timeout=30):
-    ns = ns or autodetect_namespace('default')
-    pods = list_running_pods(ns, timeout=timeout)
-    if selector:
-        pods = [p for p in pods if pod_matches_selector(p, selector)]
-    scored = []
-    for p in pods:
-        md = p.get('metadata', {})
-        name = md.get('name', '')
-        labels = md.get('labels', {}) or {}
-        score = 0
-        for key in ('app','sandbox','runtime','component'):
-            val = labels.get(key, '').lower()
-            if any(tok in val for tok in ('cua','gvisor','kata','wasm','spin','sandbox','agent')):
-                score += 3
-        if 'attacker' in name:
-            score -= 10
-        if 'agent' in name:
-            score -= 2
-        if md.get('ownerReferences'):
-            score += 1
-        scored.append((score, name, p))
-    if not scored:
-        raise RuntimeError(f'No running pods found in namespace {ns}')
-    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    pod = scored[0][2]
-    discovered = discover_workload_from_pod(ns, pod.get('metadata', {}).get('name'), timeout=timeout)
-    discovered['selector'] = selector or labels_to_selector(discovered.get('selector_labels') or {})
-    if not discovered['selector']:
-        discovered['selector'] = labels_to_selector({k:v for k,v in discovered.get('pod_labels', {}).items() if k not in ('pod-template-hash','controller-revision-hash')})
-    return discovered
-
-
-def autodetect_mode():
-    inside = is_inside_kubernetes()
-    if inside and not has_kubectl():
-        return 'internal'
-    if has_kubectl():
-        return 'both'
-    return 'internal'
-
-
-def list_candidate_resources(ns, timeout=30):
-    pods = list_running_pods(ns, timeout=timeout)
-    resources = []
+def capture_connectivity_expectations(
+    ctx: RunContext, pod_labels: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """Capture concrete TCP egress endpoints from NetworkPolicies that select the pod."""
+    policies = kubectl_get_json(ctx.kubeconfig, ["get", "networkpolicies.networking.k8s.io", "-n", ctx.namespace])
+    expectations: List[Dict[str, Any]] = []
     seen = set()
-    for pod in pods:
-        name = ((pod.get('metadata') or {}).get('name') or '')
-        if not name:
+    for policy in (policies or {}).get("items") or []:
+        spec = policy.get("spec") or {}
+        if not selector_matches_labels(spec.get("podSelector") or {}, pod_labels):
             continue
-        try:
-            info = discover_workload_from_pod(ns, name, timeout=timeout)
-        except Exception:
+        if "Egress" not in (spec.get("policyTypes") or []):
             continue
-        key = (info.get('workload_kind') or 'Pod', info.get('workload_name') or name, info.get('selector') or labels_to_selector(info.get('selector_labels') or {}))
-        if key in seen:
-            continue
-        seen.add(key)
-        info['selector'] = info.get('selector') or labels_to_selector(info.get('selector_labels') or {})
-        resources.append(info)
-    resources.sort(key=lambda x: ((x.get('workload_kind') or ''), (x.get('workload_name') or ''), (x.get('pod_name') or '')))
-    return resources
+        policy_name = ((policy.get("metadata") or {}).get("name")) or ""
+        for rule in spec.get("egress") or []:
+            tcp_ports = []
+            for port in rule.get("ports") or []:
+                if str(port.get("protocol") or "TCP").upper() != "TCP":
+                    continue
+                raw_port = port.get("port")
+                if isinstance(raw_port, int):
+                    tcp_ports.append(raw_port)
+                elif isinstance(raw_port, str) and raw_port.isdigit():
+                    tcp_ports.append(int(raw_port))
+            if not tcp_ports:
+                continue
+            for to in rule.get("to") or []:
+                ip_block = to.get("ipBlock") or {}
+                host = _tcp_ip_from_cidr(str(ip_block.get("cidr") or ""))
+                if not host:
+                    continue
+                for port in tcp_ports:
+                    key = (policy_name, host, port)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    expectations.append(
+                        {
+                            "source_policy": policy_name,
+                            "host": host,
+                            "port": port,
+                            "protocol": "TCP",
+                            "reason": "captured from concrete NetworkPolicy egress ipBlock before remediation",
+                        }
+                    )
+    return expectations[:12]
 
 
-def print_resource_list(resources, title='Discovered resources'):
-    print(f"\n=== {title} ===")
-    if not resources:
-        print('No resources discovered.')
-        return
-    for idx, r in enumerate(resources, start=1):
-        selector = r.get('selector') or labels_to_selector(r.get('selector_labels') or {}) or '-'
-        print(f"{idx}. {r.get('workload_kind','Pod')}/{r.get('workload_name')}")
-        print(f"   pod={r.get('pod_name','-')}  ns={r.get('namespace','-')}  sa={r.get('service_account_name','-')}")
-        print(f"   containers={','.join(r.get('container_names') or []) or '-'}")
-        print(f"   selector={selector}")
+def workload_pods_for_snapshot(ctx: RunContext, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    selector = ((snapshot.get("selector") or {}).get("matchLabels")) or {}
+    if selector:
+        label_arg = ",".join(f"{k}={v}" for k, v in selector.items())
+        data = kubectl_get_json(ctx.kubeconfig, ["get", "pods", "-n", ctx.namespace, "-l", label_arg])
+        return (data or {}).get("items") or []
+    pod = load_target_pod_json(ctx)
+    return [pod] if pod else []
 
 
-def prompt_resource_selection(resources):
-    if not resources:
-        raise RuntimeError('No resources available for selection')
-    while True:
-        raw = prompt('Select resource number', '1')
-        if raw.isdigit():
-            idx = int(raw)
-            if 1 <= idx <= len(resources):
-                return resources[idx - 1]
-        print(f'Enter a number from 1 to {len(resources)}')
-
-# --------------------------- remediation module ----------------------------
-
-def make_remediation_item(issue_id, severity, title, rationale, actions, snippet=None, refs=None):
+def capture_workload_config_before_patch(
+    ctx: RunContext,
+    workload_ref: Dict[str, Any],
+    workload_json: Dict[str, Any],
+    pod_spec: Dict[str, Any],
+) -> Dict[str, Any]:
+    pod = load_target_pod_json(ctx) or {}
+    pod_labels = ((pod.get("metadata") or {}).get("labels")) or {}
+    metadata = workload_json.get("metadata") or {}
+    spec = workload_json.get("spec") or {}
+    selector = spec.get("selector") or {}
+    template = spec.get("template") or {}
+    template_spec = template.get("spec") or pod_spec
+    pods_before = []
+    for item in workload_pods_for_snapshot(
+        ctx,
+        {
+            "selector": selector,
+        },
+    ):
+        pod_meta = item.get("metadata") or {}
+        pods_before.append(
+            {
+                "name": pod_meta.get("name"),
+                "uid": pod_meta.get("uid"),
+                "phase": ((item.get("status") or {}).get("phase")),
+            }
+        )
     return {
-        "issue_id": issue_id,
-        "severity": severity,
-        "title": title,
-        "rationale": rationale,
-        "actions": actions,
-        "snippet": snippet or "",
-        "refs": refs or [],
+        "schema": "agentfence-workload-config-before-autofix-v1",
+        "captured_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "namespace": ctx.namespace,
+        "target_pod": ctx.target_pod,
+        "target_container": ctx.target_container,
+        "workload_reference": workload_ref,
+        "workload_api_version": workload_json.get("apiVersion"),
+        "workload_kind": workload_json.get("kind"),
+        "workload_name": metadata.get("name"),
+        "replicas": spec.get("replicas"),
+        "selector": selector,
+        "template_labels": ((template.get("metadata") or {}).get("labels")) or {},
+        "service_account": template_spec.get("serviceAccountName") or "default",
+        "runtime_class": template_spec.get("runtimeClassName"),
+        "node_selector": template_spec.get("nodeSelector") or {},
+        "pod_security_context": template_spec.get("securityContext") or {},
+        "automount_service_account_token": template_spec.get("automountServiceAccountToken"),
+        "containers": [
+            {
+                "name": c.get("name"),
+                "image": c.get("image"),
+                "ports": c.get("ports") or [],
+                "security_context": c.get("securityContext"),
+                "readiness_probe": c.get("readinessProbe"),
+                "liveness_probe": c.get("livenessProbe"),
+            }
+            for c in template_spec.get("containers") or []
+        ],
+        "init_containers": [
+            {
+                "name": c.get("name"),
+                "image": c.get("image"),
+                "security_context": c.get("securityContext"),
+            }
+            for c in template_spec.get("initContainers") or []
+        ],
+        "pods_before": pods_before,
+        "connectivity_expectations": capture_connectivity_expectations(ctx, pod_labels),
     }
 
 
-def yaml_block_pod_hardening(selector="app=cua"):
-    key, value = selector.split("=", 1) if "=" in selector else ("app", "REPLACE_ME")
-    return f'''apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: REPLACE_ME
-spec:
-  template:
-    metadata:
-      labels:
-        {key}: {value}
-    spec:
-      automountServiceAccountToken: false
-      containers:
-      - name: REPLACE_ME
-        securityContext:
-          runAsNonRoot: true
-          runAsUser: 10001
-          runAsGroup: 10001
-          allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: true
-          capabilities:
-            drop: ["ALL"]
-          seccompProfile:
-            type: RuntimeDefault'''
-
-
-def yaml_block_networkpolicy(namespace="default", selector="app=cua"):
-    key, value = selector.split("=", 1) if "=" in selector else ("app", "cua")
-    return f'''apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: sandbox-default-deny
-  namespace: {namespace}
-spec:
-  podSelector:
-    matchLabels:
-      {key}: {value}
-  policyTypes:
-  - Ingress
-  - Egress
-  ingress: []
-  egress:
-  - to:
-    - namespaceSelector: {{}}
-      podSelector:
-        matchLabels:
-          k8s-app: kube-dns
-    ports:
-    - protocol: UDP
-      port: 53
-    - protocol: TCP
-      port: 53'''
-
-
-def yaml_block_service_account(namespace="default"):
-    return f'''apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: sandbox-sa
-  namespace: {namespace}
-automountServiceAccountToken: false'''
-
-
-def yaml_block_novnc_service_note():
+def tcp_connectivity_command(host: str, port: int) -> str:
     return (
-        "Remove or disable noVNC/VNC listeners unless they are strictly required. If required, place them behind authenticated ingress, "
-        "disable anonymous access, and restrict source access with NetworkPolicy or firewall rules."
+        f"HOST={shlex.quote(host)} PORT={int(port)}; export HOST PORT; "
+        "if command -v python3 >/dev/null 2>&1; then PY=python3; "
+        "elif command -v python >/dev/null 2>&1; then PY=python; else PY=''; fi; "
+        "if [ -n \"$PY\" ]; then \"$PY\" - <<'PY'\n"
+        "import os, socket, sys\n"
+        "host=os.environ['HOST']; port=int(os.environ['PORT'])\n"
+        "try:\n"
+        "    s=socket.create_connection((host, port), 5)\n"
+        "    s.close()\n"
+        "    print('OK')\n"
+        "except Exception as e:\n"
+        "    print(type(e).__name__ + ': ' + str(e))\n"
+        "    sys.exit(1)\n"
+        "PY\n"
+        "elif command -v nc >/dev/null 2>&1; then nc -z -w 5 \"$HOST\" \"$PORT\" && echo OK; "
+        "elif command -v timeout >/dev/null 2>&1; then timeout 5 sh -c '</dev/tcp/'\"$HOST\"'/'\"$PORT\" && echo OK; "
+        "else echo NO_TCP_CHECK_TOOL; exit 2; fi"
     )
 
 
-def remediation_from_audit(obj):
-    meta = obj.get("meta", {})
-    results = obj.get("results", {}) or {}
-    k8s = obj.get("kubernetes", {}) or {}
-    rem = []
-    ns = meta.get("namespace", "default")
-    selector = meta.get("target_selector", "app=cua")
-
-    def failed(section, key):
-        val = section.get(key)
-        return isinstance(val, dict) and val.get("ok") is False
-
-    def passed(section, key):
-        val = section.get(key)
-        return isinstance(val, dict) and val.get("ok") is True
-
-    def listener_open(section, key):
-        val = section.get(key)
-        if not isinstance(val, dict):
-            return False
-        evidence = str(val.get("evidence", ""))
-        return "listener_open=True" in evidence
-
-    if failed(results, "running_as_non_root"):
-        rem.append(make_remediation_item(
-            "RUN_AS_ROOT",
-            "high",
-            "Run workload as non-root",
-            "Root execution increases post-compromise impact and expands the effect of container escape or filesystem abuse.",
-            [
-                "Set runAsNonRoot: true and a fixed non-zero runAsUser/runAsGroup.",
-                "Ensure the image filesystem permissions support the non-root UID.",
-                "Avoid sudo inside the image and remove unnecessary setuid binaries."
-            ],
-            yaml_block_pod_hardening(selector),
-            ["Kubernetes securityContext", "Pod Security Standards"]
-        ))
-
-    if failed(results, "rootfs_readonly") or failed(k8s, "rootfs_readonly"):
-        rem.append(make_remediation_item(
-            "ROOTFS_RW",
-            "high",
-            "Mount the root filesystem read-only",
-            "Writable root filesystems make persistence and tampering easier after compromise.",
-            [
-                "Set readOnlyRootFilesystem: true.",
-                "Move writable paths to explicit emptyDir or persistent volumes.",
-                "Validate startup scripts and temp directories still work after the change."
-            ],
-            yaml_block_pod_hardening(selector),
-            ["Kubernetes securityContext"]
-        ))
-
-    if failed(results, "sensitive_paths_readonly"):
-        rem.append(make_remediation_item(
-            "SENSITIVE_PATHS_WRITABLE",
-            "high",
-            "Make sensitive filesystem paths read-only",
-            "Writable system paths such as /etc or /usr make tampering and persistence easier after compromise.",
-            [
-                "Keep system directories on a read-only layer.",
-                "Redirect legitimate writes into explicit writable volumes only.",
-                "Validate package managers, startup scripts, and app temp paths after tightening mounts."
-            ],
-            yaml_block_pod_hardening(selector),
-            ["Filesystem hardening", "Immutable infrastructure"]
-        ))
-
-    if failed(results, "setid_binaries_absent"):
-        rem.append(make_remediation_item(
-            "SETID_BINARIES_PRESENT",
-            "medium",
-            "Remove setuid/setgid binaries from the image",
-            "Setuid and setgid binaries create extra privilege-escalation paths even when the container is otherwise hardened.",
-            [
-                "Remove unnecessary setuid/setgid binaries from the image.",
-                "Prefer distroless or minimal base images where possible.",
-                "Verify no operational tooling depends on privilege-granting helpers."
-            ],
-            "Rebuild the image without unnecessary setuid/setgid helpers.",
-            ["Image hardening", "Least privilege"]
-        ))
-
-    if failed(k8s, "dangerous_caps_absent") or failed(k8s, "net_raw_absent"):
-        rem.append(make_remediation_item(
-            "LINUX_CAPS",
-            "high",
-            "Drop Linux capabilities to the minimum required set",
-            "Capabilities such as CAP_NET_RAW or CAP_SYS_ADMIN increase kernel-facing attack surface and enable stronger in-cluster pivoting primitives.",
-            [
-                "Drop ALL capabilities by default.",
-                "Re-add only narrowly required capabilities after validation.",
-                "Prefer application changes over retaining CAP_NET_RAW or CAP_SYS_ADMIN."
-            ],
-            yaml_block_pod_hardening(selector),
-            ["Linux capabilities", "Kubernetes securityContext"]
-        ))
-
-    if failed(k8s, "seccomp_enforced"):
-        rem.append(make_remediation_item(
-            "SECCOMP_DISABLED",
-            "high",
-            "Enable seccomp filtering",
-            "Seccomp reduces syscall surface and limits the effect of application-level compromise on the host kernel boundary.",
-            [
-                "Set seccompProfile.type to RuntimeDefault at minimum.",
-                "Use Localhost profiles for stricter workloads if validated.",
-                "Test the runtime profile against the sandbox process tree before production rollout."
-            ],
-            yaml_block_pod_hardening(selector),
-            ["seccomp", "Kubernetes RuntimeDefault"]
-        ))
-
-    if failed(k8s, "no_new_privs"):
-        rem.append(make_remediation_item(
-            "NO_NEW_PRIVS_DISABLED",
-            "medium",
-            "Disallow privilege escalation",
-            "allowPrivilegeEscalation=false prevents gaining more privilege through setuid binaries or similar execution paths.",
-            [
-                "Set allowPrivilegeEscalation: false.",
-                "Remove setuid/setgid binaries not required by the workload.",
-                "Rebuild the image if privilege-granting tools are bundled by default."
-            ],
-            yaml_block_pod_hardening(selector),
-            ["allowPrivilegeEscalation"]
-        ))
-
-    if failed(k8s, "sa_token_present") or failed(k8s, "sa_ca_present") or failed(k8s, "sa_namespace_present") or failed(k8s, "sa_mount_readonly"):
-        rem.append(make_remediation_item(
-            "SERVICE_ACCOUNT_TOKEN",
-            "high",
-            "Reduce service account token exposure",
-            "Mounted service account tokens expand blast radius when a pod is compromised and should be disabled unless the workload truly needs Kubernetes API access.",
-            [
-                "Set automountServiceAccountToken: false for workloads that do not need the API.",
-                "Use a dedicated least-privilege service account when API access is required.",
-                "Keep token mounts read-only and review RBAC bindings."
-            ],
-            yaml_block_service_account(ns),
-            ["ServiceAccount", "RBAC"]
-        ))
-
-    if failed(k8s, "imds_blocked") or failed(results, "cloud_imds_blocked"):
-        rem.append(make_remediation_item(
-            "IMDS_REACHABLE",
-            "high",
-            "Block cloud metadata access from the workload",
-            "Instance metadata access can expose node or cloud credentials and materially increase post-compromise blast radius.",
-            [
-                "Block 169.254.169.254 and equivalent metadata endpoints with NetworkPolicy, node firewalling, or cloud-native metadata protections.",
-                "Prefer workload identity over node-scoped credentials.",
-                "Retest from the pod after controls are applied."
-            ],
-            yaml_block_networkpolicy(ns, selector),
-            ["Cloud metadata service", "Workload identity"]
-        ))
-
-    if failed(k8s, "host_mounts_absent") or failed(results, "host_engine_sockets_absent"):
-        rem.append(make_remediation_item(
-            "HOST_EXPOSURE",
-            "critical",
-            "Remove hostPath mounts and engine sockets",
-            "Host paths and container engine sockets can collapse isolation boundaries and often enable host-level compromise.",
-            [
-                "Remove docker.sock, containerd sockets, kubelet paths, and other hostPath mounts unless absolutely necessary.",
-                "Replace direct host access with a narrowly scoped sidecar or API broker if operationally needed.",
-                "Re-run the audit after removing privileged mounts."
-            ],
-            "Remove hostPath and engine socket mounts from the Pod spec; do not expose /var/run/docker.sock or /run/containerd/containerd.sock to the workload.",
-            ["hostPath", "container runtime socket exposure"]
-        ))
-
-    if failed(results, "risky_device_nodes_absent"):
-        rem.append(make_remediation_item(
-            "RISKY_DEVICE_NODES",
-            "critical",
-            "Remove risky writable device node access",
-            "Writable access to device nodes like /dev/kmsg or /dev/mem can collapse isolation and expose the host kernel boundary.",
-            [
-                "Do not mount or expose host device nodes into the workload.",
-                "Use a stricter runtime/device policy and remove privileged device access.",
-                "Re-run the audit to confirm the nodes are no longer accessible."
-            ],
-            "Remove risky device mounts and privileged device access from the workload spec.",
-            ["Device isolation", "Privileged container hardening"]
-        ))
-
-    if listener_open(results, "novnc_http_local_6901"):
-        rem.append(make_remediation_item(
-            "NOVNC_LISTENER",
-            "medium",
-            "Review local noVNC exposure",
-            "A local noVNC listener may be intentional, but it should be authenticated and not reachable from sibling pods unless explicitly required.",
-            [
-                "Disable the listener when desktop access is not needed.",
-                "Require authentication and put it behind a controlled access path.",
-                "Restrict access with NetworkPolicy or firewall rules."
-            ],
-            yaml_block_novnc_service_note(),
-            ["noVNC", "VNC hardening"]
-        ))
-
-    classification = results.get("classification", "")
-    if classification in ("remotely_reachable_from_pod_and_unauthenticated_vnc", "remotely_reachable_from_pod_but_password_required", "remotely_reachable_from_pod_partial_signals"):
-        severity = "critical" if "unauthenticated" in classification else "high"
-        rem.append(make_remediation_item(
-            "REMOTE_REACHABILITY",
-            severity,
-            "Restrict pod-to-pod reachability to exposed sandbox services",
-            "A service reachable from a sibling pod expands lateral movement opportunities and weakens containment.",
-            [
-                "Apply default-deny ingress and egress NetworkPolicy for the sandbox pod.",
-                "Remove unnecessary Service objects and listeners.",
-                "Place required UI/API endpoints behind authenticated gateways instead of direct pod exposure."
-            ],
-            yaml_block_networkpolicy(ns, selector),
-            ["NetworkPolicy", "least privilege networking"]
-        ))
-
-    if not rem:
-        rem.append(make_remediation_item(
-            "NO_ACTIONABLE_FAILURES",
-            "info",
-            "No failed checks were mapped to a built-in remediation rule",
-            "The remediation engine did not find a failed check it recognizes in this audit result.",
-            [
-                "Review raw evidence manually.",
-                "Extend remediation_from_audit() with environment-specific rules.",
-                "Keep the audit JSON for traceability."
-            ],
-            "",
-            []
-        ))
-
-    severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
-    rem.sort(key=lambda x: severity_rank.get(x["severity"], 0), reverse=True)
-    return {
-        "count": len(rem),
-        "items": rem,
-        "templates": {
-            "pod_hardening": yaml_block_pod_hardening(selector),
-            "network_policy": yaml_block_networkpolicy(ns, selector),
-            "service_account": yaml_block_service_account(ns),
-        }
+def verify_workload_online_after_patch(
+    ctx: RunContext,
+    patch_info: Dict[str, Any],
+    patch_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    snapshot = patch_info.get("workload_config_before") or {}
+    if ctx.dry_run:
+        return {"status": "dry_run_not_executed", "healthy": True}
+    resource = str(patch_info.get("resource") or "")
+    name = str(patch_info.get("name") or "")
+    health: Dict[str, Any] = {
+        "schema": "agentfence-workload-revalidation-v1",
+        "status": "unknown",
+        "healthy": False,
+        "resource": resource,
+        "name": name,
+        "expected_containers": [c.get("name") for c in snapshot.get("containers") or [] if c.get("name")],
+        "requires_pod_recreation": bool(patch_result.get("changed")) and resource in ("deployment", "statefulset", "daemonset"),
     }
-
-
-
-
-# --------------------------- apply fixes ------------------------------------
-
-def slugify_name(s):
-    s = (s or "resource").lower()
-    s = re.sub(r"[^a-z0-9.-]+", "-", s)
-    s = re.sub(r"-{2,}", "-", s).strip("-.")
-    return s or "resource"
-
-
-def selector_to_matchlabels(selector):
-    labels = {}
-    for part in (selector or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "=" in part:
-            k, v = part.split("=", 1)
-            labels[k.strip()] = v.strip()
-    if not labels:
-        labels = {"app": "REPLACE_ME"}
-    return labels
-
-
-def get_service_ports_for_labels(ns, labels, timeout=30):
-    ports = []
-    if not has_kubectl() or not ns or not labels:
-        return ports
-    try:
-        obj = kubectl_get_json(ns, 'services', extra_args='--ignore-not-found', timeout=timeout)
-        for item in obj.get('items', []):
-            selector = ((item.get('spec') or {}).get('selector') or {})
-            if selector and all(labels.get(k) == v for k, v in selector.items()):
-                svc_name = item.get('metadata', {}).get('name')
-                for p in ((item.get('spec') or {}).get('ports') or []):
-                    port = p.get('targetPort', p.get('port'))
-                    if isinstance(port, int):
-                        ports.append({'service': svc_name, 'port': port, 'protocol': (p.get('protocol') or 'TCP').upper()})
-                    elif isinstance(p.get('port'), int):
-                        ports.append({'service': svc_name, 'port': p.get('port'), 'protocol': (p.get('protocol') or 'TCP').upper()})
-    except Exception:
-        pass
-    dedup = []
-    seen = set()
-    for entry in ports:
-        key = (entry['service'], entry['port'], entry['protocol'])
-        if key not in seen:
-            seen.add(key)
-            dedup.append(entry)
-    return dedup
-
-
-def get_kubernetes_api_cluster_ip(timeout=20):
-    if not has_kubectl():
-        return None
-    try:
-        obj = kubectl_get_json('default', 'service', 'kubernetes', timeout=timeout)
-        return ((obj.get('spec') or {}).get('clusterIP') or None)
-    except Exception:
-        return None
-
-
-def extract_listener_ports(audit_obj):
-    listeners = []
-    results = (audit_obj.get('results') or {})
-    remote = (audit_obj.get('remote') or {})
-    if results.get('novnc_http_local_6901', {}).get('ok'):
-        listeners.append({'port': 6901, 'protocol': 'TCP', 'reason': 'noVNC local listener'})
-    if results.get('vnc_rfb_greeting_5901', {}).get('ok'):
-        listeners.append({'port': 5901, 'protocol': 'TCP', 'reason': 'VNC local listener'})
-    scanned = results.get('scanned_ports') or remote.get('scanned_ports') or []
-    for item in scanned:
-        port = item.get('port')
-        if item.get('reachable') and isinstance(port, int):
-            listeners.append({'port': port, 'protocol': (item.get('protocol') or 'TCP').upper(), 'reason': 'remote probe reachable'})
-    dedup = []
-    seen = set()
-    for entry in listeners:
-        key = (entry['port'], entry['protocol'])
-        if key not in seen:
-            seen.add(key)
-            dedup.append(entry)
-    return dedup
-
-
-def build_workload_aware_networkpolicy(ns, workload_name, labels, audit_obj, dependencies=None, timeout=30):
-    dependencies = dependencies or {}
-    policy_name = f"{workload_name}-least-privilege"
-    service_ports = get_service_ports_for_labels(ns, labels, timeout=timeout)
-    listener_ports = extract_listener_ports(audit_obj)
-    ingress_ports = service_ports[:] if service_ports else []
-    if not ingress_ports and (dependencies.get('services') or []):
-        for lp in listener_ports:
-            ingress_ports.append({'service': 'inferred', 'port': lp['port'], 'protocol': lp.get('protocol', 'TCP')})
-
-    ingress_rules = []
-    strategy_notes = []
-    if ingress_ports:
-        ingress_rules.append({
-            'from': [{'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': ns}}}],
-            'ports': [{'protocol': p.get('protocol', 'TCP'), 'port': p['port']} for p in ingress_ports if isinstance(p.get('port'), int)]
-        })
-        strategy_notes.append(
-            'Ingress allowlist preserved namespace-local access only for ports selected by current Services or inferred reachable listeners.'
+    if resource in ("deployment", "statefulset", "daemonset") and name:
+        rc, out, err = run_kubectl(
+            ctx.kubeconfig,
+            ["rollout", "status", f"{resource}/{name}", "-n", ctx.namespace, "--timeout=180s"],
+            timeout=210,
         )
-    else:
-        strategy_notes.append('Ingress remains default-deny because no Service-selected ports were discovered for this workload.')
+        health["rollout_status"] = "complete" if rc == 0 else "failed"
+        health["rollout_message"] = (out or err or f"exit {rc}")[:2000]
+        if rc != 0:
+            health["status"] = "unhealthy"
+            health["reason"] = "rollout did not complete"
+            return health
 
-    egress_rules = [
-        {
-            'to': [
-                {
-                    'namespaceSelector': {},
-                    'podSelector': {'matchLabels': {'k8s-app': 'kube-dns'}},
-                }
-            ],
-            'ports': [
-                {'protocol': 'UDP', 'port': 53},
-                {'protocol': 'TCP', 'port': 53},
-            ],
+    refresh = refresh_run_context_target(ctx)
+    health["target_refresh"] = refresh
+    pods = workload_pods_for_snapshot(ctx, snapshot)
+    running = [p for p in pods if ((p.get("status") or {}).get("phase") == "Running")]
+    health["pod_count"] = len(pods)
+    health["running_pod_count"] = len(running)
+    old_uids = {p.get("uid") for p in snapshot.get("pods_before") or [] if p.get("uid")}
+    new_uids = {((p.get("metadata") or {}).get("uid")) for p in running if ((p.get("metadata") or {}).get("uid"))}
+    health["pod_recreated"] = bool(new_uids - old_uids) if old_uids else None
+    if health["requires_pod_recreation"] and health["pod_recreated"] is False:
+        health["status"] = "unhealthy"
+        health["reason"] = "pod template changed but no replacement pod was observed"
+        return health
+    if not running:
+        health["status"] = "unhealthy"
+        health["reason"] = "no running pods matched the captured workload selector"
+        return health
+
+    expected = set(health["expected_containers"])
+    container_checks = []
+    for pod in running:
+        pod_name = ((pod.get("metadata") or {}).get("name")) or ""
+        statuses = {
+            s.get("name"): bool(s.get("ready"))
+            for s in ((pod.get("status") or {}).get("containerStatuses") or [])
         }
-    ]
-    strategy_notes.append('DNS egress is preserved for kube-dns.')
-
-    api_ip = get_kubernetes_api_cluster_ip(timeout=timeout)
-    kubernetes_ok = (((audit_obj.get('kubernetes') or {}).get('egress_api_tcp_443') or {}).get('ok') is True)
-    if api_ip and kubernetes_ok:
-        egress_rules.append({
-            'to': [{'ipBlock': {'cidr': f'{api_ip}/32'}}],
-            'ports': [{'protocol': 'TCP', 'port': 443}],
-        })
-        strategy_notes.append(f'Kubernetes API egress preserved to clusterIP {api_ip}/32 on TCP 443 because the workload currently reaches the API.')
-
-    if (((audit_obj.get('kubernetes') or {}).get('imds_blocked') or {}).get('ok') is False) or (((audit_obj.get('results') or {}).get('cloud_imds_blocked') or {}).get('ok') is False):
-        strategy_notes.append('No metadata egress allow rule was generated, so the resulting policy blocks IMDS by default.')
-
-    np_obj = {
-        'apiVersion': 'networking.k8s.io/v1',
-        'kind': 'NetworkPolicy',
-        'metadata': {'name': policy_name, 'namespace': ns},
-        'spec': {
-            'podSelector': {'matchLabels': labels},
-            'policyTypes': ['Ingress', 'Egress'],
-            'ingress': ingress_rules,
-            'egress': egress_rules,
-        },
-    }
-    return {
-        'object': np_obj,
-        'service_ports': service_ports,
-        'listener_ports': listener_ports,
-        'strategy_notes': strategy_notes,
-    }
-
-
-def infer_target_workload_name(meta):
-    for key in ("workload_name", "target_pod", "name"):
-        val = meta.get(key)
-        if val:
-            return slugify_name(val)
-    selector = meta.get("target_selector", "")
-    ml = selector_to_matchlabels(selector)
-    if "app" in ml:
-        return slugify_name(ml["app"])
-    return "sandbox-target"
-
-
-def dict_to_yaml(obj, indent=0):
-    sp = " " * indent
-    if isinstance(obj, dict):
-        lines = []
-        for k, v in obj.items():
-            if isinstance(v, (dict, list)):
-                lines.append(f"{sp}{k}:")
-                lines.append(dict_to_yaml(v, indent + 2))
-            else:
-                if isinstance(v, bool):
-                    sval = "true" if v else "false"
-                elif v is None:
-                    sval = "null"
-                elif isinstance(v, (int, float)):
-                    sval = str(v)
-                else:
-                    sval = json.dumps(str(v))
-                lines.append(f"{sp}{k}: {sval}")
-        return "\n".join(lines)
-    if isinstance(obj, list):
-        lines = []
-        for item in obj:
-            if isinstance(item, (dict, list)):
-                lines.append(f"{sp}-")
-                lines.append(dict_to_yaml(item, indent + 2))
-            else:
-                if isinstance(item, bool):
-                    sval = "true" if item else "false"
-                elif item is None:
-                    sval = "null"
-                elif isinstance(item, (int, float)):
-                    sval = str(item)
-                else:
-                    sval = json.dumps(str(item))
-                lines.append(f"{sp}- {sval}")
-        return "\n".join(lines)
-    return f"{sp}{json.dumps(obj)}"
-
-
-def build_apply_fix_artifacts(audit_obj):
-    meta = audit_obj.get("meta", {}) or {}
-    remediation = audit_obj.get("remediation") or remediation_from_audit(audit_obj)
-    ns = meta.get("namespace") or autodetect_namespace('default')
-    selector = meta.get("target_selector", "")
-    labels = (meta.get("selector_labels") or selector_to_matchlabels(selector) or {})
-    workload_name = infer_target_workload_name(meta)
-    workload_kind = (meta.get("workload_kind") or "deployment").lower()
-    if workload_kind == 'replicaset':
-        workload_kind = 'deployment'
-    if workload_kind not in {'deployment','statefulset','daemonset'}:
-        workload_kind = 'deployment'
-    service_account_name = meta.get("service_account_name") or 'default'
-    container_names = list(meta.get("container_names") or [])
-    if not container_names and meta.get("target_pod") and has_kubectl():
-        try:
-            discovered = discover_workload_from_pod(ns, meta.get("target_pod"))
-            container_names = discovered.get('container_names', [])
-            if discovered.get('service_account_name'):
-                service_account_name = discovered['service_account_name']
-            if discovered.get('selector_labels'):
-                labels = discovered['selector_labels']
-        except Exception:
-            pass
-    if not labels:
-        labels = {"app": workload_name}
-    if not selector:
-        selector = labels_to_selector(labels)
-
-    containers_patch = []
-    for cname in container_names or [workload_name]:
-        containers_patch.append({
-            "name": cname,
-            "securityContext": {
-                "runAsNonRoot": True,
-                "runAsUser": 10001,
-                "runAsGroup": 10001,
-                "allowPrivilegeEscalation": False,
-                "readOnlyRootFilesystem": True,
-                "capabilities": {"drop": ["ALL"]},
-                "seccompProfile": {"type": "RuntimeDefault"},
-            },
-        })
-
-    patch_obj = {
-        "spec": {
-            "template": {
-                "spec": {
-                    "automountServiceAccountToken": False,
-                    "containers": containers_patch,
-                }
+        present = set(statuses)
+        missing = sorted(expected - present)
+        not_ready = sorted(name for name in expected & present if not statuses.get(name))
+        container_checks.append(
+            {
+                "pod": pod_name,
+                "missing_containers": missing,
+                "not_ready_containers": not_ready,
+                "all_expected_ready": not missing and not not_ready,
             }
+        )
+    health["container_readiness"] = container_checks
+    if not all(c["all_expected_ready"] for c in container_checks):
+        health["status"] = "unhealthy"
+        health["reason"] = "one or more expected containers were missing or not ready"
+        return health
+
+    connectivity_results = []
+    expectations = snapshot.get("connectivity_expectations") or []
+    if expectations:
+        pod_name = ((running[0].get("metadata") or {}).get("name")) or ctx.target_pod
+        for container in sorted(expected):
+            for target in expectations[:6]:
+                if str(target.get("protocol") or "TCP").upper() != "TCP":
+                    continue
+                host = str(target.get("host") or "")
+                port = int(target.get("port") or 0)
+                if not host or not port:
+                    continue
+                rc, out = kubectl_exec(
+                    ctx.kubeconfig,
+                    ctx.namespace,
+                    pod_name,
+                    container,
+                    tcp_connectivity_command(host, port),
+                    15,
+                )
+                status = "reachable" if rc == 0 and "OK" in out else "failed"
+                if "NO_TCP_CHECK_TOOL" in out:
+                    status = "not_assessed"
+                connectivity_results.append(
+                    {
+                        "pod": pod_name,
+                        "container": container,
+                        "host": host,
+                        "port": port,
+                        "source_policy": target.get("source_policy"),
+                        "status": status,
+                        "output": out[:500],
+                    }
+                )
+    health["connectivity_checks"] = connectivity_results
+    if connectivity_results and any(r.get("status") == "failed" for r in connectivity_results):
+        health["status"] = "unhealthy"
+        health["reason"] = "one or more captured TCP egress expectations failed"
+        return health
+    health["status"] = "healthy"
+    health["healthy"] = True
+    return health
+
+
+def runtime_class_handler(ctx: RunContext, runtime_class_name: Optional[str]) -> Dict[str, Any]:
+    if not runtime_class_name:
+        return {"runtime_class": None, "handler": "default", "family": "runc"}
+    obj = kubectl_get_json(ctx.kubeconfig, ["get", "runtimeclass", str(runtime_class_name)])
+    handler = str(((obj or {}).get("handler")) or "")
+    name = str(runtime_class_name)
+    folded = f"{name} {handler}".lower()
+    if "kata" in folded:
+        family = "kata"
+    elif "gvisor" in folded or "runsc" in folded:
+        family = "gvisor"
+    else:
+        family = "other"
+    return {"runtime_class": name, "handler": handler or None, "family": family}
+
+
+def current_workload_template_spec(ctx: RunContext, patch_info: Dict[str, Any]) -> Dict[str, Any]:
+    resource = str(patch_info.get("resource") or "")
+    name = str(patch_info.get("name") or "")
+    if not resource or not name:
+        return {}
+    obj = kubectl_get_json(ctx.kubeconfig, ["get", resource, name, "-n", ctx.namespace]) or {}
+    if resource == "cronjob":
+        return (
+            ((obj.get("spec") or {}).get("jobTemplate") or {})
+            .get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+        ) or {}
+    return ((obj.get("spec") or {}).get("template") or {}).get("spec") or {}
+
+
+def seccomp_profile_type(value: Optional[Dict[str, Any]]) -> Optional[str]:
+    profile = (value or {}).get("seccompProfile") or {}
+    return profile.get("type")
+
+
+def workload_template_spec_for_context(ctx: RunContext) -> Dict[str, Any]:
+    workload = discover_workload_reference(ctx)
+    wl = workload.get("workload") or {}
+    resource = str(wl.get("resource") or "")
+    name = str(wl.get("name") or "")
+    spec: Dict[str, Any] = {}
+    if resource and name:
+        spec = current_workload_template_spec(ctx, {"resource": resource, "name": name})
+    if not spec:
+        pod = load_target_pod_json(ctx) or {}
+        spec = (pod.get("spec") or {}) if isinstance(pod, dict) else {}
+    return {"workload_reference": workload, "spec": spec}
+
+
+def seccomp_state_for_context(ctx: RunContext) -> Dict[str, Any]:
+    info = workload_template_spec_for_context(ctx)
+    spec = info.get("spec") or {}
+    workload = info.get("workload_reference") or {}
+    runtime = runtime_class_handler(ctx, spec.get("runtimeClassName") or workload.get("runtime_class"))
+    pod_profile = seccomp_profile_type(spec.get("securityContext"))
+    container_profiles = {}
+    for c in (spec.get("containers") or []) + (spec.get("initContainers") or []):
+        name = c.get("name")
+        if name:
+            container_profiles[name] = seccomp_profile_type(c.get("securityContext"))
+    target_profile = container_profiles.get(ctx.target_container) or pod_profile
+    return {
+        "runtime": runtime,
+        "pod_seccomp_profile": pod_profile,
+        "container_seccomp_profiles": container_profiles,
+        "target_container": ctx.target_container,
+        "target_effective_seccomp_profile": target_profile,
+        "workload": (workload.get("workload") or {}),
+    }
+
+
+def gvisor_runtime_seccomp_verified(state: Dict[str, Any]) -> bool:
+    runtime = state.get("runtime") or {}
+    return (
+        runtime.get("family") == "gvisor"
+        and state.get("target_effective_seccomp_profile") == "RuntimeDefault"
+    )
+
+
+def format_seccomp_state_evidence(state: Dict[str, Any]) -> str:
+    runtime = state.get("runtime") or {}
+    workload = state.get("workload") or {}
+    return (
+        f"runtime_family={runtime.get('family')} "
+        f"runtime_class={runtime.get('runtime_class')} "
+        f"handler={runtime.get('handler')} "
+        f"workload={workload.get('kind')}/{workload.get('name')} "
+        f"target_container={state.get('target_container')} "
+        f"target_effective_seccomp={state.get('target_effective_seccomp_profile')} "
+        f"pod_seccomp={state.get('pod_seccomp_profile')} "
+        f"container_seccomp_profiles={state.get('container_seccomp_profiles')}"
+    )
+
+
+def inspect_container_seccomp_status(ctx: RunContext, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    pods = workload_pods_for_snapshot(ctx, snapshot)
+    running = [p for p in pods if ((p.get("status") or {}).get("phase") == "Running")]
+    if not running:
+        return []
+    pod_name = ((running[0].get("metadata") or {}).get("name")) or ctx.target_pod
+    containers = [c.get("name") for c in snapshot.get("containers") or [] if c.get("name")]
+    rows = []
+    for container in containers:
+        rc, out = kubectl_exec(
+            ctx.kubeconfig,
+            ctx.namespace,
+            pod_name,
+            str(container),
+            "grep -E '^(NoNewPrivs|Seccomp|CapBnd):' /proc/self/status 2>/dev/null || true",
+            15,
+        )
+        seccomp_mode = None
+        m = re.search(r"^Seccomp:\s*(\d+)", out or "", re.M)
+        if m:
+            seccomp_mode = int(m.group(1))
+        rows.append(
+            {
+                "pod": pod_name,
+                "container": container,
+                "status": "captured" if rc == 0 else "failed",
+                "seccomp_mode": seccomp_mode,
+                "output": out[:1000],
+            }
+        )
+    return rows
+
+
+def build_runtime_seccomp_diagnostic(
+    ctx: RunContext,
+    patch_info: Dict[str, Any],
+    verification: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    probe_ids = set(patch_info.get("probe_ids") or [])
+    if "AgentFence.IDENTITY.SECCOMP_BYPASS_OK" not in probe_ids:
+        return {}
+    snapshot = patch_info.get("workload_config_before") or {}
+    spec = current_workload_template_spec(ctx, patch_info)
+    runtime = runtime_class_handler(ctx, spec.get("runtimeClassName") or snapshot.get("runtime_class"))
+    expected_containers = [c.get("name") for c in snapshot.get("containers") or [] if c.get("name")]
+    container_profiles = {}
+    for c in spec.get("containers") or []:
+        name = c.get("name")
+        if name:
+            container_profiles[name] = seccomp_profile_type(c.get("securityContext"))
+    process_status = inspect_container_seccomp_status(ctx, snapshot)
+    all_expected_configured = bool(expected_containers) and all(
+        container_profiles.get(name) == "RuntimeDefault" for name in expected_containers
+    )
+    process_modes = [row.get("seccomp_mode") for row in process_status if row.get("seccomp_mode") is not None]
+    process_active = bool(process_modes) and all(mode == 2 for mode in process_modes)
+    unresolved = set((verification or {}).get("still_unsafe_probe_ids") or [])
+    gvisor_runtime_verified = runtime.get("family") == "gvisor" and all_expected_configured
+    runtime_config_required = (
+        "AgentFence.IDENTITY.SECCOMP_BYPASS_OK" in unresolved
+        or (
+            runtime.get("family") in ("gvisor", "kata")
+            and all_expected_configured
+            and not process_active
+            and not gvisor_runtime_verified
+        )
+    )
+    recommendation = ""
+    if runtime.get("family") == "kata":
+        recommendation = (
+            "Kata accepted the workload seccomp profile but did not expose active process seccomp. "
+            "Enable guest seccomp for the Kata runtime, for example set disable_guest_seccomp = false "
+            "in the active Kata configuration for this handler, restart the runtime/containerd path, "
+            "then recreate the workload pods and rerun AgentFence."
+        )
+    elif runtime.get("family") == "gvisor":
+        recommendation = (
+            "gVisor accepted the workload seccomp profile. AgentFence treats the runsc RuntimeClass plus "
+            "workload RuntimeDefault profile as the runtime-specific seccomp success condition because "
+            "gVisor syscall mediation does not require the sandboxed process to show Linux Seccomp:2."
+        )
+    elif runtime_config_required:
+        recommendation = (
+            "The workload seccomp profile is configured but the post-remediation probe did not verify it. "
+            "Review runtime support or use a Localhost seccomp profile."
+        )
+    return {
+        "schema": "agentfence-runtime-seccomp-diagnostic-v1",
+        "runtime": runtime,
+        "pod_seccomp_profile": seccomp_profile_type(spec.get("securityContext")),
+        "container_seccomp_profiles": container_profiles,
+        "expected_containers": expected_containers,
+        "all_expected_containers_configured": all_expected_configured,
+        "process_seccomp_status": process_status,
+        "process_seccomp_active": process_active,
+        "gvisor_runtime_verified": gvisor_runtime_verified,
+        "runtime_config_required": runtime_config_required,
+        "node_config_changed": False,
+        "recommendation": recommendation,
+    }
+
+
+def apply_kata_node_seccomp_runtime_remediation(
+    ctx: RunContext,
+    patch_info: Dict[str, Any],
+    runtime_diag: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Optional[List[TestResult]]]:
+    record: Dict[str, Any] = {
+        "kind": "node_runtime_seccomp",
+        "status": "not_applicable",
+        "probe_ids": ["AgentFence.IDENTITY.SECCOMP_BYPASS_OK"],
+        "runtime": runtime_diag.get("runtime") or {},
+        "workload": patch_info.get("workload_reference"),
+        "workload_config_before": patch_info.get("workload_config_before"),
+        "node_config_changed": False,
+        "operator_gate": "requires --allow-node-runtime-remediation",
+    }
+    if not runtime_diag.get("runtime_config_required"):
+        record["reason"] = "runtime seccomp already verified or not required"
+        return record, None
+    runtime = runtime_diag.get("runtime") or {}
+    if runtime.get("family") != "kata":
+        record["reason"] = "node runtime remediation is only implemented for Kata guest seccomp"
+        return record, None
+    if ctx.dry_run:
+        record["status"] = "dry_run_planned"
+        record["reason"] = "would enable Kata guest seccomp on the target node and recreate the workload"
+        return record, None
+    if not ctx.allow_node_runtime_remediation:
+        record["status"] = "manual_recommendation"
+        record["reason"] = (
+            "Kata guest seccomp requires node/runtime configuration. Re-run with "
+            "--allow-node-runtime-remediation only after confirming other Kata workloads "
+            "on the same node can tolerate guest seccomp."
+        )
+        return record, None
+
+    pod = load_target_pod_json(ctx) or {}
+    node = ((pod.get("spec") or {}).get("nodeName")) or ""
+    if not node:
+        record["status"] = "failed"
+        record["reason"] = "unable to determine target node for Kata runtime remediation"
+        return record, None
+    record["node"] = node
+
+    script = r"""
+set -eu
+configs="/etc/kata-containers/configuration-qemu.toml /etc/kata-containers/configuration.toml /usr/share/defaults/kata-containers/configuration-qemu.toml /usr/share/defaults/kata-containers/configuration.toml /opt/kata/share/defaults/kata-containers/runtimes/qemu/configuration-qemu.toml /opt/kata/share/defaults/kata-containers/configuration-qemu.toml /opt/kata/share/defaults/kata-containers/configuration.toml"
+chosen=""
+for f in $configs; do
+  if [ -f "$f" ]; then chosen="$f"; break; fi
+done
+if [ -z "$chosen" ]; then
+  echo "NO_KATA_CONFIG_FOUND" >&2
+  exit 3
+fi
+cp "$chosen" "$chosen.agentfence.bak.$(date +%Y%m%d%H%M%S)"
+if grep -q '^[[:space:]]*disable_guest_seccomp[[:space:]]*=' "$chosen"; then
+  sed -i 's/^[[:space:]]*disable_guest_seccomp[[:space:]]*=.*/disable_guest_seccomp = false/' "$chosen"
+else
+  printf '\n# Added by AgentFence after operator-approved remediation\ndisable_guest_seccomp = false\n' >> "$chosen"
+fi
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl restart containerd
+else
+  service containerd restart
+fi
+echo "KATA_SECCOMP_CONFIGURED $chosen"
+"""
+    debug_custom = {
+        "resources": {
+            "requests": {"cpu": "25m", "memory": "64Mi"},
+            "limits": {"cpu": "100m", "memory": "128Mi"},
         }
     }
-
-    dependencies = meta.get('dependencies') or summarize_dependencies(ns, workload_name=workload_name, pod_name=meta.get('target_pod'), labels=labels)
-    np_plan = build_workload_aware_networkpolicy(ns, workload_name, labels, audit_obj, dependencies=dependencies)
-    np_obj = np_plan['object']
-
-    sa_patch_obj = {"automountServiceAccountToken": False}
-
-    deployment_patch_json = json.dumps(patch_obj, indent=2)
-    serviceaccount_patch_json = json.dumps(sa_patch_obj, indent=2)
-    networkpolicy_yaml = dict_to_yaml(np_obj)
-    patch_min = json.dumps(patch_obj, separators=(",", ":"))
-    sa_min = json.dumps(sa_patch_obj, separators=(",", ":"))
-
-    commands = {
-        "patch_workload": f"kubectl -n {shlex.quote(ns)} patch {shlex.quote(workload_kind)} {shlex.quote(workload_name)} --type strategic -p {shlex.quote(patch_min)}",
-        "apply_networkpolicy": f"kubectl apply -f NETWORKPOLICY_FILE.yaml",
-        "patch_serviceaccount": f"kubectl -n {shlex.quote(ns)} patch serviceaccount {shlex.quote(service_account_name)} --type merge -p {shlex.quote(sa_min)}",
+    custom_path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
+            json.dump(debug_custom, f)
+            custom_path = f.name
+        rc, out, err = run_kubectl(
+            ctx.kubeconfig,
+            [
+                "debug",
+                f"node/{node}",
+                "-n",
+                ctx.namespace,
+                "--image=busybox:1.36",
+                "--profile=sysadmin",
+                f"--custom={custom_path}",
+                "--",
+                "chroot",
+                "/host",
+                "sh",
+                "-c",
+                script,
+            ],
+            timeout=300,
+        )
+    finally:
+        if custom_path:
+            try:
+                os.unlink(custom_path)
+            except OSError:
+                pass
+    debug_pod = ""
+    m = re.search(r"Creating debugging pod\s+([^\s]+)", out or "")
+    if m:
+        debug_pod = m.group(1)
+    debug_phase = ""
+    debug_logs = ""
+    if debug_pod:
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            prc, pout, _ = run_kubectl(
+                ctx.kubeconfig,
+                ["get", "pod", debug_pod, "-n", ctx.namespace, "-o", "jsonpath={.status.phase}"],
+                timeout=15,
+            )
+            debug_phase = (pout or "").strip() if prc == 0 else debug_phase
+            if debug_phase in ("Succeeded", "Failed"):
+                break
+            time.sleep(3)
+        _, debug_logs, _ = run_kubectl(
+            ctx.kubeconfig,
+            ["logs", debug_pod, "-n", ctx.namespace, "--tail=200"],
+            timeout=30,
+        )
+        run_kubectl(
+            ctx.kubeconfig,
+            ["delete", "pod", debug_pod, "-n", ctx.namespace, "--ignore-not-found"],
+            timeout=30,
+        )
+    marker_seen = "KATA_SECCOMP_CONFIGURED" in (debug_logs or out or "")
+    record["node_runtime_command"] = {
+        "status": "complete" if rc == 0 and marker_seen else "failed",
+        "exit_code": rc,
+        "debug_pod": debug_pod,
+        "debug_pod_phase": debug_phase,
+        "stdout": (out or "")[-3000:],
+        "stderr": (err or "")[-3000:],
+        "logs": (debug_logs or "")[-3000:],
     }
+    if rc != 0 or not marker_seen:
+        record["status"] = "failed"
+        record["reason"] = (
+            "failed to enable Kata guest seccomp through kubectl node debug"
+            if rc != 0
+            else "node debug pod completed without the Kata seccomp success marker"
+        )
+        return record, None
+    record["node_config_changed"] = True
 
-    return {
-        "meta": {
-            "namespace": ns,
-            "selector": selector,
-            "workload_name": workload_name,
-            "workload_kind": workload_kind,
-            "service_account_name": service_account_name,
-            "container_names": container_names,
-            "labels": labels,
-            "dependencies": dependencies,
-            "network_policy_strategy": {
-                "service_ports": np_plan.get('service_ports', []),
-                "listener_ports": np_plan.get('listener_ports', []),
-                "notes": np_plan.get('strategy_notes', []),
-            },
-        },
-        "artifacts": {
-            "workload_patch_json": deployment_patch_json,
-            "serviceaccount_patch_json": serviceaccount_patch_json,
-            "networkpolicy_yaml": networkpolicy_yaml,
-        },
-        "commands": commands,
-        "remediation_count": remediation.get("count", 0),
-    }
+    resource = str(patch_info.get("resource") or "")
+    name = str(patch_info.get("name") or "")
+    if resource in ("deployment", "statefulset", "daemonset") and name:
+        rc2, out2, err2 = run_kubectl(
+            ctx.kubeconfig,
+            ["rollout", "restart", f"{resource}/{name}", "-n", ctx.namespace],
+            timeout=90,
+        )
+        record["workload_recreate_command"] = {
+            "status": "started" if rc2 == 0 else "failed",
+            "exit_code": rc2,
+            "output": (out2 or err2 or "")[:2000],
+        }
+        if rc2 != 0:
+            record["status"] = "failed"
+            record["reason"] = "node config changed, but workload recreation failed to start"
+            return record, None
+    else:
+        record["status"] = "manual_recommendation"
+        record["reason"] = "node config changed, but workload controller type requires manual pod recreation"
+        return record, None
 
+    health = verify_workload_online_after_patch(
+        ctx,
+        patch_info,
+        {"status": "applied", "changed": True},
+    )
+    record["workload_revalidation"] = health
+    if not health.get("healthy"):
+        record["status"] = "failed"
+        record["reason"] = health.get("reason") or "workload did not become healthy after runtime remediation"
+        return record, run_all_probes(ctx)
 
-def apply_fixes(audit_obj, namespace=None, workload=None, kind=None, apply_network_policy=False, patch_service_account=False, dry_run=True):
-    artifacts = build_apply_fix_artifacts(audit_obj)
-    ns = namespace or artifacts["meta"]["namespace"]
-    workload_name = workload or artifacts["meta"]["workload_name"]
-    kind = (kind or artifacts["meta"]["workload_kind"] or "deployment").lower()
-    service_account_name = artifacts["meta"].get("service_account_name") or 'default'
-
-    patch_min = json.dumps(json.loads(artifacts["artifacts"]["workload_patch_json"]), separators=(",", ":"))
-    executed = []
-    if kind not in {"deployment", "statefulset", "daemonset"}:
-        raise ValueError("kind must be deployment, statefulset, or daemonset")
-
-    patch_cmd = f"kubectl -n {shlex.quote(ns)} patch {shlex.quote(kind)} {shlex.quote(workload_name)} --type strategic -p {shlex.quote(patch_min)}"
-    executed.append({"step": f"patch_{kind}", "command": patch_cmd, "applied": not dry_run})
-    if not dry_run:
-        rc, out = shell_rc(patch_cmd, timeout=120)
-        executed[-1]["rc"] = rc
-        executed[-1]["output"] = out.strip()
-
-    if apply_network_policy:
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".yaml") as tf:
-            tf.write(artifacts["artifacts"]["networkpolicy_yaml"])
-            np_path = tf.name
-        np_cmd = f"kubectl apply -f {shlex.quote(np_path)}"
-        executed.append({"step": "apply_networkpolicy", "command": np_cmd, "applied": not dry_run, "file": np_path})
-        if not dry_run:
-            rc, out = shell_rc(np_cmd, timeout=120)
-            executed[-1]["rc"] = rc
-            executed[-1]["output"] = out.strip()
-
-    if patch_service_account:
-        sa_patch_min = json.dumps(json.loads(artifacts["artifacts"]["serviceaccount_patch_json"]), separators=(",", ":"))
-        sa_cmd = f"kubectl -n {shlex.quote(ns)} patch serviceaccount {shlex.quote(service_account_name)} --type merge -p {shlex.quote(sa_patch_min)}"
-        executed.append({"step": "patch_serviceaccount", "command": sa_cmd, "applied": not dry_run})
-        if not dry_run:
-            rc, out = shell_rc(sa_cmd, timeout=120)
-            executed[-1]["rc"] = rc
-            executed[-1]["output"] = out.strip()
-
-    return {
-        "meta": artifacts["meta"],
-        "dry_run": dry_run,
-        "executed": executed,
-        "artifacts": artifacts["artifacts"],
-    }
+    after_results = run_all_probes(ctx)
+    after_unsafe = unsafe_probe_ids(after_results)
+    runtime_after = build_runtime_seccomp_diagnostic(
+        ctx,
+        patch_info,
+        {"still_unsafe_probe_ids": sorted(after_unsafe & {"AgentFence.IDENTITY.SECCOMP_BYPASS_OK"})},
+    )
+    record["runtime_seccomp_diagnostic_after"] = runtime_after
+    if (
+        "AgentFence.IDENTITY.SECCOMP_BYPASS_OK" not in after_unsafe
+        or runtime_after.get("process_seccomp_active")
+    ):
+        record["status"] = "applied"
+        record["resolved_probe_ids"] = ["AgentFence.IDENTITY.SECCOMP_BYPASS_OK"]
+    else:
+        record["status"] = "applied_with_verification_warning"
+        record["resolved_probe_ids"] = []
+        record["verification_warnings"] = [
+            "Kata runtime config was changed and workload was recreated, but process-level seccomp still did not verify."
+        ]
+    return record, after_results
 
 
-
-# --------------------------- interactive workflow ---------------------------
-
-RISK_PROFILES = {
-    "RUN_AS_ROOT": {
-        "risk_level": "high",
-        "auto_applicable": True,
-        "group": "workload_patch",
-        "risk_note": "Changing to non-root can break startup if the image expects root-owned paths or privileged binds.",
-        "manual_recommendation": "Validate file ownership, writable paths, and startup scripts before rollout.",
+NODE_SYSCTL_HARDENING: Dict[str, Dict[str, str]] = {
+    "AgentFence.KERNEL.DMESG_VISIBLE": {
+        "sysctl": "kernel.dmesg_restrict",
+        "value": "1",
+        "title": "Restrict kernel dmesg",
     },
-    "ROOTFS_RW": {
-        "risk_level": "high",
-        "auto_applicable": True,
-        "group": "workload_patch",
-        "risk_note": "Enabling readOnlyRootFilesystem can break workloads that write under /tmp, /var, /etc, or application paths.",
-        "manual_recommendation": "Identify writable paths and move them to explicit volumes or emptyDir mounts first.",
+    "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": {
+        "sysctl": "kernel.perf_event_paranoid",
+        "value": "4",
+        "title": "Restrict perf_event_open",
     },
-    "SENSITIVE_PATHS_WRITABLE": {
-        "risk_level": "high",
-        "auto_applicable": False,
-        "group": "manual_only",
-        "risk_note": "Writable system paths often imply image or mount layout changes that should be validated carefully.",
-        "manual_recommendation": "Lock down writes to /etc, /usr, /bin, /sbin, and /root by moving legitimate writes into explicit writable mounts.",
+    "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE": {
+        "sysctl": "kernel.unprivileged_bpf_disabled",
+        "value": "2",
+        "title": "Disable unprivileged BPF",
     },
-    "SETID_BINARIES_PRESENT": {
-        "risk_level": "medium",
-        "auto_applicable": False,
-        "group": "manual_only",
-        "risk_note": "Removing setuid/setgid binaries usually requires an image rebuild and validation of admin tooling expectations.",
-        "manual_recommendation": "Rebuild the image on a minimal base and remove unnecessary setuid/setgid helpers.",
-    },
-    "LINUX_CAPS": {
-        "risk_level": "medium",
-        "auto_applicable": True,
-        "group": "workload_patch",
-        "risk_note": "Dropping all capabilities can break workloads that implicitly rely on raw sockets or privileged network operations.",
-        "manual_recommendation": "Test with ALL dropped, then add back only the single capability proven to be required.",
-    },
-    "SECCOMP_DISABLED": {
-        "risk_level": "medium",
-        "auto_applicable": True,
-        "group": "workload_patch",
-        "risk_note": "RuntimeDefault seccomp can block uncommon syscalls used by desktop stacks, debuggers, or special runtimes.",
-        "manual_recommendation": "Validate the workload under RuntimeDefault before enforcing in production.",
-    },
-    "NO_NEW_PRIVS_DISABLED": {
-        "risk_level": "low",
-        "auto_applicable": True,
-        "group": "workload_patch",
-        "risk_note": "Usually low risk, but it can affect images that still depend on setuid/setgid helpers.",
-        "manual_recommendation": "Check whether the image depends on privilege-granting helpers and remove them where possible.",
-    },
-    "SERVICE_ACCOUNT_TOKEN": {
-        "risk_level": "high",
-        "auto_applicable": True,
-        "group": "service_account",
-        "risk_note": "Disabling token automount will break workloads that call the Kubernetes API from inside the pod.",
-        "manual_recommendation": "Confirm whether the workload needs Kubernetes API access before disabling automount.",
-    },
-    "IMDS_REACHABLE": {
-        "risk_level": "high",
-        "auto_applicable": True,
-        "group": "network_policy",
-        "risk_note": "Blocking metadata endpoints can affect software that still relies on node credentials or metadata-based discovery.",
-        "manual_recommendation": "Prefer workload identity and verify cloud SDK behavior after blocking metadata access.",
-    },
-    "REMOTE_REACHABILITY": {
-        "risk_level": "high",
-        "auto_applicable": True,
-        "group": "network_policy",
-        "risk_note": "Default-deny NetworkPolicy can block legitimate east-west traffic and required egress beyond DNS.",
-        "manual_recommendation": "Inventory required ingress and egress first, then expand the policy gradually.",
-    },
-    "HOST_EXPOSURE": {
-        "risk_level": "critical",
-        "auto_applicable": False,
-        "group": "manual_only",
-        "risk_note": "Removing hostPath mounts or engine sockets can break architecture assumptions and operational tooling.",
-        "manual_recommendation": "Refactor the design to avoid hostPath and runtime sockets. Do not auto-remove without workload review.",
-    },
-    "RISKY_DEVICE_NODES": {
-        "risk_level": "critical",
-        "auto_applicable": False,
-        "group": "manual_only",
-        "risk_note": "Writable access to host-like device nodes is a severe isolation issue and usually requires workload redesign.",
-        "manual_recommendation": "Remove privileged device access and any mounts exposing host-sensitive device nodes.",
-    },
-    "NOVNC_LISTENER": {
-        "risk_level": "medium",
-        "auto_applicable": False,
-        "group": "manual_only",
-        "risk_note": "Disabling noVNC/VNC can remove a required management or UI function.",
-        "manual_recommendation": "If desktop access is required, keep it but put it behind authentication and narrow network controls.",
-    },
-    "NO_ACTIONABLE_FAILURES": {
-        "risk_level": "info",
-        "auto_applicable": False,
-        "group": "manual_only",
-        "risk_note": "",
-        "manual_recommendation": "Review the raw findings manually.",
+    "AgentFence.KERNEL.USERFAULTFD_REACHABLE": {
+        "sysctl": "vm.unprivileged_userfaultfd",
+        "value": "0",
+        "title": "Restrict unprivileged userfaultfd",
     },
 }
 
-def enrich_remediation(remediation):
-    items = []
-    for item in remediation.get("items", []):
-        prof = RISK_PROFILES.get(item.get("issue_id", ""), {})
-        merged = dict(item)
-        merged["risk_level"] = prof.get("risk_level", item.get("severity", "medium"))
-        merged["auto_applicable"] = prof.get("auto_applicable", False)
-        merged["fix_group"] = prof.get("group", "manual_only")
-        merged["risk_note"] = prof.get("risk_note", "")
-        merged["manual_recommendation"] = prof.get("manual_recommendation", "")
-        items.append(merged)
-    return {"count": len(items), "items": items, "templates": remediation.get("templates", {})}
 
-def default_json_path(prefix):
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return output_path(f"{prefix}_{stamp}.json")
-
-
-def safe_slug(value, default="resource"):
-    text = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip()).strip("-").lower()
-    return text or default
-
-
-OUTPUT_ROOT = os.environ.get("COMBINED_AUDIT_OUTPUT_DIR", "generated_outputs")
-
-
-def ensure_output_root():
-    path = Path(OUTPUT_ROOT)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def output_path(filename):
-    return str(ensure_output_root() / filename)
-
-
-def resource_json_path(prefix, namespace=None, workload_name=None):
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    parts = [prefix]
-    if namespace:
-        parts.append(safe_slug(namespace, "namespace"))
-    if workload_name:
-        parts.append(safe_slug(workload_name, "workload"))
-    parts.append(stamp)
-    return output_path("_".join(parts) + ".json")
-
-
-def security_issue_summary(obj):
-    remediation = obj.get('remediation') or {}
-    items = actionable_remediation_items(remediation)
-    severity_counts = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
-    for item in items:
-        sev = (item.get('severity') or 'info').lower()
-        severity_counts[sev] = severity_counts.get(sev, 0) + 1
-    return {
-        'count': len(items),
-        'severity_counts': severity_counts,
-        'issue_ids': [item.get('issue_id') for item in items],
+def audit_node_runtime_hardening(ctx: RunContext) -> Dict[str, Any]:
+    """Read target-node hardening state without changing node or runtime config."""
+    audit: Dict[str, Any] = {
+        "kind": "node_runtime_hardening_preflight",
+        "status": "unknown",
+        "node": "",
+        "runtime": {},
+        "sysctls": NODE_SYSCTL_HARDENING,
+        "sysctl_states": {},
+        "desired_values_met": {},
+        "kata_guest_seccomp": {},
+        "changes_needed": True,
+        "change_reasons": [],
     }
-
-def prompt(text, default=None):
-    suffix = f" [{default}]" if default is not None else ""
-    val = input(f"{text}{suffix}: ").strip()
-    return val if val else (default if default is not None else "")
-
-def prompt_choice(text, choices, default=None):
-    choices_txt = "/".join(choices)
-    while True:
-        val = prompt(f"{text} ({choices_txt})", default=default)
-        if val in choices:
-            return val
-        print(f"Enter one of: {choices_txt}")
-
-def prompt_yes_no(text, default="y"):
-    return prompt_choice(text, ["y", "n"], default=default) == "y"
-
-def print_audit_summary(obj):
-    print("\n=== Audit summary ===")
-    sec = security_issue_summary(obj)
-    print(f"Security issues: {sec.get('count', 0)}")
-    assessment_status = get_nested(obj, 'meta', 'assessment_status')
-    assessment_reason = get_nested(obj, 'meta', 'assessment_reason')
-    if assessment_status:
-        rendered = assessment_status.replace('_', ' ')
-        if assessment_reason:
-            print(f"Assessment status: {rendered} ({assessment_reason})")
-        else:
-            print(f"Assessment status: {rendered}")
-    sev = sec.get('severity_counts') or {}
-    sev_parts = [f"{name}={sev.get(name, 0)}" for name in ('critical', 'high', 'medium', 'low') if sev.get(name, 0)]
-    if sev_parts:
-        print(f"Severity mix: {', '.join(sev_parts)}")
-    if "summary" in obj:
-        s = obj["summary"]
-        print(f"Validation checks: {s.get('passed', 0)}/{s.get('total', 0)} passed")
-    internal = ((obj.get("results") or {}).get("internal_audit") or {})
-    if isinstance(internal, dict) and internal.get("summary"):
-        s = internal["summary"]
-        print(f"Internal validation: {s.get('passed', 0)}/{s.get('total', 0)} passed")
-    cls = (((obj.get("results") or {}).get("classification")) or "")
-    if cls:
-        print(f"Remote classification: {cls}")
-    meta = obj.get("meta", {})
-    for k in ("namespace", "target_selector", "target_pod", "target_ip"):
-        if meta.get(k):
-            print(f"{k}: {meta.get(k)}")
-
-def print_remediation_summary(remediation):
-    print("\n=== Proposed fixes ===")
-    for idx, item in enumerate(remediation.get("items", []), start=1):
-        auto = "auto" if item.get("auto_applicable") else "manual"
-        print(f"{idx}. [{item.get('severity','').upper()}] {item.get('title')} ({auto}, risk={item.get('risk_level','')})")
-        if item.get("rationale"):
-            print(f"   Why: {item['rationale']}")
-        if item.get("risk_note"):
-            print(f"   Risk: {item['risk_note']}")
-        if item.get("manual_recommendation"):
-            print(f"   Manual note: {item['manual_recommendation']}")
-
-def write_json_file(path_out, obj, label):
-    with open(path_out, "w") as f:
-        json.dump(obj, f, indent=2)
-    print(f"{label}: {path_out}")
-
-def run_selected_fix_groups(audit_obj, selected_items, namespace=None, workload=None, kind="deployment", execute=False):
-    selected = [x for x in selected_items if x.get("auto_applicable") or x.get("base_auto_applicable")]
-    groups = {x.get("fix_group") for x in selected}
-    result = {
-        "meta": {
-            "namespace": namespace or audit_obj.get("meta", {}).get("namespace"),
-            "workload": workload or infer_target_workload_name(audit_obj.get("meta", {})),
-            "kind": kind,
-            "executed_at": now_utc_iso(),
-        },
-        "selected_issue_ids": [x.get("issue_id") for x in selected_items],
-        "per_issue": [],
-        "apply_result": None,
-    }
-    if not selected:
-        result["status"] = "no_change"
-        for item in selected_items:
-            result["per_issue"].append({
-                "issue_id": item.get("issue_id"),
-                "title": item.get("title"),
-                "status": "manual_only" if not item.get("auto_applicable") else "skipped",
-                "risk_level": item.get("risk_level"),
-                "note": item.get("manual_recommendation") or item.get("risk_note") or "No change requested.",
-            })
-        return result
-
-    apply_network_policy = "network_policy" in groups
-    patch_service_account = "service_account" in groups
-    patch_workload = "workload_patch" in groups
-
-    if patch_workload or apply_network_policy or patch_service_account:
-        apply_result = apply_fixes(
-            audit_obj,
-            namespace=namespace,
-            workload=workload,
-            kind=kind,
-            apply_network_policy=apply_network_policy,
-            patch_service_account=patch_service_account,
-            dry_run=(not execute),
-        )
-        result["apply_result"] = apply_result
-
-    result["status"] = "applied" if execute else "planned"
-    for item in selected_items:
-        if not item.get("auto_applicable"):
-            status = "manual_only"
-            note = item.get("manual_recommendation") or item.get("risk_note")
-        elif item.get("fix_group") in groups:
-            status = "applied" if execute else "planned"
-            note = item.get("risk_note") or ""
-        else:
-            status = "skipped"
-            note = "No change requested."
-        result["per_issue"].append({
-            "issue_id": item.get("issue_id"),
-            "title": item.get("title"),
-            "status": status,
-            "risk_level": item.get("risk_level"),
-            "note": note,
-        })
-    return result
-
-def print_fix_result(result):
-    print("\n=== Fix results ===")
-    print(f"Overall status: {result.get('status')}")
-    for item in result.get("per_issue", []):
-        print(f"- {item.get('issue_id')}: {item.get('status')} ({item.get('risk_level')})")
-        if item.get("note"):
-            print(f"  {item.get('note')}")
-    apply_result = result.get("apply_result")
-    if apply_result:
-        print("\nCommands / execution:")
-        for step in apply_result.get("executed", []):
-            print(f"* {step.get('step')}: {'executed' if step.get('applied') else 'planned'}")
-            print(f"  {step.get('command')}")
-            if step.get("output"):
-                print(f"  output: {step.get('output')}")
-        if apply_result.get('source_of_truth_manifest'):
-            print(f"Source-of-truth manifest: {apply_result.get('source_of_truth_manifest')}")
-        if apply_result.get('backup_bundle'):
-            print(f"Backup bundle: {apply_result['backup_bundle'].get('directory')}")
-            print(f"Backup manifest: {apply_result['backup_bundle'].get('manifest')}")
-        if apply_result.get('rollback'):
-            print("Rollback artifacts available for patched resources.")
-        if apply_result.get('post_fix_revalidation') and not apply_result['post_fix_revalidation'].get('error'):
-            score = apply_result['post_fix_revalidation'].get('risk_score') or compute_risk_score(apply_result['post_fix_revalidation'])
-            if apply_result['post_fix_revalidation'].get('risk_score_unverified'):
-                print(f"Post-fix risk score: {score.get('total')} ({score.get('band')}, unverified)")
-            else:
-                print(f"Post-fix risk score: {score.get('total')} ({score.get('band')})")
-
-def interactive_wizard():
-    print("Interactive combined sandbox audit")
-    mode = prompt_choice("Where should the audit run", ["internal", "remote", "both"], default="both")
-    action = prompt_choice("What do you want to do for the selected resource", ["analyze", "fix", "analyze+fix"], default="analyze+fix")
-    timeout = float(prompt("Socket / probe timeout seconds", "2.0") or "2.0")
-    audit_out = prompt("Audit output JSON file", default_json_path("audit"))
-    fix_out = prompt("Fix output JSON file", default_json_path("fixes")) if action in ("fix", "analyze+fix") else None
-    namespace = None
-    selector = None
-    selected_resource = None
-
-    if mode in ("remote", "both"):
-        namespace = prompt("Namespace", autodetect_namespace('default'))
-        resources = list_candidate_resources(namespace, timeout=30)
-        print_resource_list(resources)
-        selected_resource = prompt_resource_selection(resources)
-        selector = selected_resource.get('selector') or labels_to_selector(selected_resource.get('selector_labels') or {})
-        print(f"\nSelected: {selected_resource.get('workload_kind')}/{selected_resource.get('workload_name')} (selector={selector})")
-    else:
-        selected_resource = {
-            'namespace': autodetect_namespace('default'),
-            'workload_kind': 'CurrentPod',
-            'workload_name': platform.node() or 'current',
-            'pod_name': platform.node() or 'current',
-            'service_account_name': os.environ.get('SERVICE_ACCOUNT', 'unknown'),
-            'container_names': [],
-            'selector': 'n/a',
-        }
-        print_resource_list([selected_resource], title='Current execution resource')
-        _ = prompt_resource_selection([selected_resource])
-
-    if mode == "internal":
-        audit_obj = collect_internal(timeout=timeout)
-    elif mode == "remote":
-        audit_obj = collect_remote(namespace, selector, timeout=timeout, include_introspection=True, include_internal_audit=False)
-    else:
-        audit_obj = collect_remote(namespace, selector, timeout=timeout, include_introspection=True, include_internal_audit=True)
-
-    audit_obj["remediation"] = enrich_remediation(audit_obj.get("remediation") or remediation_from_audit(audit_obj))
-    if selected_resource and mode in ("remote", "both"):
-        audit_obj.setdefault('meta', {})['selected_resource'] = selected_resource
-    print_audit_summary(audit_obj)
-    print_remediation_summary(audit_obj["remediation"])
-    write_json_file(audit_out, audit_obj, "Audit JSON written")
-
-    if action == 'analyze':
-        return
-
-    items = audit_obj.get('remediation', {}).get('items', [])
-    if not items:
-        fix_result = {
-            'status': 'no_change',
-            'reason': 'no_fixable_findings',
-            'executed_at': now_utc_iso(),
-            'per_issue': [],
-        }
-        print_fix_result(fix_result)
-        write_json_file(fix_out, fix_result, 'Fix JSON written')
-        return
-
-    if mode == 'internal':
-        fix_result = {
-            'status': 'no_change',
-            'reason': 'internal_mode_manual_recommendation_only',
-            'executed_at': now_utc_iso(),
-            'per_issue': [
-                {
-                    'issue_id': item.get('issue_id'),
-                    'title': item.get('title'),
-                    'status': 'manual_only',
-                    'risk_level': item.get('risk_level'),
-                    'note': item.get('manual_recommendation') or item.get('risk_note'),
-                } for item in items
-            ],
-        }
-        print_fix_result(fix_result)
-        write_json_file(fix_out, fix_result, 'Fix JSON written')
-        return
-
-    fix_mode = prompt_choice('Apply fixes all at once or separately or none', ['all', 'separate', 'none'], default='separate')
-    execute = prompt_yes_no('Execute the selected auto-applicable fixes now', default='n')
-    selected_items = []
-
-    if fix_mode == 'none':
-        selected_items = []
-    elif fix_mode == 'all':
-        selected_items = items
-    else:
-        print("\nSelect which fixes to implement one by one:")
-        for idx, item in enumerate(items, start=1):
-            auto = 'auto' if item.get('auto_applicable') else 'manual'
-            risk = item.get('risk_level', '')
-            ans = prompt_yes_no(f"Apply {idx}. {item.get('title')} [{auto}, risk={risk}]", default='n' if risk in ('high','critical') else 'y')
-            if ans:
-                selected_items.append(item)
-
-    fix_result = run_selected_fix_groups(
-        audit_obj,
-        selected_items,
-        namespace=namespace,
-        workload=(selected_resource or {}).get('workload_name'),
-        kind=((selected_resource or {}).get('workload_kind') or 'Deployment').lower(),
-        execute=execute,
-    )
-    print_fix_result(fix_result)
-    write_json_file(fix_out, fix_result, 'Fix JSON written')
-
-
-def auto_run(timeout=2.0, apply_safe_fixes=True, execute=False, aggressive_execute=False, audit_out=None, fix_out=None):
-    mode = autodetect_mode()
-    audit_out = audit_out or default_json_path('audit')
-    fix_out = fix_out or default_json_path('fixes')
-    namespace = None
-    selector = None
-    discovered = None
-    if mode in ('remote', 'both'):
-        namespace = autodetect_namespace('default')
-        discovered = autodiscover_remote_target(namespace)
-        selector = discovered.get('selector') or labels_to_selector(discovered.get('selector_labels') or {})
-        if not selector:
-            raise RuntimeError('Auto-discovery could not determine target selector')
-    if mode == 'internal':
-        audit_obj = collect_internal(timeout=timeout)
-    elif mode == 'remote':
-        audit_obj = collect_remote(namespace, selector, timeout=timeout, include_introspection=True, include_internal_audit=False)
-    else:
-        audit_obj = collect_remote(namespace, selector, timeout=timeout, include_introspection=True, include_internal_audit=True)
-    audit_obj['remediation'] = enrich_remediation(audit_obj.get('remediation') or remediation_from_audit(audit_obj))
-    print_audit_summary(audit_obj)
-    print_remediation_summary(audit_obj['remediation'])
-    write_json_file(audit_out, audit_obj, 'Audit JSON written')
-
-    items = audit_obj['remediation'].get('items', [])
-    if mode == 'internal':
-        fix_result = {
-            'status': 'no_change',
-            'reason': 'internal_mode_manual_recommendation_only',
-            'executed_at': now_utc_iso(),
-            'per_issue': [
-                {
-                    'issue_id': item.get('issue_id'),
-                    'title': item.get('title'),
-                    'status': 'manual_only',
-                    'risk_level': item.get('risk_level'),
-                    'note': item.get('manual_recommendation') or item.get('risk_note'),
-                } for item in items
-            ],
-        }
-    else:
-        selected_items = []
-        for item in items:
-            if not item.get('auto_applicable'):
-                selected_items.append(item)
-                continue
-            if item.get('risk_level') in ('critical', 'high'):
-                selected_items.append(dict(item, auto_applicable=False, fix_group='manual_only'))
-            elif apply_safe_fixes:
-                selected_items.append(item)
-        fix_result = run_selected_fix_groups(
-            audit_obj,
-            selected_items,
-            namespace=namespace,
-            workload=(audit_obj.get('meta', {}) or {}).get('workload_name'),
-            kind=(audit_obj.get('meta', {}) or {}).get('workload_kind') or 'deployment',
-            execute=execute,
-        )
-        fix_result['automation_mode'] = {
-            'apply_safe_fixes': apply_safe_fixes,
-            'execute': execute,
-            'risky_fixes_left_manual': True,
-        }
-    print_fix_result(fix_result)
-    write_json_file(fix_out, fix_result, 'Fix JSON written')
-    return {'audit': audit_obj, 'fix': fix_result}
-
-# --------------------------- cli --------------------------------------------
-
-def write_or_print(obj, out_path=None, stdout_json=False):
-    if out_path:
-        with open(out_path, "w") as f:
-            json.dump(obj, f, indent=2)
-        print(f"Wrote {out_path}")
-    if stdout_json or not out_path:
-        print(json.dumps(obj, indent=2))
-
-
-def main():
-    if len(sys.argv) == 1:
-        interactive_wizard()
-        return
-
-    ap = argparse.ArgumentParser(description="Combined internal + remote sandbox audit")
-    sub = ap.add_subparsers(dest="mode", required=True)
-
-    ap_internal = sub.add_parser("internal", help="Run inside the target pod")
-    ap_internal.add_argument("--out", help="Output JSON file")
-    ap_internal.add_argument("--timeout", type=float, default=2.0)
-    ap_internal.add_argument("--stdout-json", action="store_true", help="Print JSON to stdout")
-
-    ap_remote = sub.add_parser("remote", help="Run remote audit from kubectl host")
-    ap_remote.add_argument("-n", "--namespace", default="cua")
-    ap_remote.add_argument("--target-selector", default="app=cua")
-    ap_remote.add_argument("--out", help="Output JSON file")
-    ap_remote.add_argument("--timeout", type=float, default=2.0)
-    ap_remote.add_argument("--no-introspection", action="store_true")
-    ap_remote.add_argument("--stdout-json", action="store_true", help="Print JSON to stdout")
-
-    ap_both = sub.add_parser("both", help="Run remote audit and invoke internal audit in the target pod")
-    ap_both.add_argument("-n", "--namespace", default="cua")
-    ap_both.add_argument("--target-selector", default="app=cua")
-    ap_both.add_argument("--out", help="Output JSON file")
-    ap_both.add_argument("--timeout", type=float, default=2.0)
-    ap_both.add_argument("--no-introspection", action="store_true")
-    ap_both.add_argument("--stdout-json", action="store_true", help="Print JSON to stdout")
-
-    ap_remediate = sub.add_parser("remediate", help="Generate remediation guidance from an existing audit JSON")
-    ap_remediate.add_argument("--input", required=True, help="Path to existing audit JSON")
-    ap_remediate.add_argument("--out", help="Output JSON file")
-    ap_remediate.add_argument("--stdout-json", action="store_true", help="Print JSON to stdout")
-
-    ap_rollback = sub.add_parser("rollback-bundle", help="Strictly restore resources from a saved rollback bundle and verify normalized equality")
-    ap_rollback.add_argument("--bundle-dir", required=True, help="Rollback bundle directory containing backup_manifest.json")
-    ap_rollback.add_argument("--out", help="Output JSON file")
-    ap_rollback.add_argument("--stdout-json", action="store_true", help="Print JSON to stdout")
-
-    ap_auto = sub.add_parser("auto", help="Fully automatic audit and safe-fix planning or execution")
-    ap_auto.add_argument("--timeout", type=float, default=2.0)
-    ap_auto.add_argument("--audit-out", help="Audit JSON file")
-    ap_auto.add_argument("--fix-out", help="Fix-result JSON file")
-    ap_auto.add_argument("--no-apply-safe-fixes", action="store_true", help="Do not auto-select safe low/medium fixes")
-    ap_auto.add_argument("--execute", action="store_true", help="Actually execute safe fixes instead of planning them")
-    ap_auto.add_argument("--aggressive-execute", action="store_true", help="Apply all patchable fixes, including conditional-approval items, with mandatory backup and rollback artifacts")
-
-    ap_apply = sub.add_parser("apply-fix", help="Generate or apply kubectl patches from audit findings")
-    ap_apply.add_argument("--input", required=True, help="Path to existing audit JSON")
-    ap_apply.add_argument("--out", help="Output JSON file")
-    ap_apply.add_argument("--stdout-json", action="store_true", help="Print JSON to stdout")
-    ap_apply.add_argument("-n", "--namespace", help="Override namespace")
-    ap_apply.add_argument("--workload", help="Deployment/StatefulSet/DaemonSet name to patch")
-    ap_apply.add_argument("--kind", default="deployment", choices=["deployment", "statefulset", "daemonset"])
-    ap_apply.add_argument("--apply-network-policy", action="store_true", help="Include kubectl apply for generated NetworkPolicy")
-    ap_apply.add_argument("--patch-service-account", action="store_true", help="Patch sandbox-sa to disable automount token")
-    ap_apply.add_argument("--execute", action="store_true", help="Actually run kubectl patch/apply commands instead of dry-run output")
-
-    args = ap.parse_args()
-
-    if args.mode == "internal":
-        obj = collect_internal(timeout=args.timeout)
-        obj["remediation"] = enrich_remediation(obj.get("remediation") or remediation_from_audit(obj))
-        write_or_print(obj, out_path=args.out, stdout_json=args.stdout_json)
-        return
-
-    if args.mode == "remote":
-        obj = collect_remote(
-            ns=args.namespace,
-            selector=args.target_selector,
-            timeout=args.timeout,
-            include_introspection=(not args.no_introspection),
-            include_internal_audit=False,
-        )
-        obj["remediation"] = enrich_remediation(obj.get("remediation") or remediation_from_audit(obj))
-        write_or_print(obj, out_path=args.out, stdout_json=args.stdout_json)
-        return
-
-    if args.mode == "both":
-        obj = collect_remote(
-            ns=args.namespace,
-            selector=args.target_selector,
-            timeout=args.timeout,
-            include_introspection=(not args.no_introspection),
-            include_internal_audit=True,
-        )
-        obj["remediation"] = enrich_remediation(obj.get("remediation") or remediation_from_audit(obj))
-        write_or_print(obj, out_path=args.out, stdout_json=args.stdout_json)
-        return
-
-    if args.mode == "remediate":
-        with open(args.input, "r") as f:
-            obj = json.load(f)
-        out = {
-            "meta": obj.get("meta", {}),
-            "remediation": enrich_remediation(obj.get("remediation") or remediation_from_audit(obj)),
-        }
-        write_or_print(out, out_path=args.out, stdout_json=args.stdout_json)
-        return
-
-    if args.mode == "rollback-bundle":
-        out = strict_rollback_bundle(args.bundle_dir)
-        write_or_print(out, out_path=args.out, stdout_json=args.stdout_json)
-        return
-
-    if args.mode == "auto":
-        auto_run(
-            timeout=args.timeout,
-            apply_safe_fixes=(not args.no_apply_safe_fixes),
-            execute=args.execute,
-            aggressive_execute=args.aggressive_execute,
-            audit_out=args.audit_out,
-            fix_out=args.fix_out,
-        )
-        return
-
-    if args.mode == "apply-fix":
-        with open(args.input, "r") as f:
-            obj = json.load(f)
-        out = apply_fixes(
-            obj,
-            namespace=args.namespace,
-            workload=args.workload,
-            kind=args.kind,
-            apply_network_policy=args.apply_network_policy,
-            patch_service_account=args.patch_service_account,
-            dry_run=(not args.execute),
-        )
-        write_or_print(out, out_path=args.out, stdout_json=args.stdout_json)
-        return
-
-
-# ---------------- enhanced recommendations layer ----------------
-SEVERITY_TO_NUM = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
-
-
-def collect_evidence(section_name, section):
-    out = []
-    for k, v in (section or {}).items():
-        if isinstance(v, dict) and 'ok' in v:
-            out.append({
-                'section': section_name,
-                'check_id': k,
-                'ok': v.get('ok'),
-                'evidence': v.get('evidence', ''),
-                'timestamp_utc': now_utc_iso(),
-            })
-    return out
-
-
-def merge_remediation_items(primary_items, secondary_items):
-    merged = []
-    seen = set()
-    for item in (primary_items or []) + (secondary_items or []):
-        if not isinstance(item, dict):
-            continue
-        key = (item.get('issue_id'), item.get('title'))
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(item)
-    return merged
-
-
-def actionable_remediation_items(remediation):
-    items = ((remediation or {}).get('items') or [])
-    return [item for item in items if item.get('issue_id') != 'NO_ACTIONABLE_FAILURES']
-
-
-def promote_internal_audit_findings(audit_obj):
-    audit_obj = dict(audit_obj or {})
-    internal_audit = ((audit_obj.get('results') or {}).get('internal_audit') or {})
-    if not isinstance(internal_audit, dict):
-        return audit_obj
-    top_items = actionable_remediation_items(audit_obj.get('remediation'))
-    internal_items = actionable_remediation_items(internal_audit.get('remediation'))
-    if internal_items:
-        merged_items = merge_remediation_items(top_items, internal_items)
-        templates = {}
-        templates.update((audit_obj.get('remediation') or {}).get('templates', {}) or {})
-        templates.update((internal_audit.get('remediation') or {}).get('templates', {}) or {})
-        audit_obj['remediation'] = {'count': len(merged_items), 'items': merged_items, 'templates': templates}
-        audit_obj['risk_score'] = compute_risk_score(audit_obj)
-        if internal_audit.get('risk_score', {}).get('total', 0) > audit_obj['risk_score'].get('total', 0):
-            audit_obj['risk_score'] = internal_audit['risk_score']
-    evidence = list(audit_obj.get('evidence') or [])
-    evidence.extend(internal_audit.get('evidence', []))
-    if evidence:
-        audit_obj['evidence'] = evidence
-    return audit_obj
-
-
-def apply_spec_fallback_if_needed(audit_obj):
-    audit_obj = copy.deepcopy(audit_obj or {})
-    internal_audit = ((audit_obj.get('results') or {}).get('internal_audit') or {})
-    internal_error = internal_audit.get('error') if isinstance(internal_audit, dict) else None
-    if not internal_error:
-        return audit_obj
-    fallback_errors = {
-        'internal_exec_parse_failed',
-        'no_python_in_target_pod',
-        'no_shell_in_target_pod',
-        'internal_exec_failed',
-    }
-    if internal_error not in fallback_errors and 'internal_exec' not in str(internal_error):
-        return audit_obj
-    fallback = build_spec_fallback_revalidation(audit_obj, audit_obj)
-    fallback.setdefault('meta', {})['assessment_status'] = 'partially_verified'
-    fallback['meta']['assessment_reason'] = internal_error
-    return fallback
-
-
-def reconcile_spec_backed_findings(audit_obj):
-    audit_obj = copy.deepcopy(audit_obj or {})
-    internal_audit = ((audit_obj.get('results') or {}).get('internal_audit') or {})
-    if not isinstance(internal_audit, dict) or internal_audit.get('error'):
-        return audit_obj
     try:
-        fallback = build_spec_fallback_revalidation(audit_obj, audit_obj)
-    except Exception:
-        return audit_obj
-    current_items = actionable_remediation_items(audit_obj.get('remediation'))
-    fallback_items = actionable_remediation_items(fallback.get('remediation'))
-    meta = audit_obj.get('meta') or {}
-    recent_unverifiable = recent_unverifiable_issue_items(meta.get('namespace'), meta.get('workload_name'))
-    if not current_items and not fallback_items and not recent_unverifiable:
-        return audit_obj
+        pod = load_target_pod_json(ctx) or {}
+    except Exception as e:
+        audit["reason"] = f"unable to load target pod: {type(e).__name__}: {e}"
+        return audit
+    spec = (pod.get("spec") or {})
+    node = str(spec.get("nodeName") or "")
+    audit["node"] = node
+    runtime = runtime_class_handler(ctx, spec.get("runtimeClassName"))
+    audit["runtime"] = runtime
+    if not node:
+        audit["reason"] = "unable to determine target node"
+        return audit
 
-    spec_backed_issue_ids = {
-        'SERVICE_ACCOUNT_TOKEN',
-        'ROOTFS_RW',
-        'SECCOMP_DISABLED',
-        'NO_NEW_PRIVS_DISABLED',
-        'RUN_AS_ROOT',
-        'LINUX_CAPS',
+    sysctl_commands = []
+    for cfg in NODE_SYSCTL_HARDENING.values():
+        key = cfg["sysctl"]
+        sysctl_commands.append(
+            f"echo AGENTFENCE_AUDIT_SYSCTL {shlex.quote(key)} value=$(sysctl -n {shlex.quote(key)} 2>/dev/null || true)"
+        )
+    kata_commands = r"""
+configs="/etc/kata-containers/configuration-qemu.toml /etc/kata-containers/configuration.toml /usr/share/defaults/kata-containers/configuration-qemu.toml /usr/share/defaults/kata-containers/configuration.toml /opt/kata/share/defaults/kata-containers/runtimes/qemu/configuration-qemu.toml /opt/kata/share/defaults/kata-containers/configuration-qemu.toml /opt/kata/share/defaults/kata-containers/configuration.toml"
+chosen=""
+for f in $configs; do
+  if [ -f "$f" ]; then chosen="$f"; break; fi
+done
+if [ -n "$chosen" ]; then
+  value="$(sed -n 's/^[[:space:]]*disable_guest_seccomp[[:space:]]*=[[:space:]]*//p' "$chosen" | tail -1 | tr -d ' "')" || value=""
+  echo "AGENTFENCE_AUDIT_KATA_CONFIG path=$chosen disable_guest_seccomp=${value:-unset}"
+else
+  echo "AGENTFENCE_AUDIT_KATA_CONFIG path= disable_guest_seccomp=missing"
+fi
+"""
+    script = "set -eu\n" + "\n".join(sysctl_commands) + "\n" + kata_commands + "\necho AGENTFENCE_AUDIT_COMPLETE\n"
+    debug_custom = {
+        "resources": {
+            "requests": {"cpu": "25m", "memory": "64Mi"},
+            "limits": {"cpu": "100m", "memory": "128Mi"},
+        }
     }
-    fallback_map = {item.get('issue_id'): copy.deepcopy(item) for item in fallback_items if item.get('issue_id')}
-    merged = []
-    seen = set()
-    for item in current_items:
-        issue_id = item.get('issue_id')
-        if not issue_id or issue_id in seen:
-            continue
-        seen.add(issue_id)
-        if issue_id in spec_backed_issue_ids:
-            if issue_id in fallback_map:
-                merged.append(copy.deepcopy(fallback_map[issue_id]))
-            continue
-        merged.append(copy.deepcopy(item))
-    for issue_id, item in fallback_map.items():
-        if issue_id in spec_backed_issue_ids and issue_id not in seen:
-            merged.append(copy.deepcopy(item))
-    for item in recent_unverifiable:
-        issue_id = item.get('issue_id')
-        if issue_id and issue_id not in seen:
-            seen.add(issue_id)
-            merged.append(copy.deepcopy(item))
+    custom_path = ""
+    rc = 1
+    out = ""
+    err = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
+            json.dump(debug_custom, f)
+            custom_path = f.name
+        rc, out, err = run_kubectl(
+            ctx.kubeconfig,
+            [
+                "debug",
+                f"node/{node}",
+                "-n",
+                ctx.namespace,
+                "--image=busybox:1.36",
+                "--profile=sysadmin",
+                f"--custom={custom_path}",
+                "--",
+                "chroot",
+                "/host",
+                "sh",
+                "-c",
+                script,
+            ],
+            timeout=120,
+        )
+    finally:
+        if custom_path:
+            try:
+                os.unlink(custom_path)
+            except OSError:
+                pass
 
-    if any((item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES' for item in merged):
-        merged = [item for item in merged if (item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES']
-
-    templates = {}
-    templates.update((audit_obj.get('remediation') or {}).get('templates', {}) or {})
-    templates.update((fallback.get('remediation') or {}).get('templates', {}) or {})
-    audit_obj['remediation'] = {'count': len(merged), 'items': merged, 'templates': templates}
-    audit_obj['risk_score'] = compute_risk_score(audit_obj)
-    audit_obj.setdefault('controller', {})['spec_reconciliation'] = {
-        'status': 'applied',
-        'reason': 'spec_backed_checks_reconciled',
-    }
-    return audit_obj
-
-
-def recent_unverifiable_issue_items(namespace, workload_name, limit=20):
-    if not namespace or not workload_name:
-        return []
-    patterns = [
-        f"guided_analyze_audit_{safe_slug(namespace, 'namespace')}_{safe_slug(workload_name, 'workload')}_*.json",
-        f"guided_remediation_audit_{safe_slug(namespace, 'namespace')}_{safe_slug(workload_name, 'workload')}_*.json",
-    ]
-    files = []
-    root = ensure_output_root()
-    for pattern in patterns:
-        files.extend(sorted(root.glob(pattern), reverse=True))
-    seen = set()
-    carry_ids = {'SETID_BINARIES_PRESENT', 'SENSITIVE_PATHS_WRITABLE', 'RISKY_DEVICE_NODES'}
-    carried = []
-    for path in files[:limit]:
-        try:
-            obj = json.loads(Path(path).read_text())
-        except Exception:
-            continue
-        for item in (((obj.get('remediation') or {}).get('items') or [])):
-            issue_id = item.get('issue_id')
-            if issue_id in carry_ids and issue_id not in seen:
-                seen.add(issue_id)
-                carried.append(copy.deepcopy(item))
-    return carried
-
-
-def get_nested(obj, *path):
-    cur = obj
-    for part in path:
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(part)
-    return cur
-
-
-def summarize_dependencies(ns, workload_name=None, pod_name=None, labels=None, timeout=30):
-    deps = {
-        'services': [], 'ingresses': [], 'network_policies': [], 'hpas': [], 'pdbs': [],
-        'configmaps': [], 'secrets': [], 'runtime_class': None, 'node_selector': {}, 'volumes': []
-    }
-    if not has_kubectl() or not ns:
-        return deps
-    labels = labels or {}
-    if workload_name:
-        for kind in ('deployment', 'statefulset', 'daemonset'):
-            rc, out = shell_rc(f"kubectl -n {shlex.quote(ns)} get {kind} {shlex.quote(workload_name)} -o json", timeout=timeout)
-            if rc == 0:
-                try:
-                    obj = json.loads(out)
-                    spec = (((obj.get('spec') or {}).get('template') or {}).get('spec') or {})
-                    deps['runtime_class'] = spec.get('runtimeClassName')
-                    deps['node_selector'] = spec.get('nodeSelector') or {}
-                    deps['volumes'] = spec.get('volumes') or []
-                    for vol in deps['volumes']:
-                        if vol.get('configMap'):
-                            deps['configmaps'].append(vol['configMap'].get('name'))
-                        if vol.get('secret'):
-                            deps['secrets'].append(vol['secret'].get('secretName'))
-                except Exception:
-                    pass
+    debug_pod = ""
+    m = re.search(r"Creating debugging pod\s+([^\s]+)", out or "")
+    if m:
+        debug_pod = m.group(1)
+    debug_phase = ""
+    debug_logs = ""
+    if debug_pod:
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            prc, pout, _ = run_kubectl(
+                ctx.kubeconfig,
+                ["get", "pod", debug_pod, "-n", ctx.namespace, "-o", "jsonpath={.status.phase}"],
+                timeout=15,
+            )
+            debug_phase = (pout or "").strip() if prc == 0 else debug_phase
+            if debug_phase in ("Succeeded", "Failed"):
                 break
-    for resource, key in [('services', 'services'), ('networkpolicy', 'network_policies'), ('ingress', 'ingresses'), ('hpa', 'hpas'), ('pdb', 'pdbs')]:
-        try:
-            obj = kubectl_get_json(ns, resource, extra_args='--ignore-not-found', timeout=timeout)
-            for item in obj.get('items', []):
-                name = item.get('metadata', {}).get('name')
-                if resource == 'services':
-                    selector = ((item.get('spec') or {}).get('selector') or {})
-                    if selector and all(labels.get(k) == v for k, v in selector.items()):
-                        deps[key].append(name)
-                elif resource == 'networkpolicy':
-                    ml = (((item.get('spec') or {}).get('podSelector') or {}).get('matchLabels') or {})
-                    if (not ml) or all(labels.get(k) == v for k, v in ml.items()):
-                        deps[key].append(name)
-                else:
-                    deps[key].append(name)
-        except Exception:
-            pass
-    deps['configmaps'] = sorted(set([x for x in deps['configmaps'] if x]))
-    deps['secrets'] = sorted(set([x for x in deps['secrets'] if x]))
-    return deps
-
-
-def compute_risk_score(audit_obj):
-    rem = ((audit_obj.get('remediation') or {}).get('items') or [])
-    weights = {
-        'RUN_AS_ROOT': (2,2), 'ROOTFS_RW': (2,2), 'LINUX_CAPS': (2,2), 'SECCOMP_DISABLED': (1,1),
-        'NO_NEW_PRIVS_DISABLED': (1,1), 'SERVICE_ACCOUNT_TOKEN': (2,2), 'IMDS_REACHABLE': (2,3),
-        'HOST_EXPOSURE': (3,3), 'NOVNC_LISTENER': (1,1), 'REMOTE_REACHABILITY': (3,3),
-        'SENSITIVE_PATHS_WRITABLE': (2,2), 'SETID_BINARIES_PRESENT': (1,1), 'RISKY_DEVICE_NODES': (3,3),
+            time.sleep(2)
+        _, debug_logs, _ = run_kubectl(
+            ctx.kubeconfig,
+            ["logs", debug_pod, "-n", ctx.namespace, "--tail=200"],
+            timeout=30,
+        )
+        run_kubectl(
+            ctx.kubeconfig,
+            ["delete", "pod", debug_pod, "-n", ctx.namespace, "--ignore-not-found"],
+            timeout=30,
+        )
+    combined = debug_logs or out or ""
+    audit["node_runtime_command"] = {
+        "status": "complete" if rc == 0 and "AGENTFENCE_AUDIT_COMPLETE" in combined else "failed",
+        "exit_code": rc,
+        "debug_pod": debug_pod,
+        "debug_pod_phase": debug_phase,
+        "stdout": (out or "")[-2000:],
+        "stderr": (err or "")[-2000:],
+        "logs": (debug_logs or "")[-2000:],
     }
-    p = b = 0
-    contributions = []
-    for item in rem:
-        sev = SEVERITY_TO_NUM.get(item.get('severity', 'low'), 1)
-        wp, wb = weights.get(item.get('issue_id'), (0, 0))
-        cp = min(5, wp + max(0, sev - 1) // 2)
-        cb = min(5, wb + max(0, sev - 1) // 2)
-        p += cp
-        b += cb
-        contributions.append({'issue_id': item.get('issue_id'), 'severity': item.get('severity'), 'P': cp, 'B': cb, 'title': item.get('title')})
-    total = p + b
-    band = 'low'
-    if total >= 18:
-        band = 'critical'
-    elif total >= 12:
-        band = 'high'
-    elif total >= 6:
-        band = 'medium'
-    return {'probability': p, 'blast_radius': b, 'total': total, 'band': band, 'contributions': contributions}
+    if rc != 0 or "AGENTFENCE_AUDIT_COMPLETE" not in combined:
+        audit["reason"] = "unable to complete node hardening preflight audit"
+        return audit
 
-
-def compatibility_assessment(audit_obj):
-    res = audit_obj.get('results', {}) or {}
-    meta = audit_obj.get('meta', {}) or {}
-    notes = []
-    if res.get('running_as_non_root', {}).get('ok') is False:
-        notes.append({'issue_id': 'RUN_AS_ROOT', 'risk': 'high', 'message': 'Container runs as root; forcing non-root may fail if file ownership and entrypoint assumptions are not updated.'})
-    if res.get('rootfs_readonly', {}).get('ok') is False or ((audit_obj.get('kubernetes') or {}).get('rootfs_readonly', {}) or {}).get('ok') is False:
-        notes.append({'issue_id': 'ROOTFS_RW', 'risk': 'high', 'message': 'Writable root filesystem detected; validate /tmp, /var/tmp, and application workspace writes before enabling read-only rootfs.'})
-    if 'listener_open=True' in str((res.get('novnc_http_local_6901') or {}).get('evidence', '')) or any(x.get('port') == 6901 and x.get('reachable') for x in res.get('scanned_ports', [])):
-        notes.append({'issue_id': 'NOVNC_LISTENER', 'risk': 'medium', 'message': 'Port 6901 appears active; removing exposure may impact a required desktop/UI path.'})
-    if 'listener_open=True' in str((res.get('vnc_rfb_greeting_5901') or {}).get('evidence', '')) or any(x.get('port') == 5901 and x.get('reachable') for x in res.get('scanned_ports', [])):
-        notes.append({'issue_id': 'NOVNC_LISTENER', 'risk': 'medium', 'message': 'Port 5901 appears active; hardening may be safer than removal if desktop access is intentional.'})
-    if (meta.get('dependencies') or {}).get('services'):
-        notes.append({'issue_id': 'REMOTE_REACHABILITY', 'risk': 'high', 'message': f"Services select this workload: {', '.join(meta['dependencies']['services'])}. Default-deny policy may block expected traffic."})
-    return notes
-
-
-def markdown_report(audit_obj, fix_result=None):
-    audit_obj = audit_obj or {}
-    fix_result = fix_result or None
-    meta = (audit_obj.get('meta', {}) or {}).copy()
-    if fix_result and not meta:
-        apply_meta = ((fix_result.get('apply_result') or {}).get('meta') or {})
-        fix_meta = (fix_result.get('meta') or {})
-        meta = {
-            'namespace': apply_meta.get('namespace') or fix_meta.get('namespace'),
-            'workload_kind': apply_meta.get('workload_kind') or fix_meta.get('kind'),
-            'workload_name': apply_meta.get('workload_name') or fix_meta.get('workload'),
-            'dependencies': apply_meta.get('dependencies') or {},
-        }
-    score = audit_obj.get('risk_score') or compute_risk_score(audit_obj)
-    if fix_result:
-        post_revalidated = ((fix_result.get('apply_result') or {}).get('post_fix_revalidation') or {})
-        post_score = post_revalidated.get('risk_score')
-        if post_score:
-            score = post_score
-    lines = [
-        '# Sandbox Audit Report', '',
-        f"- Generated: {now_utc_iso()}",
-        f"- Namespace: {meta.get('namespace', 'n/a')}",
-        f"- Workload: {meta.get('workload_kind', '')}/{meta.get('workload_name', '')}",
-        f"- Risk score: {score.get('total')} ({score.get('band')})", ''
+    sysctl_states: Dict[str, Dict[str, str]] = {}
+    for line in combined.splitlines():
+        m_state = re.match(r"AGENTFENCE_AUDIT_SYSCTL\s+(\S+)\s+value=(\S*)", line.strip())
+        if m_state:
+            sysctl_states[m_state.group(1)] = {"current": m_state.group(2)}
+            continue
+        m_kata = re.match(r"AGENTFENCE_AUDIT_KATA_CONFIG\s+path=(\S*)\s+disable_guest_seccomp=(\S*)", line.strip())
+        if m_kata:
+            audit["kata_guest_seccomp"] = {
+                "path": m_kata.group(1),
+                "disable_guest_seccomp": m_kata.group(2),
+            }
+    desired_met = {
+        pid: sysctl_states.get(cfg["sysctl"], {}).get("current") == cfg["value"]
+        for pid, cfg in NODE_SYSCTL_HARDENING.items()
+    }
+    reasons = [
+        f"{cfg['sysctl']} should be {cfg['value']} but is {sysctl_states.get(cfg['sysctl'], {}).get('current', 'unreadable')}"
+        for pid, cfg in NODE_SYSCTL_HARDENING.items()
+        if not desired_met.get(pid)
     ]
-    lines.append('## Findings')
-    for item in ((audit_obj.get('remediation') or {}).get('items') or []):
-        lines.append(f"- **{item.get('issue_id')}** [{item.get('severity')}] {item.get('title')}")
-    lines.append('')
-    lines.append('## Dependencies')
-    for k, v in (meta.get('dependencies') or {}).items():
-        if isinstance(v, list):
-            rendered = ', '.join(x if isinstance(x, str) else json.dumps(x, sort_keys=True) for x in v) if v else 'none'
-            lines.append(f"- {k}: {rendered}")
-        else:
-            lines.append(f"- {k}: {v}")
-    if fix_result:
-        lines.extend(['', '## Fix result', f"- Status: {fix_result.get('status')}"])
-        for item in fix_result.get('per_issue', []):
-            lines.append(f"- {item.get('issue_id')}: {item.get('status')}")
-        post_revalidated = ((fix_result.get('apply_result') or {}).get('post_fix_revalidation') or {})
-        post_score = post_revalidated.get('risk_score')
-        if post_score:
-            suffix = ' (partially verified)' if post_revalidated.get('risk_score_unverified') else ''
-            lines.append(f"- Post-remediation risk score: {post_score.get('total')} ({post_score.get('band')}){suffix}")
-    advisor = audit_obj.get('ai_advisor') or {}
-    if advisor.get('status') == 'ok':
-        lines.extend(['', '## AI Advisor'])
-        if advisor.get('guided_operator_message'):
-            lines.append(f"- Guided message: {advisor.get('guided_operator_message')}")
-        if advisor.get('executive_summary'):
-            lines.append(f"- Executive summary: {advisor.get('executive_summary')}")
-        if advisor.get('remediation_overview'):
-            lines.append(f"- Remediation overview: {advisor.get('remediation_overview')}")
-        groups = advisor.get('prioritized_groups') or []
-        if groups:
-            lines.extend(['', '### Prioritized roadmap'])
-            for group in groups:
-                lines.append(f"- {group.get('title')} [{group.get('priority')}]: {group.get('rationale')}")
-                if group.get('issue_ids'):
-                    lines.append(f"  Issues: {', '.join(group.get('issue_ids') or [])}")
-        item_advice = advisor.get('item_advice') or []
-        if item_advice:
-            lines.extend(['', '### Item guidance'])
-            for item in item_advice[:8]:
-                lines.append(f"- {item.get('issue_id')}: {item.get('explanation')}")
-        for warning in (advisor.get('warnings') or [])[:5]:
-            lines.append(f"- Warning: {warning}")
-    return '\n'.join(lines) + '\n'
+    if runtime.get("family") == "kata":
+        kata_value = str((audit.get("kata_guest_seccomp") or {}).get("disable_guest_seccomp") or "")
+        if kata_value.lower() != "false":
+            reasons.append("Kata guest seccomp is not enabled in the active runtime configuration")
+    audit["sysctl_states"] = sysctl_states
+    audit["desired_values_met"] = desired_met
+    audit["change_reasons"] = reasons
+    audit["changes_needed"] = bool(reasons)
+    audit["status"] = "changes_needed" if reasons else "already_hardened"
+    return audit
 
 
-def generate_admission_policies(labels):
-    kyverno = """apiVersion: kyverno.io/v1
-kind: ClusterPolicy
-metadata:
-  name: sandbox-restricted
-spec:
-  validationFailureAction: Audit
-  rules:
-  - name: require-restricted-security-context
-    match:
-      resources:
-        kinds:
-        - Pod
-    validate:
-      message: Enforce restricted securityContext for sandbox workloads.
-      pattern:
-        spec:
-          containers:
-          - securityContext:
-              allowPrivilegeEscalation: false
-              readOnlyRootFilesystem: true
-              seccompProfile:
-                type: RuntimeDefault
-"""
-    gatekeeper = """apiVersion: templates.gatekeeper.sh/v1beta1
-kind: ConstraintTemplate
-metadata:
-  name: k8srequiredsandboxsecurity
-spec:
-  crd:
-    spec:
-      names:
-        kind: K8sRequiredSandboxSecurity
-  targets:
-  - target: admission.k8s.gatekeeper.sh
-    rego: |
-      package k8srequiredsandboxsecurity
-      violation[{\"msg\": msg}] {
-        input.review.kind.kind == \"Pod\"
-        not input.review.object.spec.containers[_].securityContext.readOnlyRootFilesystem
-        msg := \"Sandbox pods must set readOnlyRootFilesystem=true\"
-      }
-"""
-    psa = {'pod_security_admission': 'Use namespace labels: pod-security.kubernetes.io/enforce=restricted'}
-    return {'kyverno_policy': kyverno, 'gatekeeper_template': gatekeeper, 'pod_security_admission': psa}
+def apply_node_sysctl_hardening(
+    ctx: RunContext,
+    baseline_results: Optional[List[TestResult]],
+) -> Tuple[List[Dict[str, Any]], Optional[List[TestResult]]]:
+    if not ctx.allow_node_runtime_remediation or ctx.dry_run or not baseline_results:
+        return [], None
+    unsafe = unsafe_probe_ids(baseline_results)
+    targets = dict(NODE_SYSCTL_HARDENING)
+    unsafe_targets = {pid: cfg for pid, cfg in targets.items() if pid in unsafe}
+    preflight = audit_node_runtime_hardening(ctx)
+    sysctl_changes_needed = any(
+        not bool((preflight.get("desired_values_met") or {}).get(pid))
+        for pid in targets
+    )
+    if preflight.get("status") == "already_hardened" and not preflight.get("changes_needed"):
+        return [
+            {
+                "kind": "node_sysctl_hardening",
+                "status": "not_applicable",
+                "reason": "node hardening preflight found all desired sysctl values already enabled; no node changes applied",
+                "node": preflight.get("node"),
+                "probe_ids": sorted(targets),
+                "unsafe_probe_ids": sorted(unsafe_targets),
+                "sysctls": targets,
+                "sysctl_states": preflight.get("sysctl_states") or {},
+                "desired_values_met": preflight.get("desired_values_met") or {},
+                "node_config_changed": False,
+                "node_config_already_hardened": True,
+                "preflight": preflight,
+            }
+        ], None
+    if not sysctl_changes_needed:
+        return [
+            {
+                "kind": "node_sysctl_hardening",
+                "status": "not_applicable",
+                "reason": "node hardening preflight found no sysctl changes to apply",
+                "node": preflight.get("node"),
+                "probe_ids": sorted(targets),
+                "unsafe_probe_ids": sorted(unsafe_targets),
+                "sysctls": targets,
+                "sysctl_states": preflight.get("sysctl_states") or {},
+                "desired_values_met": preflight.get("desired_values_met") or {},
+                "node_config_changed": False,
+                "node_config_already_hardened": True,
+                "preflight": preflight,
+            }
+        ], None
+    if preflight.get("status") not in ("changes_needed", "unknown"):
+        return [
+            {
+                "kind": "node_sysctl_hardening",
+                "status": "manual_recommendation",
+                "reason": "node hardening preflight did not identify an applicable automatic sysctl change",
+                "node": preflight.get("node"),
+                "probe_ids": sorted(targets),
+                "unsafe_probe_ids": sorted(unsafe_targets),
+                "node_config_changed": False,
+                "preflight": preflight,
+            }
+        ], None
+    pod = load_target_pod_json(ctx) or {}
+    node = ((pod.get("spec") or {}).get("nodeName")) or ""
+    if not node:
+        return [
+            {
+                "kind": "node_sysctl_hardening",
+                "status": "failed",
+                "reason": "unable to determine target node",
+                "probe_ids": sorted(targets),
+                "unsafe_probe_ids": sorted(unsafe_targets),
+            }
+        ], None
 
+    commands = []
+    for cfg in targets.values():
+        key = cfg["sysctl"]
+        value = cfg["value"]
+        safe_name = key.replace(".", "_")
+        commands.append(f"before_{safe_name}=$(sysctl -n {shlex.quote(key)} 2>/dev/null || true)")
+        commands.append(f"sysctl -w {shlex.quote(key)}={shlex.quote(value)}")
+        commands.append(f"after_{safe_name}=$(sysctl -n {shlex.quote(key)} 2>/dev/null || true)")
+        commands.append(f"echo AGENTFENCE_SYSCTL {shlex.quote(key)} before=${{before_{safe_name}}} after=${{after_{safe_name}}}")
+    script = "set -eu\n" + "\n".join(commands) + "\necho AGENTFENCE_SYSCTL_CONFIGURED\n"
 
-def capture_resource_snapshot(ns, kind, name, timeout=30):
-    if not has_kubectl() or not ns or not kind or not name:
-        return {'kind': kind, 'name': name, 'captured': False, 'reason': 'kubectl unavailable or incomplete target'}
-    rc, out = shell_rc(f"kubectl -n {shlex.quote(ns)} get {shlex.quote(kind)} {shlex.quote(name)} -o json", timeout=timeout)
-    if rc != 0:
-        return {'kind': kind, 'name': name, 'captured': False, 'error': out.strip()}
-    try:
-        obj = json.loads(out)
-    except Exception:
-        obj = {'raw': out}
-    return {'kind': kind, 'name': name, 'captured': True, 'resource_version': get_nested(obj, 'metadata', 'resourceVersion'), 'uid': get_nested(obj, 'metadata', 'uid'), 'object': obj}
-
-
-def normalize_resource_object(obj):
-    norm = copy.deepcopy(obj)
-    if not isinstance(norm, dict):
-        return norm
-    norm.pop('status', None)
-    md = norm.get('metadata', {})
-    if isinstance(md, dict):
-        for key in ['resourceVersion', 'uid', 'managedFields', 'creationTimestamp', 'generation', 'selfLink']:
-            md.pop(key, None)
-        annotations = md.get('annotations')
-        if isinstance(annotations, dict):
-            annotations.pop('deployment.kubernetes.io/revision', None)
-            annotations.pop('kubectl.kubernetes.io/last-applied-configuration', None)
-            if not annotations:
-                md.pop('annotations', None)
-    return norm
-
-
-def prepare_replace_object(snapshot_obj, live_obj):
-    prepared = copy.deepcopy(snapshot_obj)
-    prepared.pop('status', None)
-    prepared.setdefault('metadata', {})
-    live_md = (live_obj or {}).get('metadata', {}) or {}
-    prepared['metadata']['resourceVersion'] = live_md.get('resourceVersion')
-    for key in ['uid', 'managedFields', 'creationTimestamp', 'generation', 'selfLink']:
-        prepared['metadata'].pop(key, None)
-    return prepared
-
-
-def strict_restore_snapshot_file(snapshot_file, timeout=60):
-    with open(snapshot_file, 'r') as f:
-        snapshot_obj = json.load(f)
-    kind = ((snapshot_obj.get('kind') or '')).lower()
-    name = get_nested(snapshot_obj, 'metadata', 'name')
-    ns = get_nested(snapshot_obj, 'metadata', 'namespace') or 'default'
-    if not kind or not name:
-        raise RuntimeError(f'invalid snapshot file: {snapshot_file}')
-    live = kubectl_get_json(ns, kind, name=name, timeout=timeout)
-    prepared = prepare_replace_object(snapshot_obj, live)
-    tmp = tempfile.NamedTemporaryFile('w', delete=False, suffix='.json')
-    try:
-        json.dump(prepared, tmp, indent=2)
-        tmp.close()
-        rc, out = shell_rc(f"kubectl -n {shlex.quote(ns)} replace -f {shlex.quote(tmp.name)}", timeout=timeout)
-        if rc != 0:
-            raise RuntimeError(out.strip() or f'kubectl replace failed for {kind}/{name}')
-        restored = kubectl_get_json(ns, kind, name=name, timeout=timeout)
-        equal = normalize_resource_object(restored) == normalize_resource_object(snapshot_obj)
-        diff = ''
-        if not equal:
-            import difflib
-            a = json.dumps(normalize_resource_object(snapshot_obj), indent=2, sort_keys=True).splitlines()
-            b = json.dumps(normalize_resource_object(restored), indent=2, sort_keys=True).splitlines()
-            diff = '\n'.join(difflib.unified_diff(a, b, fromfile='snapshot', tofile='restored', n=2))
-        return {
-            'kind': kind,
-            'name': name,
-            'namespace': ns,
-            'snapshot_file': snapshot_file,
-            'restore_rc': rc,
-            'restore_output': out.strip(),
-            'normalized_equal': equal,
-            'normalized_diff': diff,
+    debug_custom = {
+        "resources": {
+            "requests": {"cpu": "25m", "memory": "64Mi"},
+            "limits": {"cpu": "100m", "memory": "128Mi"},
         }
+    }
+    custom_path = ""
+    rc = 1
+    out = ""
+    err = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
+            json.dump(debug_custom, f)
+            custom_path = f.name
+        rc, out, err = run_kubectl(
+            ctx.kubeconfig,
+            [
+                "debug",
+                f"node/{node}",
+                "-n",
+                ctx.namespace,
+                "--image=busybox:1.36",
+                "--profile=sysadmin",
+                f"--custom={custom_path}",
+                "--",
+                "chroot",
+                "/host",
+                "sh",
+                "-c",
+                script,
+            ],
+            timeout=180,
+        )
+    finally:
+        if custom_path:
+            try:
+                os.unlink(custom_path)
+            except OSError:
+                pass
+
+    debug_pod = ""
+    m = re.search(r"Creating debugging pod\s+([^\s]+)", out or "")
+    if m:
+        debug_pod = m.group(1)
+    debug_phase = ""
+    debug_logs = ""
+    if debug_pod:
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            prc, pout, _ = run_kubectl(
+                ctx.kubeconfig,
+                ["get", "pod", debug_pod, "-n", ctx.namespace, "-o", "jsonpath={.status.phase}"],
+                timeout=15,
+            )
+            debug_phase = (pout or "").strip() if prc == 0 else debug_phase
+            if debug_phase in ("Succeeded", "Failed"):
+                break
+            time.sleep(3)
+        _, debug_logs, _ = run_kubectl(
+            ctx.kubeconfig,
+            ["logs", debug_pod, "-n", ctx.namespace, "--tail=200"],
+            timeout=30,
+        )
+        run_kubectl(
+            ctx.kubeconfig,
+            ["delete", "pod", debug_pod, "-n", ctx.namespace, "--ignore-not-found"],
+            timeout=30,
+        )
+    marker_seen = "AGENTFENCE_SYSCTL_CONFIGURED" in (debug_logs or out or "")
+    sysctl_states: Dict[str, Dict[str, str]] = {}
+    for line in (debug_logs or out or "").splitlines():
+        m_state = re.match(r"AGENTFENCE_SYSCTL\s+(\S+)\s+before=(\S*)\s+after=(\S*)", line.strip())
+        if not m_state:
+            continue
+        sysctl_states[m_state.group(1)] = {
+            "before": m_state.group(2),
+            "after": m_state.group(3),
+        }
+    desired_met = {
+        pid: sysctl_states.get(cfg["sysctl"], {}).get("after") == cfg["value"]
+        for pid, cfg in targets.items()
+    }
+    all_desired = bool(desired_met) and all(desired_met.values())
+    changed_values = [
+        cfg["sysctl"]
+        for cfg in targets.values()
+        if sysctl_states.get(cfg["sysctl"], {}).get("before")
+        != sysctl_states.get(cfg["sysctl"], {}).get("after")
+    ]
+    record: Dict[str, Any] = {
+        "kind": "node_sysctl_hardening",
+        "node": node,
+        "probe_ids": sorted(targets),
+        "unsafe_probe_ids": sorted(unsafe_targets),
+        "sysctls": targets,
+        "sysctl_states": sysctl_states,
+        "desired_values_met": desired_met,
+        "status": "applied" if rc == 0 and marker_seen and all_desired else "failed",
+        "node_config_changed": bool(changed_values),
+        "node_config_already_hardened": bool(rc == 0 and marker_seen and all_desired and not changed_values),
+        "node_runtime_command": {
+            "status": "complete" if rc == 0 and marker_seen and all_desired else "failed",
+            "exit_code": rc,
+            "debug_pod": debug_pod,
+            "debug_pod_phase": debug_phase,
+            "stdout": (out or "")[-3000:],
+            "stderr": (err or "")[-3000:],
+            "logs": (debug_logs or "")[-3000:],
+        },
+    }
+    if record["status"] != "applied":
+        record["reason"] = "node sysctl hardening did not complete"
+        return [record], None
+    after_results = run_all_probes(ctx)
+    before_unsafe = unsafe
+    after_unsafe = unsafe_probe_ids(after_results)
+    record["resolved_probe_ids"] = sorted((before_unsafe & set(unsafe_targets)) - after_unsafe)
+    record["still_unsafe_probe_ids"] = sorted((before_unsafe & set(unsafe_targets)) & after_unsafe)
+    if record["still_unsafe_probe_ids"]:
+        record["verification_warnings"] = [
+            "Node sysctl hardening is at the desired value, but one or more related probes remain unsafe; "
+            "the remaining evidence is likely runtime-specific or requires a non-sysctl control."
+        ]
+    return [record], after_results
+
+
+def build_workload_hardening_patch(
+    ctx: RunContext,
+    remediation_plan: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    patches, info = build_workload_hardening_patches(ctx, remediation_plan)
+    if not patches:
+        return None, info
+    first = dict(patches[0])
+    return first.pop("patch"), first
+
+
+def build_workload_hardening_patches(
+    ctx: RunContext,
+    remediation_plan: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    actionable = remediation_plan.get("actionable_items") or []
+    workload = discover_workload_reference(ctx)
+    wl = workload.get("workload") or {}
+    resource = wl.get("resource")
+    name = wl.get("name")
+    if not resource or not name:
+        return [], {"reason": "no supported controller workload discovered", "workload_reference": workload}
+    workload_json = kubectl_get_json(ctx.kubeconfig, ["get", str(resource), str(name), "-n", ctx.namespace])
+    if not workload_json:
+        return [], {"reason": "unable to load controller workload", "workload_reference": workload}
+
+    if resource == "cronjob":
+        pod_spec = (
+            ((workload_json.get("spec") or {}).get("jobTemplate") or {})
+            .get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+        )
+    else:
+        pod_spec = ((workload_json.get("spec") or {}).get("template") or {}).get("spec") or {}
+    container_names = [c.get("name") for c in (pod_spec.get("containers") or []) if c.get("name")]
+    init_container_names = [c.get("name") for c in (pod_spec.get("initContainers") or []) if c.get("name")]
+    if not container_names and not init_container_names:
+        return [], {"reason": "workload has no named containers", "workload_reference": workload}
+
+    workload_snapshot = capture_workload_config_before_patch(ctx, workload, workload_json, pod_spec)
+    allows_security_context, compatibility_reason = workload_allows_auto_security_context(pod_spec)
+    allows_sa_token, sa_token_reason = workload_allows_auto_service_account_token(ctx, pod_spec)
+    # Some recipes are mechanically patchable but not universally safe. The app
+    # uses workload shape and Kubernetes rollout validation, not sandbox/runtime
+    # names, to decide what can be attempted automatically.
+    unsafe_blind_auto = {"AgentFence.ID.RUN_AS_UID_ZERO"}
+    guarded_hybrid_artifacts = {
+        "kernel_surface_hardening_patch",
+        "namespace_isolation_patch",
+        "readonly_rootfs_patch",
+        "device_access_review_patch",
+    }
+    conservative_multi_container_probe_ids = {
+        "AgentFence.IDENTITY.SECCOMP_BYPASS_OK",
+        "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK",
+        "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE",
+        "AgentFence.DEVICE.RAW_SOCKET_USABLE",
+    }
+    auto_items = [
+        i
+        for i in actionable
+        if (
+            i.get("probe_id") not in unsafe_blind_auto
+            and (
+                allows_security_context
+                or i.get("probe_id") in conservative_multi_container_probe_ids
+            )
+            and (
+                i.get("action_type") == "auto_fix"
+                or (
+                    i.get("action_type") == "hybrid"
+                    and ((i.get("dry_run_artifact") or {}).get("artifact_kind") in guarded_hybrid_artifacts)
+                )
+            )
+        )
+    ]
+    probe_ids = {str(i.get("probe_id")) for i in auto_items}
+    artifacts = {
+        ((i.get("dry_run_artifact") or {}).get("artifact_kind") or "")
+        for i in auto_items
+    }
+
+    base_info: Dict[str, Any] = {
+        "workload_reference": workload,
+        "resource": str(resource),
+        "name": str(name),
+        "workload_config_before": workload_snapshot,
+        "compatibility": {
+            "auto_security_context": allows_security_context,
+            "reason": compatibility_reason,
+            "auto_service_account_token": allows_sa_token,
+            "service_account_reason": sa_token_reason,
+        },
+    }
+    stages: List[Dict[str, Any]] = []
+
+    def selected_container_names() -> List[str]:
+        if allows_security_context:
+            return list(container_names)
+        if ctx.target_container in container_names:
+            return [ctx.target_container]
+        return list(container_names[:1])
+
+    def container_patch(sc: Dict[str, Any], names: List[str]) -> Dict[str, Any]:
+        pod_patch: Dict[str, Any] = {}
+        if names:
+            pod_patch["containers"] = [
+                {"name": cname, "securityContext": dict(sc)}
+                for cname in names
+            ]
+        if allows_security_context and init_container_names:
+            pod_patch["initContainers"] = [
+                {"name": cname, "securityContext": dict(sc)}
+                for cname in init_container_names
+            ]
+        return pod_patch
+
+    def add_stage(
+        stage_name: str,
+        pod_spec_patch: Dict[str, Any],
+        changed_for: Iterable[str],
+        artifact_kinds: Iterable[str],
+        risk_level: str = "guarded",
+    ) -> None:
+        probe_list = sorted({str(x) for x in changed_for if x})
+        if not pod_spec_patch or not probe_list:
+            return
+        info = {
+            **base_info,
+            "stage": stage_name,
+            "risk_level": risk_level,
+            "probe_ids": probe_list,
+            "artifact_kinds": sorted({str(a) for a in artifact_kinds if a}),
+            "patch": workload_template_patch(str(resource), pod_spec_patch),
+        }
+        stages.append(info)
+
+    seccomp_probe_ids = probe_ids & {"AgentFence.IDENTITY.SECCOMP_BYPASS_OK"}
+    kernel_surface_probe_ids = probe_ids & {
+        "AgentFence.KERNEL.KEXEC_REACHABLE",
+        "AgentFence.KERNEL.INIT_MODULE_REACHABLE",
+        "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE",
+        "AgentFence.KERNEL.DMESG_VISIBLE",
+        "AgentFence.FS.KCORE_READABLE",
+    }
+    if seccomp_probe_ids:
+        seccomp_container_sc = {"seccompProfile": {"type": "RuntimeDefault"}}
+        seccomp_patch = {
+            "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
+            **container_patch(seccomp_container_sc, list(container_names)),
+        }
+        add_stage(
+            "seccomp_runtime_default",
+            seccomp_patch,
+            seccomp_probe_ids,
+            {"pod_security_context_patch"},
+            "low",
+        )
+
+    nnp_probe_ids = probe_ids & {"AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK"}
+    if nnp_probe_ids:
+        add_stage(
+            "no_new_privileges",
+            container_patch(
+                {"allowPrivilegeEscalation": False},
+                selected_container_names(),
+            ),
+            nnp_probe_ids,
+            {"pod_security_context_patch"},
+            "guarded",
+        )
+
+    capability_probe_ids = probe_ids & {
+        "AgentFence.DEVICE.RAW_SOCKET_USABLE",
+        "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE",
+        "AgentFence.DEVICE.TUN_TAP_PRESENT",
+        "AgentFence.DEVICE.KVM_PRESENT",
+        "AgentFence.DEVICE.USB_PRESENT",
+        "AgentFence.FS.HOST_DEVICES_VISIBLE",
+    }
+    if capability_probe_ids:
+        cap_sc: Dict[str, Any] = {"privileged": False}
+        merge_capabilities_drop_all(cap_sc)
+        add_stage(
+            "capability_minimization",
+            container_patch(cap_sc, selected_container_names()),
+            capability_probe_ids,
+            {"capabilities_drop_patch", "device_access_review_patch"},
+            "guarded",
+        )
+    if kernel_surface_probe_ids and allows_security_context:
+        kernel_sc: Dict[str, Any] = {
+            "seccompProfile": {"type": "RuntimeDefault"},
+            "privileged": False,
+        }
+        merge_capabilities_drop_all(kernel_sc)
+        add_stage(
+            "kernel_surface_hardening",
+            {
+                "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
+                **container_patch(kernel_sc, list(container_names)),
+            },
+            kernel_surface_probe_ids,
+            {"kernel_surface_hardening_patch"},
+            "guarded",
+        )
+
+    readonly_probe_ids = probe_ids & {"AgentFence.ID.ROOTFS_WRITE_OK"}
+    if readonly_probe_ids and allows_security_context:
+        add_stage(
+            "readonly_root_filesystem",
+            container_patch(
+                {"readOnlyRootFilesystem": True},
+                list(container_names),
+            ),
+            readonly_probe_ids,
+            {"readonly_rootfs_patch"},
+            "high_compatibility_risk",
+        )
+
+    if (
+        ("service_account_patch" in artifacts or "service_account_and_egress_patch" in artifacts)
+        and allows_sa_token
+    ):
+        sa_probe_ids = probe_ids & {
+            "AgentFence.ID.SA_TOKEN_READABLE",
+            "AgentFence.NET.APISERVER_DIRECT_REACHABLE",
+        }
+        add_stage(
+            "disable_service_account_token_automount",
+            {"automountServiceAccountToken": False},
+            sa_probe_ids,
+            {"service_account_patch", "service_account_and_egress_patch"},
+            "guarded",
+        )
+
+    if "namespace_isolation_patch" in artifacts:
+        ns_probe_ids = probe_ids & {
+            "AgentFence.NS.PID_NS_SHARES_HOST",
+            "AgentFence.NS.IPC_NS_SHARES_HOST",
+            "AgentFence.NS.NET_NS_SHARES_HOST",
+            "AgentFence.NS.UTS_NS_SHARES_HOST",
+            "AgentFence.FS.HOST_PROC_VISIBLE",
+            "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC",
+        }
+        if ns_probe_ids and allows_security_context:
+            add_stage(
+                "namespace_isolation",
+                {"hostPID": False, "hostIPC": False, "hostNetwork": False},
+                ns_probe_ids,
+                {"namespace_isolation_patch"},
+                "guarded",
+            )
+
+    if not stages:
+        return [], {
+            "reason": "no supported workload patch for current findings",
+            **base_info,
+        }
+
+    return stages, {**base_info, "stage_count": len(stages)}
+
+
+def kubectl_patch_workload(
+    ctx: RunContext,
+    resource: str,
+    name: str,
+    patch: Dict[str, Any],
+    dry_run: bool,
+) -> Dict[str, Any]:
+    patch_json = json.dumps(patch, separators=(",", ":"))
+    base = [
+        "patch",
+        resource,
+        name,
+        "-n",
+        ctx.namespace,
+        "--type=strategic",
+        "-p",
+        patch_json,
+    ]
+    rc, out, err = run_kubectl(ctx.kubeconfig, base + ["--dry-run=server"], timeout=90)
+    if rc != 0:
+        return {"status": "failed", "phase": "dry_run_server", "error": (err or out or f"exit {rc}")[:2000]}
+    if dry_run:
+        return {"status": "dry_run_planned", "server_dry_run": (out or "").strip()[:1000]}
+    rc, out, err = run_kubectl(ctx.kubeconfig, base, timeout=120)
+    if rc != 0:
+        return {"status": "failed", "phase": "apply", "error": (err or out or f"exit {rc}")[:2000]}
+    apply_output = (out or "").strip()[:1000]
+    changed = "(no change)" not in apply_output and " unchanged" not in apply_output
+    rollout_status = "not_applicable"
+    rollout_message = ""
+    if resource in ("deployment", "statefulset", "daemonset"):
+        rc2, out2, err2 = run_kubectl(
+            ctx.kubeconfig,
+            ["rollout", "status", f"{resource}/{name}", "-n", ctx.namespace, "--timeout=120s"],
+            timeout=150,
+        )
+        rollout_status = "complete" if rc2 == 0 else "warning"
+        rollout_message = (out2 or err2 or f"exit {rc2}")[:2000]
+        if rc2 != 0:
+            undo_rc, undo_out, undo_err = run_kubectl(
+                ctx.kubeconfig,
+                ["rollout", "undo", f"{resource}/{name}", "-n", ctx.namespace],
+                timeout=60,
+            )
+            return {
+                "status": "failed",
+                "phase": "rollout",
+                "kubectl": (out or "").strip()[:1000],
+                "rollout_status": rollout_status,
+                "rollout_message": rollout_message,
+                "rollback_attempted": True,
+                "rollback_status": "started" if undo_rc == 0 else "failed",
+                "rollback_message": (undo_out or undo_err or f"exit {undo_rc}")[:2000],
+            }
+    return {
+        "status": "applied",
+        "kubectl": apply_output,
+        "changed": changed,
+        "rollout_status": rollout_status,
+        "rollout_message": rollout_message,
+    }
+
+
+def node_internal_ip(ctx: RunContext, node_name: Optional[str]) -> Optional[str]:
+    if not node_name:
+        return None
+    node = kubectl_get_json(ctx.kubeconfig, ["get", "node", node_name])
+    for addr in ((node or {}).get("status") or {}).get("addresses") or []:
+        if addr.get("type") == "InternalIP" and addr.get("address"):
+            return str(addr["address"])
+    return None
+
+
+def kubernetes_service_ip(ctx: RunContext) -> Optional[str]:
+    svc = kubectl_get_json(ctx.kubeconfig, ["get", "service", "kubernetes", "-n", "default"])
+    ip = ((svc or {}).get("spec") or {}).get("clusterIP")
+    return str(ip) if ip and ip != "None" else None
+
+
+def reapplyable_manifest(obj: Dict[str, Any]) -> Dict[str, Any]:
+    data = json.loads(json.dumps(obj))
+    _strip_managed_fields(data)
+    metadata = data.get("metadata") or {}
+    for key in (
+        "creationTimestamp",
+        "deletionGracePeriodSeconds",
+        "deletionTimestamp",
+        "finalizers",
+        "generation",
+        "resourceVersion",
+        "selfLink",
+        "uid",
+    ):
+        metadata.pop(key, None)
+    annotations = metadata.get("annotations") or {}
+    annotations.pop("kubectl.kubernetes.io/last-applied-configuration", None)
+    if annotations:
+        metadata["annotations"] = annotations
+    else:
+        metadata.pop("annotations", None)
+    data.pop("status", None)
+    return data
+
+
+def manifest_resource_ref(manifest: Dict[str, Any]) -> Tuple[str, str, str]:
+    metadata = manifest.get("metadata") or {}
+    return (
+        str(manifest.get("kind") or ""),
+        str(metadata.get("name") or ""),
+        str(metadata.get("namespace") or ""),
+    )
+
+
+def apply_json_manifest(ctx: RunContext, manifest: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
+    kind, name, namespace = manifest_resource_ref(manifest)
+    previous_manifest = None
+    if kind and name:
+        get_args = ["get", kind, name]
+        if namespace:
+            get_args += ["-n", namespace]
+        previous = kubectl_get_json(ctx.kubeconfig, get_args)
+        if isinstance(previous, dict) and previous.get("kind"):
+            previous_manifest = reapplyable_manifest(previous)
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as tmp:
+        json.dump(manifest, tmp, indent=2)
+        tmp_path = tmp.name
+    try:
+        rc, out, err = run_kubectl(ctx.kubeconfig, ["apply", "--dry-run=server", "-f", tmp_path], timeout=90)
+        if rc != 0:
+            return {"status": "failed", "phase": "dry_run_server", "error": (err or out or f"exit {rc}")[:2000]}
+        if dry_run:
+            return {"status": "dry_run_planned", "server_dry_run": (out or "").strip()[:1000]}
+        rc, out, err = run_kubectl(ctx.kubeconfig, ["apply", "-f", tmp_path], timeout=120)
+        if rc != 0:
+            return {"status": "failed", "phase": "apply", "error": (err or out or f"exit {rc}")[:2000]}
+        apply_output = (out or "").strip()[:1000]
+        operation = "unknown"
+        if " created" in apply_output:
+            operation = "created"
+        elif " configured" in apply_output:
+            operation = "configured"
+        elif " unchanged" in apply_output:
+            operation = "unchanged"
+        result = {
+            "status": "applied",
+            "kubectl": apply_output,
+            "apply_operation": operation,
+            "changed": operation != "unchanged",
+        }
+        if previous_manifest:
+            result["previous_manifest"] = previous_manifest
+        return result
     finally:
         try:
-            os.unlink(tmp.name)
-        except Exception:
+            os.unlink(tmp_path)
+        except OSError:
             pass
 
 
-def strict_rollback_bundle(bundle_dir):
-    manifest_path = os.path.join(bundle_dir, 'backup_manifest.json')
-    with open(manifest_path, 'r') as f:
-        manifest = json.load(f)
-    results = []
-    for key, snap in (manifest.get('snapshots') or {}).items():
-        path = snap.get('file')
-        if not path:
-            results.append({'resource': key, 'skipped': True, 'reason': 'no snapshot file recorded'})
+def pod_selector_matches_labels(selector: Dict[str, Any], labels: Dict[str, str]) -> bool:
+    match_labels = selector.get("matchLabels") or {}
+    if not all(labels.get(str(k)) == str(v) for k, v in match_labels.items()):
+        return False
+    expressions = selector.get("matchExpressions") or []
+    for expr in expressions:
+        key = str(expr.get("key") or "")
+        operator = str(expr.get("operator") or "")
+        values = [str(v) for v in expr.get("values") or []]
+        actual = labels.get(key)
+        if operator == "In" and actual not in values:
+            return False
+        if operator == "NotIn" and actual in values:
+            return False
+        if operator == "Exists" and key not in labels:
+            return False
+        if operator == "DoesNotExist" and key in labels:
+            return False
+    return True
+
+
+def target_has_existing_egress_policy(ctx: RunContext, labels: Dict[str, str]) -> Tuple[bool, str]:
+    policies = kubectl_get_json(
+        ctx.kubeconfig,
+        ["get", "networkpolicies.networking.k8s.io", "-n", ctx.namespace],
+    )
+    if policies is None:
+        return True, "unable to inspect existing NetworkPolicies"
+    for policy in policies.get("items") or []:
+        metadata = policy.get("metadata") or {}
+        name = str(metadata.get("name") or "")
+        if name == "agentfence-egress-restrict-target":
             continue
-        results.append(strict_restore_snapshot_file(path))
-    ok = all(r.get('normalized_equal') is True or r.get('skipped') for r in results)
-    return {'bundle_dir': bundle_dir, 'manifest': manifest_path, 'results': results, 'status': 'restored' if ok else 'drift_remaining'}
-
-
-def build_rollback_from_snapshot(snapshot):
-    if not snapshot.get('captured'):
-        return {'available': False, 'reason': snapshot.get('reason') or snapshot.get('error') or 'snapshot unavailable'}
-    kind = (snapshot.get('kind') or '').lower()
-    name = snapshot.get('name')
-    ns = get_nested(snapshot.get('object', {}), 'metadata', 'namespace')
-    return {
-        'available': True,
-        'kind': kind,
-        'name': name,
-        'namespace': ns,
-        'restore_object_json': json.dumps(snapshot['object'], indent=2),
-        'restore_command': f"kubectl -n {shlex.quote(ns or 'default')} replace -f SNAPSHOT_{slugify_name(kind)}_{slugify_name(name)}.json"
-    }
-
-def build_fix_backup_bundle(audit_obj, namespace=None, workload=None, kind=None, include_serviceaccount=False, include_networkpolicy=False):
-    artifacts = _original_build_apply_fix_artifacts(audit_obj)
-    meta = artifacts.get('meta', {})
-    ns = namespace or meta.get('namespace')
-    workload_name = workload or meta.get('workload_name')
-    workload_kind = (kind or meta.get('workload_kind') or 'deployment').lower()
-    service_account_name = meta.get('service_account_name')
-    snapshots = {
-        'workload': capture_resource_snapshot(ns, workload_kind, workload_name),
-    }
-    if include_serviceaccount:
-        snapshots['serviceaccount'] = capture_resource_snapshot(ns, 'serviceaccount', service_account_name) if service_account_name else {'captured': False, 'reason': 'missing service account name'}
-    if include_networkpolicy:
-        try:
-            np_obj = yaml_or_json_load(artifacts['artifacts']['networkpolicy_yaml'])
-            np_name = get_nested(np_obj, 'metadata', 'name')
-            snapshots['networkpolicy'] = capture_resource_snapshot(ns, 'networkpolicy', np_name) if np_name else {'captured': False, 'reason': 'missing network policy name'}
-        except Exception as e:
-            snapshots['networkpolicy'] = {'captured': False, 'error': f'network policy parse failed: {e}'}
-    rollback = {k: build_rollback_from_snapshot(v) for k, v in snapshots.items()}
-    return {'artifacts': artifacts, 'snapshots': snapshots, 'rollback': rollback}
-
-
-def yaml_or_json_load(text):
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    lines = []
-    stack = [({}, -1)]
-    for raw in text.splitlines():
-        if not raw.strip() or raw.lstrip().startswith('#'):
+        spec = policy.get("spec") or {}
+        policy_types = set(spec.get("policyTypes") or [])
+        has_egress = "Egress" in policy_types or bool(spec.get("egress"))
+        if not has_egress:
             continue
-        indent = len(raw) - len(raw.lstrip(' '))
-        line = raw.strip()
-        while len(stack) > 1 and indent <= stack[-1][1]:
-            stack.pop()
-        parent = stack[-1][0]
-        if line.endswith(':'):
-            key = line[:-1]
-            parent[key] = {}
-            stack.append((parent[key], indent))
-        else:
-            key, value = line.split(':', 1)
-            value = value.strip().strip('"')
-            if value == 'true':
-                value = True
-            elif value == 'false':
-                value = False
-            elif value == 'null':
-                value = None
-            else:
-                try:
-                    value = int(value)
-                except Exception:
-                    pass
-            parent[key] = value
-    return stack[0][0]
+        if pod_selector_matches_labels(spec.get("podSelector") or {}, labels):
+            return True, f"existing egress NetworkPolicy {name!r} selects the target"
+    return False, "no existing egress NetworkPolicy selects the target"
 
 
-def backup_bundle_dir(prefix, namespace=None, workload_name=None):
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    parts = [prefix, safe_slug(namespace, 'namespace'), safe_slug(workload_name, 'workload'), stamp]
-    return str(ensure_output_root() / "_".join(parts))
+def target_exclusion_selector(labels: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    for key in ("role", "app", "app.kubernetes.io/name"):
+        value = labels.get(key)
+        if value:
+            return {"matchExpressions": [{"key": key, "operator": "NotIn", "values": [value]}]}
+    return None
 
 
-def build_source_of_truth_manifest_text(artifacts, include_serviceaccount=False, include_networkpolicy=False):
-    meta = artifacts.get('meta', {}) or {}
-    ns = meta.get('namespace')
-    workload_name = meta.get('workload_name')
-    workload_kind = (meta.get('workload_kind') or 'deployment').lower()
-    service_account_name = meta.get('service_account_name') or 'default'
-    workload_patch = json.loads((artifacts.get('artifacts') or {}).get('workload_patch_json') or '{}')
-    container_patches = get_nested(workload_patch, 'spec', 'template', 'spec', 'containers') or []
-    pod_spec_patch = get_nested(workload_patch, 'spec', 'template', 'spec') or {}
-    docs = []
-    if include_serviceaccount:
-        sa_obj = {
-            'apiVersion': 'v1',
-            'kind': 'ServiceAccount',
-            'metadata': {'name': service_account_name, 'namespace': ns},
-            'automountServiceAccountToken': False,
-        }
-        docs.append(dict_to_yaml(sa_obj))
-    wl_obj = {
-        'apiVersion': 'apps/v1',
-        'kind': workload_kind.capitalize() if workload_kind != 'daemonset' else 'DaemonSet',
-        'metadata': {'name': workload_name, 'namespace': ns},
-        'spec': {
-            'template': {
-                'spec': {
-                    'automountServiceAccountToken': pod_spec_patch.get('automountServiceAccountToken'),
-                    'containers': container_patches,
-                }
+def manifest_agentfence_annotations(manifest: Dict[str, Any], probe_ids: List[str]) -> None:
+    metadata = manifest.setdefault("metadata", {})
+    annotations = metadata.setdefault("annotations", {})
+    annotations["agentfence.dev/probe-ids"] = ",".join(sorted(set(probe_ids)))
+
+
+def ingress_policy_selects_target(policy: Dict[str, Any], labels: Dict[str, str]) -> bool:
+    spec = policy.get("spec") or {}
+    if not pod_selector_matches_labels(spec.get("podSelector") or {}, labels):
+        return False
+    policy_types = set(spec.get("policyTypes") or [])
+    return "Ingress" in policy_types or bool(spec.get("ingress"))
+
+
+def build_target_ingress_isolation_manifests(
+    ctx: RunContext, labels: Dict[str, str]
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    manifests: List[Dict[str, Any]] = []
+    notes: List[Dict[str, Any]] = []
+    deny_target = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": "agentfence-deny-ingress-target",
+            "namespace": ctx.namespace,
+            "labels": {"app.kubernetes.io/managed-by": "agentfence"},
+        },
+        "spec": {
+            "podSelector": {"matchLabels": labels},
+            "policyTypes": ["Ingress"],
+            "ingress": [],
+        },
+    }
+    manifest_agentfence_annotations(deny_target, ["AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE"])
+    manifests.append(deny_target)
+
+    exclusion_selector = target_exclusion_selector(labels)
+    if not exclusion_selector:
+        notes.append(
+            {
+                "probe_id": "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE",
+                "status": "manual_recommendation",
+                "reason": "cannot safely narrow broad ingress policies because target lacks a stable role/app label",
             }
-        }
-    }
-    docs.append(dict_to_yaml(wl_obj))
-    if include_networkpolicy:
-        docs.append((artifacts.get('artifacts') or {}).get('networkpolicy_yaml', '').strip())
-    return "\n---\n".join([d for d in docs if d]) + "\n"
+        )
+        return manifests, notes
 
-
-def persist_source_of_truth_manifest(artifacts, include_serviceaccount=False, include_networkpolicy=False, out_dir=None):
-    meta = artifacts.get('meta', {}) or {}
-    filename = backup_bundle_dir('source_of_truth_manifest', namespace=meta.get('namespace'), workload_name=meta.get('workload_name')) + '.yaml'
-    path = os.path.join(out_dir, os.path.basename(filename)) if out_dir else filename
-    text = build_source_of_truth_manifest_text(
-        artifacts,
-        include_serviceaccount=include_serviceaccount,
-        include_networkpolicy=include_networkpolicy,
+    policies = kubectl_get_json(
+        ctx.kubeconfig,
+        ["get", "networkpolicies.networking.k8s.io", "-n", ctx.namespace],
     )
-    with open(path, 'w') as f:
-        f.write(text)
-    return path
+    if policies is None:
+        notes.append(
+            {
+                "probe_id": "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE",
+                "status": "manual_recommendation",
+                "reason": "unable to inspect existing NetworkPolicies for safe ingress narrowing",
+            }
+        )
+        return manifests, notes
+
+    for policy in policies.get("items") or []:
+        metadata = policy.get("metadata") or {}
+        name = str(metadata.get("name") or "")
+        if name.startswith("agentfence-"):
+            continue
+        spec = policy.get("spec") or {}
+        ingress = spec.get("ingress")
+        if not ingress_policy_selects_target(policy, labels) or not ingress:
+            continue
+
+        narrowed = reapplyable_manifest(policy)
+        narrowed_spec = narrowed.setdefault("spec", {})
+        narrowed_spec["podSelector"] = exclusion_selector
+        narrowed.setdefault("metadata", {}).setdefault("labels", {})[
+            "app.kubernetes.io/managed-by"
+        ] = "agentfence"
+        manifest_agentfence_annotations(narrowed, ["AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE"])
+        manifests.append(narrowed)
+
+    return manifests, notes
 
 
-def persist_backup_bundle(bundle, prefix='rollback_bundle'):
-    meta = ((bundle.get('artifacts') or {}).get('meta') or {})
-    out_dir = backup_bundle_dir(prefix, namespace=meta.get('namespace'), workload_name=meta.get('workload_name'))
-    os.makedirs(out_dir, exist_ok=True)
-    manifest = {
-        'meta': meta,
-        'snapshots': {},
-        'rollback': bundle.get('rollback', {}),
-    }
-    for key, snap in (bundle.get('snapshots') or {}).items():
-        manifest['snapshots'][key] = {k: v for k, v in snap.items() if k != 'object'}
-        if snap.get('captured') and snap.get('object') is not None:
-            path = os.path.join(out_dir, f"snapshot_{safe_slug(snap.get('kind'), key)}_{safe_slug(snap.get('name'), key)}.json")
-            with open(path, 'w') as f:
-                json.dump(snap['object'], f, indent=2)
-            manifest['snapshots'][key]['file'] = path
-            if bundle.get('rollback', {}).get(key, {}).get('available'):
-                bundle['rollback'][key]['restore_command'] = bundle['rollback'][key]['restore_command'].replace(
-                    f"SNAPSHOT_{slugify_name((snap.get('kind') or '').lower())}_{slugify_name(snap.get('name'))}.json",
-                    path
-                )
-    manifest['rollback'] = bundle.get('rollback', {})
-    manifest_path = os.path.join(out_dir, 'backup_manifest.json')
-    with open(manifest_path, 'w') as f:
-        json.dump(manifest, f, indent=2)
-    return {'directory': out_dir, 'manifest': manifest_path}
+def network_policy_manifests(
+    ctx: RunContext,
+    remediation_plan: Dict[str, Any],
+    workload_info: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    actionable = remediation_plan.get("actionable_items") or []
+    auto_items = [
+        i
+        for i in actionable
+        if i.get("action_type") == "auto_fix" and is_scored_probe(i.get("probe_id"))
+    ]
+    probe_ids = {canonical_probe_id(i.get("probe_id")) for i in auto_items}
+    labels = target_match_labels(ctx)
+    if not labels:
+        return [], [{"status": "manual_recommendation", "reason": "target pod has no labels for NetworkPolicy podSelector"}]
 
-
-def ensure_mandatory_backup_bundle(audit_obj, namespace=None, workload=None, kind=None, include_serviceaccount=False, include_networkpolicy=False):
-    bundle = build_fix_backup_bundle(
-        audit_obj,
-        namespace=namespace,
-        workload=workload,
-        kind=kind,
-        include_serviceaccount=include_serviceaccount,
-        include_networkpolicy=include_networkpolicy,
-    )
-    required = ['workload']
-    if include_serviceaccount:
-        required.append('serviceaccount')
-    missing = [name for name in required if not get_nested(bundle, 'snapshots', name, 'captured')]
-    if missing:
-        reasons = []
-        for name in missing:
-            snap = get_nested(bundle, 'snapshots', name) or {}
-            reasons.append(f"{name}: {snap.get('reason') or snap.get('error') or 'snapshot unavailable'}")
-        raise RuntimeError("mandatory backup failed: " + "; ".join(reasons))
-    persisted = persist_backup_bundle(bundle)
-    bundle['persisted'] = persisted
-    return bundle
-
-
-def post_fix_revalidate(audit_obj, timeout=2.0):
-    meta = audit_obj.get('meta', {}) or {}
-    try:
-        if meta.get('namespace') and meta.get('target_selector'):
-            revalidated = collect_remote_with_attacker_policy(
-                meta['namespace'],
-                meta['target_selector'],
-                timeout=timeout,
-                include_introspection=True,
-                include_internal_audit=False,
-                create_if_missing=False,
-                cleanup_temporary_attacker=False,
+    manifests: List[Dict[str, Any]] = []
+    notes: List[Dict[str, Any]] = []
+    forbidden: List[str] = []
+    if "AgentFence.NET.IMDS_REACHABLE" in probe_ids:
+        has_existing_egress, egress_reason = target_has_existing_egress_policy(ctx, labels)
+        if has_existing_egress:
+            notes.append(
+                {
+                    "probe_id": "AgentFence.NET.IMDS_REACHABLE",
+                    "status": "manual_recommendation",
+                    "reason": (
+                        "metadata egress blocking requires editing existing egress policy; "
+                        f"blind add-on policy could broaden access ({egress_reason})"
+                    ),
+                }
             )
-            revalidated.setdefault('meta', {})
-            for key in ('namespace', 'target_selector', 'workload_name', 'workload_kind', 'service_account_name', 'selector_labels'):
-                if meta.get(key) and not revalidated['meta'].get(key):
-                    revalidated['meta'][key] = copy.deepcopy(meta.get(key))
-            if (audit_obj.get('results') or {}).get('internal_audit'):
-                target_pod = get_nested(revalidated, 'meta', 'target_pod')
-                if target_pod:
-                    containers = get_pod_containers(meta['namespace'], target_pod)
-                    container = containers[0] if containers else None
-                    internal_audit, internal_state = run_internal_audit_for_target(meta['namespace'], target_pod, container=container, timeout=timeout)
-                    revalidated.setdefault('results', {})['internal_audit'] = internal_audit
-                    revalidated.setdefault('controller', {})['internal_execution'] = internal_state
-                    revalidated = promote_internal_audit_findings(revalidated)
-                    if internal_state.get('status') != 'collected_from_laptop':
-                        revalidated = build_spec_fallback_revalidation(audit_obj, revalidated)
-                else:
-                    revalidated = build_spec_fallback_revalidation(audit_obj, revalidated)
-            revalidated = reconcile_spec_backed_findings(revalidated)
-            return revalidated
-        return collect_internal(timeout=timeout)
-    except Exception as e:
-        return {'error': 'revalidate_failed', 'detail': str(e)}
-
-
-def _all_containers(workload_obj):
-    return get_nested(workload_obj, 'spec', 'template', 'spec', 'containers') or []
-
-
-def _all_true(values):
-    return bool(values) and all(bool(v) for v in values)
-
-
-def _all_false(values):
-    return bool(values) and all((v is False) for v in values)
-
-
-def build_spec_fallback_revalidation(original_audit_obj, remote_obj):
-    meta = (remote_obj.get('meta') or {}).copy()
-    namespace = meta.get('namespace') or get_nested(original_audit_obj, 'meta', 'namespace')
-    workload_name = meta.get('workload_name') or get_nested(original_audit_obj, 'meta', 'workload_name')
-    workload_kind = (meta.get('workload_kind') or get_nested(original_audit_obj, 'meta', 'workload_kind') or 'deployment').lower()
-    service_account_name = meta.get('service_account_name') or get_nested(original_audit_obj, 'meta', 'service_account_name') or 'default'
-    workload_obj = kubectl_get_json(namespace, workload_kind, name=workload_name, timeout=30)
-    sa_obj = kubectl_get_json(namespace, 'serviceaccount', name=service_account_name, timeout=30)
-    pod_spec = get_nested(workload_obj, 'spec', 'template', 'spec') or {}
-    containers = _all_containers(workload_obj)
-
-    seccomp_vals = []
-    for c in containers:
-        csec = get_nested(c, 'securityContext', 'seccompProfile', 'type')
-        psec = get_nested(pod_spec, 'securityContext', 'seccompProfile', 'type')
-        seccomp_vals.append((csec or psec) in ('RuntimeDefault', 'Localhost'))
-
-    rootfs_vals = [get_nested(c, 'securityContext', 'readOnlyRootFilesystem') is True for c in containers]
-    ape_vals = [get_nested(c, 'securityContext', 'allowPrivilegeEscalation') is False for c in containers]
-    nonroot_vals = []
-    for c in containers:
-        sc = get_nested(c, 'securityContext') or {}
-        pod_sc = get_nested(pod_spec, 'securityContext') or {}
-        run_as_non_root = sc.get('runAsNonRoot')
-        run_as_user = sc.get('runAsUser')
-        if run_as_non_root is None:
-            run_as_non_root = pod_sc.get('runAsNonRoot')
-        if run_as_user is None:
-            run_as_user = pod_sc.get('runAsUser')
-        nonroot_vals.append(run_as_non_root is True or (isinstance(run_as_user, int) and run_as_user != 0))
-
-    caps_vals = []
-    for c in containers:
-        drops = get_nested(c, 'securityContext', 'capabilities', 'drop') or []
-        adds = get_nested(c, 'securityContext', 'capabilities', 'add') or []
-        drops_norm = {str(x).upper() for x in drops}
-        adds_norm = {str(x).upper() for x in adds}
-        dangerous = {'NET_RAW', 'SYS_ADMIN'}
-        caps_vals.append(('ALL' in drops_norm) and not (dangerous & adds_norm))
-
-    automount_pod = pod_spec.get('automountServiceAccountToken')
-    automount_sa = sa_obj.get('automountServiceAccountToken')
-    sa_disabled = (automount_pod is False) or (automount_pod is None and automount_sa is False)
-
-    spec_results = {
-        'running_as_non_root': bool_field(_all_true(nonroot_vals), f"spec_nonroot={nonroot_vals}"),
-        'rootfs_readonly': bool_field(_all_true(rootfs_vals), f"spec_readonly_rootfs={rootfs_vals}"),
-    }
-    spec_k8s = {
-        'seccomp_enforced': bool_field(_all_true(seccomp_vals), f"spec_seccomp={seccomp_vals}"),
-        'no_new_privs': bool_field(_all_true(ape_vals), f"spec_allowPrivilegeEscalation_false={ape_vals}"),
-        'rootfs_readonly': bool_field(_all_true(rootfs_vals), f"spec_readonly_rootfs={rootfs_vals}"),
-        'dangerous_caps_absent': bool_field(_all_true(caps_vals), f"spec_caps_drop_all={caps_vals}"),
-        'sa_token_present': bool_field(sa_disabled, f"automount_disabled={sa_disabled} pod={automount_pod} sa={automount_sa}"),
-        'sa_ca_present': bool_field(sa_disabled, f"automount_disabled={sa_disabled} pod={automount_pod} sa={automount_sa}"),
-        'sa_namespace_present': bool_field(sa_disabled, f"automount_disabled={sa_disabled} pod={automount_pod} sa={automount_sa}"),
-        'sa_mount_readonly': bool_field(sa_disabled, f"automount_disabled={sa_disabled} pod={automount_pod} sa={automount_sa}"),
-    }
-
-    fallback = copy.deepcopy(remote_obj)
-    fallback.setdefault('results', {}).update(spec_results)
-    fallback['kubernetes'] = spec_k8s
-    fallback.setdefault('results', {})['internal_audit'] = {
-        'summary': {'passed': count_ok(spec_results) + count_ok(spec_k8s), 'total': count_total(spec_results) + count_total(spec_k8s)},
-        'results': spec_results,
-        'kubernetes': spec_k8s,
-        'error': None,
-        'verification_mode': 'spec_fallback',
-    }
-    fallback.setdefault('controller', {})['internal_execution'] = {
-        'status': 'spec_fallback',
-        'reason': get_nested(remote_obj, 'controller', 'internal_execution', 'reason') or 'runtime_internal_audit_unavailable',
-    }
-    fallback.setdefault('meta', {})['verification_status'] = 'partially_verified'
-    fallback['remediation'] = remediation_from_audit(fallback)
-    fallback = promote_internal_audit_findings(fallback)
-
-    promoted_original = promote_internal_audit_findings(copy.deepcopy(original_audit_obj))
-    original_remediation = promoted_original.get('remediation') or remediation_from_audit(promoted_original)
-    original_items = ((original_remediation or {}).get('items') or [])
-    current_items = ((fallback.get('remediation') or {}).get('items') or [])
-    current_ids = {item.get('issue_id') for item in current_items}
-    carry_forward_ids = {'SETID_BINARIES_PRESENT', 'SENSITIVE_PATHS_WRITABLE', 'RISKY_DEVICE_NODES'}
-    for item in original_items:
-        issue_id = item.get('issue_id')
-        if issue_id in carry_forward_ids and issue_id not in current_ids:
-            current_items.append(copy.deepcopy(item))
-    if any((item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES' for item in current_items):
-        current_items = [item for item in current_items if (item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES']
-    fallback['remediation'] = enrich_remediation({'count': len(current_items), 'items': current_items, 'templates': (fallback.get('remediation') or {}).get('templates', {})})
-    fallback['risk_score'] = compute_risk_score(fallback)
-    fallback['risk_score_unverified'] = True
-    return fallback
-
-
-def wait_for_workload_rollout(namespace, workload, kind, timeout=60):
-    if not has_kubectl() or not namespace or not workload or not kind:
-        return {'ok': False, 'reason': 'missing_rollout_target'}
-    rc, out = shell_rc(
-        f"kubectl -n {shlex.quote(namespace)} rollout status {shlex.quote(kind)}/{shlex.quote(workload)} --timeout={int(timeout)}s",
-        timeout=timeout + 10,
-    )
-    return {'ok': rc == 0, 'output': (out or '').strip(), 'rc': rc}
-
-
-_original_collect_internal = collect_internal
-
-def collect_internal(timeout=2.0):
-    obj = _original_collect_internal(timeout=timeout)
-    obj['evidence'] = collect_evidence('results', obj.get('results', {})) + collect_evidence('kubernetes', obj.get('kubernetes', {}))
-    obj['risk_score'] = compute_risk_score(obj)
-    obj.setdefault('meta', {})['compatibility_notes'] = compatibility_assessment(obj)
-    obj['reports'] = {'markdown': markdown_report(obj)}
-    return obj
-
-
-_original_collect_remote = collect_remote
-
-def collect_remote(ns, selector, timeout=2.0, include_introspection=True, include_internal_audit=False):
-    obj = _original_collect_remote(ns, selector, timeout=timeout, include_introspection=include_introspection, include_internal_audit=include_internal_audit)
-    obj.setdefault('meta', {})['dependencies'] = summarize_dependencies(ns, obj.get('meta', {}).get('workload_name'), obj.get('meta', {}).get('target_pod'), obj.get('meta', {}).get('selector_labels') or {})
-    obj['evidence'] = collect_evidence('results', obj.get('results', {}))
-    obj['risk_score'] = compute_risk_score(obj)
-    obj = promote_internal_audit_findings(obj)
-    obj.setdefault('meta', {})['compatibility_notes'] = compatibility_assessment(obj)
-    obj['reports'] = {'markdown': markdown_report(obj)}
-    return obj
-
-
-_original_remediation_from_audit = remediation_from_audit
-
-def remediation_from_audit(obj):
-    rem = _original_remediation_from_audit(obj)
-    rem.setdefault('templates', {}).update(generate_admission_policies(selector_to_matchlabels((obj.get('meta') or {}).get('target_selector', 'app=cua'))))
-    return rem
-
-
-_original_build_apply_fix_artifacts = build_apply_fix_artifacts
-
-def build_apply_fix_artifacts(audit_obj):
-    artifacts = _original_build_apply_fix_artifacts(audit_obj)
-    meta = artifacts.get('meta', {})
-    workload_snapshot = capture_resource_snapshot(meta.get('namespace'), meta.get('workload_kind'), meta.get('workload_name'))
-    sa_snapshot = capture_resource_snapshot(meta.get('namespace'), 'serviceaccount', meta.get('service_account_name')) if meta.get('service_account_name') else {'captured': False}
-    artifacts['snapshots'] = {'workload': workload_snapshot, 'serviceaccount': sa_snapshot}
-    artifacts['rollback'] = {'workload': build_rollback_from_snapshot(workload_snapshot), 'serviceaccount': build_rollback_from_snapshot(sa_snapshot)}
-    return artifacts
-
-
-_original_apply_fixes = apply_fixes
-
-def apply_fixes(audit_obj, namespace=None, workload=None, kind=None, apply_network_policy=False, patch_service_account=False, dry_run=True):
-    backup_bundle = None
-    if not dry_run:
-        backup_bundle = ensure_mandatory_backup_bundle(
-            audit_obj,
-            namespace=namespace,
-            workload=workload,
-            kind=kind,
-            include_serviceaccount=patch_service_account,
-            include_networkpolicy=apply_network_policy,
+        else:
+            forbidden.append("169.254.169.254/32")
+    wl = workload_info.get("workload_reference") or {}
+    node_ip = node_internal_ip(ctx)
+    if "AgentFence.NET.KUBELET_API_REACHABLE" in probe_ids and node_ip:
+        forbidden.append(f"{node_ip}/32")
+    api_ip = kubernetes_service_ip(ctx)
+    if "AgentFence.NET.APISERVER_DIRECT_REACHABLE" in probe_ids and api_ip:
+        forbidden.append(f"{api_ip}/32")
+    forbidden = sorted(set(forbidden))
+    if forbidden:
+        manifests.append(
+            {
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {
+                    "name": "agentfence-egress-restrict-target",
+                    "namespace": ctx.namespace,
+                    "labels": {"app.kubernetes.io/managed-by": "agentfence"},
+                },
+                "spec": {
+                    "podSelector": {"matchLabels": labels},
+                    "policyTypes": ["Egress"],
+                    "egress": [
+                        {
+                            "to": [
+                                {
+                                    "ipBlock": {
+                                        "cidr": "0.0.0.0/0",
+                                        "except": forbidden,
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                },
+            }
         )
-    out = _original_apply_fixes(audit_obj, namespace=namespace, workload=workload, kind=kind, apply_network_policy=apply_network_policy, patch_service_account=patch_service_account, dry_run=dry_run)
-    if dry_run:
-        artifacts = build_apply_fix_artifacts(audit_obj)
-        out['snapshots'] = artifacts.get('snapshots', {})
-        out['rollback'] = artifacts.get('rollback', {})
-        out['source_of_truth_manifest'] = persist_source_of_truth_manifest(
-            artifacts,
-            include_serviceaccount=patch_service_account,
-            include_networkpolicy=apply_network_policy,
+    if "AgentFence.NET.HOST_NETWORK_REACHABLE" in probe_ids:
+        notes.append(
+            {
+                "probe_id": "AgentFence.NET.HOST_NETWORK_REACHABLE",
+                "status": "manual_recommendation",
+                "reason": "host/private network egress needs environment-specific allowlisting; app avoids broad blind network outage",
+            }
         )
-    else:
-        out['snapshots'] = backup_bundle.get('snapshots', {})
-        out['rollback'] = backup_bundle.get('rollback', {})
-        out['backup_bundle'] = backup_bundle.get('persisted', {})
-        out['source_of_truth_manifest'] = persist_source_of_truth_manifest(
-            backup_bundle.get('artifacts', {}),
-            include_serviceaccount=patch_service_account,
-            include_networkpolicy=apply_network_policy,
-            out_dir=backup_bundle.get('persisted', {}).get('directory'),
-        )
-    if not dry_run:
-        rollout = wait_for_workload_rollout(namespace or out['meta'].get('namespace'), workload or out['meta'].get('workload_name'), kind or out['meta'].get('workload_kind') or 'deployment', timeout=90)
-        out['rollout_status'] = rollout
-        revalidated = post_fix_revalidate(audit_obj)
-        if isinstance(revalidated, dict) and not revalidated.get('error'):
-            revalidated['remediation'] = remediation_from_audit(revalidated)
-            revalidated = promote_internal_audit_findings(revalidated)
-            revalidated = reconcile_spec_backed_findings(revalidated)
-            revalidated['remediation'] = enrich_remediation(revalidated.get('remediation') or {})
-            revalidated['risk_score'] = compute_risk_score(revalidated)
-            if ((revalidated.get('controller') or {}).get('internal_execution') or {}).get('status') != 'collected_from_laptop':
-                revalidated['risk_score_unverified'] = True
-        out['post_fix_revalidation'] = revalidated
-    return out
+    return manifests, notes
 
 
-def infer_fix_profile(selected_items):
-    ids = {x.get('issue_id') for x in (selected_items or [])}
-    if {'REMOTE_REACHABILITY', 'IMDS_REACHABLE', 'SERVICE_ACCOUNT_TOKEN'} & ids:
-        return 'sandbox-strict'
-    if {'NOVNC_LISTENER'} & ids:
-        return 'agentic-desktop-compatible'
-    if {'RUN_AS_ROOT', 'ROOTFS_RW', 'LINUX_CAPS', 'SECCOMP_DISABLED'} <= ids:
-        return 'restricted-pod'
-    return 'baseline-safe'
+def unsafe_probe_ids(results: List[TestResult]) -> set:
+    return {r.id for r in results if r.status == "pass"}
 
 
-_original_enrich_remediation = enrich_remediation
-
-def enrich_remediation(remediation):
-    out = _original_enrich_remediation(remediation)
-    for item in out.get('items', []):
-        item['simulation_hint'] = item.get('risk_note') or item.get('manual_recommendation') or ''
-    return out
-
-
-def write_json_file(path_out, obj, label):
-    with open(path_out, 'w') as f:
-        json.dump(obj, f, indent=2)
-    if label:
-        print(f"{label}: {path_out}")
-    try:
-        md = None
-        if isinstance(obj, dict) and obj.get('reports', {}).get('markdown'):
-            md = obj['reports']['markdown']
-        elif isinstance(obj, dict) and obj.get('audit'):
-            md = markdown_report(obj.get('audit', {}), obj.get('fix'))
-        if md:
-            md_path = str(Path(path_out).with_suffix('.md'))
-            Path(md_path).write_text(md)
-            if label:
-                print(f"Markdown report written: {md_path}")
-    except Exception:
-        pass
+def network_policy_probe_ids(manifest: Dict[str, Any]) -> List[str]:
+    annotations = ((manifest.get("metadata") or {}).get("annotations")) or {}
+    annotated = annotations.get("agentfence.dev/probe-ids")
+    if annotated:
+        return sorted({x.strip() for x in str(annotated).split(",") if x.strip()})
+    name = ((manifest.get("metadata") or {}).get("name")) or ""
+    if name == "agentfence-deny-ingress-target":
+        return ["AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE"]
+    if name != "agentfence-egress-restrict-target":
+        return []
+    probe_ids: List[str] = []
+    for egress in ((manifest.get("spec") or {}).get("egress")) or []:
+        for to in egress.get("to") or []:
+            ip_block = to.get("ipBlock") or {}
+            exceptions = set(ip_block.get("except") or [])
+            if "169.254.169.254/32" in exceptions:
+                probe_ids.append("AgentFence.NET.IMDS_REACHABLE")
+    return sorted(set(probe_ids))
 
 
-_base_write_json_file = write_json_file
-
-
-def print_audit_summary(obj):
-    print("\n=== Audit summary ===")
-    sec = security_issue_summary(obj)
-    print(f"Security issues: {sec.get('count', 0)}")
-    sev = sec.get('severity_counts') or {}
-    sev_parts = [f"{name}={sev.get(name, 0)}" for name in ('critical', 'high', 'medium', 'low') if sev.get(name, 0)]
-    if sev_parts:
-        print(f"Severity mix: {', '.join(sev_parts)}")
-    if 'summary' in obj:
-        s = obj['summary']
-        print(f"Validation checks: {s.get('passed', 0)}/{s.get('total', 0)} passed")
-    internal = ((obj.get("results") or {}).get("internal_audit") or {})
-    if isinstance(internal, dict) and internal.get("summary"):
-        s = internal["summary"]
-        print(f"Internal validation: {s.get('passed', 0)}/{s.get('total', 0)} passed")
-    cls = (((obj.get('results') or {}).get('classification')) or '')
-    if cls:
-        print(f"Remote classification: {cls}")
-    score = obj.get('risk_score') or compute_risk_score(obj)
-    print(f"Risk score: {score.get('total')} (P={score.get('probability')}, B={score.get('blast_radius')}) -> {score.get('band')}")
-    meta = obj.get('meta', {})
-    for k in ('namespace', 'target_selector', 'target_pod', 'target_ip', 'workload_kind', 'workload_name'):
-        if meta.get(k):
-            print(f"{k}: {meta.get(k)}")
-    deps = meta.get('dependencies') or {}
-    if deps:
-        print('Dependencies / surrounding resources:')
-        for k, v in deps.items():
-            if isinstance(v, list):
-                rendered = ', '.join(x if isinstance(x, str) else json.dumps(x, sort_keys=True) for x in v) if v else 'none'
-                print(f"- {k}: {rendered}")
-            elif v:
-                print(f"- {k}: {v}")
-    for note in meta.get('compatibility_notes', [])[:5]:
-        print(f"Compatibility note: {note.get('message')}")
-
-
-def print_fix_result(result):
-    print("\n=== Fix results ===")
-    print(f"Overall status: {result.get('status')}")
-    if result.get('fix_profile'):
-        print(f"Fix profile: {result.get('fix_profile')}")
-    for item in result.get('per_issue', []):
-        print(f"- {item.get('issue_id')}: {item.get('status')} ({item.get('risk_level')})")
-        if item.get('note'):
-            print(f"  {item.get('note')}")
-    apply_result = result.get('apply_result')
-    if apply_result:
-        print("\nCommands / execution:")
-        for step in apply_result.get('executed', []):
-            print(f"* {step.get('step')}: {'executed' if step.get('applied') else 'planned'}")
-            print(f"  {step.get('command')}")
-            if step.get('output'):
-                print(f"  output: {step.get('output')}")
-        if apply_result.get('rollback'):
-            print('Rollback artifacts available for patched resources.')
-        if apply_result.get('post_fix_revalidation') and not apply_result['post_fix_revalidation'].get('error'):
-            score = apply_result['post_fix_revalidation'].get('risk_score') or compute_risk_score(apply_result['post_fix_revalidation'])
-            print(f"Post-fix risk score: {score.get('total')} ({score.get('band')})")
-
-
-_original_run_selected_fix_groups = run_selected_fix_groups
-
-def run_selected_fix_groups(audit_obj, selected_items, namespace=None, workload=None, kind='deployment', execute=False):
-    result = _original_run_selected_fix_groups(audit_obj, selected_items, namespace=namespace, workload=workload, kind=kind, execute=execute)
-    apply_result = result.get('apply_result') or {}
-    revalidated = apply_result.get('post_fix_revalidation') or {}
-    if execute and revalidated and not revalidated.get('error'):
-        revalidated = reconcile_spec_backed_findings(revalidated)
-        current_items = ((revalidated.get('remediation') or {}).get('items') or [])
-        current_ids = {item.get('issue_id') for item in current_items}
-        carry_ids = {'SETID_BINARIES_PRESENT', 'SENSITIVE_PATHS_WRITABLE', 'RISKY_DEVICE_NODES'}
-        for item in (((audit_obj.get('remediation') or {}).get('items') or [])):
-            issue_id = item.get('issue_id')
-            if issue_id in carry_ids and issue_id not in current_ids:
-                current_items.append(copy.deepcopy(item))
-        if any((item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES' for item in current_items):
-            current_items = [item for item in current_items if (item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES']
-        revalidated['remediation'] = enrich_remediation({
-            'count': len(current_items),
-            'items': current_items,
-            'templates': (revalidated.get('remediation') or {}).get('templates', {}),
-        })
-        revalidated['risk_score'] = compute_risk_score(revalidated)
-        apply_result['post_fix_revalidation'] = revalidated
-        result['apply_result'] = apply_result
-    if execute and revalidated and revalidated.get('risk_score_unverified'):
-        current_items = ((revalidated.get('remediation') or {}).get('items') or [])
-        current_ids = {item.get('issue_id') for item in current_items}
-        unverifiable_issue_ids = {'SETID_BINARIES_PRESENT', 'SENSITIVE_PATHS_WRITABLE', 'RISKY_DEVICE_NODES'}
-        for item in selected_items:
-            issue_id = item.get('issue_id')
-            if not issue_id or issue_id in current_ids:
-                continue
-            if issue_id in unverifiable_issue_ids:
-                current_items.append(copy.deepcopy(item))
-        if any((item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES' for item in current_items):
-            current_items = [item for item in current_items if (item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES']
-        revalidated['remediation'] = enrich_remediation({
-            'count': len(current_items),
-            'items': current_items,
-            'templates': (revalidated.get('remediation') or {}).get('templates', {}),
-        })
-        revalidated['risk_score'] = compute_risk_score(revalidated)
-        apply_result['post_fix_revalidation'] = revalidated
-        result['apply_result'] = apply_result
-    if execute and revalidated and not revalidated.get('error'):
-        remaining_issue_ids = {
-            item.get('issue_id')
-            for item in (((revalidated.get('remediation') or {}).get('items') or []))
-            if item.get('issue_id') and item.get('issue_id') != 'NO_ACTIONABLE_FAILURES'
+def rollback_workload_record(ctx: RunContext, record: Dict[str, Any]) -> Dict[str, Any]:
+    resource = str(record.get("resource") or "")
+    name = str(record.get("name") or "")
+    if not resource or not name:
+        return {"status": "failed", "reason": "missing workload resource/name for rollback"}
+    if resource not in ("deployment", "statefulset", "daemonset"):
+        return {
+            "status": "manual_required",
+            "reason": f"automatic rollback for {resource} requires restore checkpoint",
         }
-        for item in result.get('per_issue', []):
-            issue_id = item.get('issue_id')
-            if not issue_id:
-                continue
-            if item.get('status') == 'manual_only' and issue_id not in remaining_issue_ids:
-                item['status'] = 'resolved_by_applied_patch'
-                note = item.get('note') or ''
-                suffix = 'Cleared from post-remediation revalidation.'
-                item['note'] = f"{note} {suffix}".strip()
-    result['fix_profile'] = infer_fix_profile(selected_items)
-    return result
+    rc, out, err = run_kubectl(
+        ctx.kubeconfig,
+        ["rollout", "undo", f"{resource}/{name}", "-n", ctx.namespace],
+        timeout=90,
+    )
+    if rc != 0:
+        return {"status": "failed", "phase": "undo", "error": (err or out or f"exit {rc}")[:2000]}
+    rc2, out2, err2 = run_kubectl(
+        ctx.kubeconfig,
+        ["rollout", "status", f"{resource}/{name}", "-n", ctx.namespace, "--timeout=120s"],
+        timeout=150,
+    )
+    return {
+        "status": "complete" if rc2 == 0 else "warning",
+        "undo": (out or "").strip()[:1000],
+        "rollout": (out2 or err2 or f"exit {rc2}")[:2000],
+    }
 
 
-_original_auto_run = auto_run
+def rollback_network_policy_record(ctx: RunContext, record: Dict[str, Any]) -> Dict[str, Any]:
+    name = str(record.get("name") or "")
+    if not name:
+        return {"status": "failed", "reason": "missing NetworkPolicy name for rollback"}
+    operation = record.get("apply_operation")
+    previous = record.get("previous_manifest")
+    if operation == "created" and not previous:
+        rc, out, err = run_kubectl(
+            ctx.kubeconfig,
+            ["delete", "networkpolicy", name, "-n", ctx.namespace, "--ignore-not-found"],
+            timeout=90,
+        )
+        if rc != 0:
+            return {"status": "failed", "phase": "delete", "error": (err or out or f"exit {rc}")[:2000]}
+        return {"status": "complete", "delete": (out or "").strip()[:1000]}
+    if isinstance(previous, dict):
+        restored = apply_json_manifest(ctx, previous, False)
+        return {
+            "status": "complete" if restored.get("status") == "applied" else "failed",
+            "restore": restored,
+        }
+    return {
+        "status": "manual_required",
+        "reason": "NetworkPolicy existed before this run; use restore checkpoint if rollback is needed",
+    }
 
-def auto_run(timeout=2.0, apply_safe_fixes=True, execute=False, audit_out=None, fix_out=None):
-    bundle = _original_auto_run(timeout=timeout, apply_safe_fixes=apply_safe_fixes, execute=execute, audit_out=audit_out, fix_out=fix_out)
-    if isinstance(bundle, dict):
-        bundle['reports'] = {'markdown': markdown_report(bundle.get('audit', {}), bundle.get('fix'))}
-    return bundle
+
+def rollback_auto_record(ctx: RunContext, record: Dict[str, Any]) -> Dict[str, Any]:
+    if record.get("kind") == "workload_hardening_patch":
+        return rollback_workload_record(ctx, record)
+    if record.get("kind") == "network_policy":
+        return rollback_network_policy_record(ctx, record)
+    return {"status": "manual_required", "reason": f"no rollback handler for {record.get('kind')}"}
 
 
+def verify_auto_record(
+    ctx: RunContext,
+    record: Dict[str, Any],
+    baseline_results: Optional[List[TestResult]],
+) -> Tuple[Dict[str, Any], Optional[List[TestResult]]]:
+    if ctx.dry_run:
+        return {"status": "dry_run_not_executed"}, None
+    if record.get("status") != "applied":
+        return {"status": "not_applicable", "reason": f"record status is {record.get('status')}"}, None
+    if not baseline_results:
+        return {"status": "not_run", "reason": "no baseline results supplied"}, None
+
+    probe_ids = set(str(x) for x in (record.get("probe_ids") or []) if x)
+    if not probe_ids:
+        return {"status": "not_run", "reason": "record has no related probe ids"}, None
+
+    after_results = run_all_probes(ctx)
+    before_unsafe = unsafe_probe_ids(baseline_results)
+    after_unsafe = unsafe_probe_ids(after_results)
+    before_metrics = summarize_results(baseline_results)
+    after_metrics = summarize_results(after_results)
+    targeted_before = before_unsafe & probe_ids
+    resolved = sorted(targeted_before - after_unsafe)
+    still_unsafe = sorted(targeted_before & after_unsafe)
+    new_unsafe = sorted(after_unsafe - before_unsafe)
+    score_worsened = after_metrics.score_raw > before_metrics.score_raw
+    no_target_improvement = bool(targeted_before) and not resolved
+
+    verification = {
+        "status": "verified",
+        "probe_ids": sorted(probe_ids),
+        "resolved_probe_ids": resolved,
+        "still_unsafe_probe_ids": still_unsafe,
+        "new_unsafe_probe_ids": new_unsafe,
+        "score_raw_before": before_metrics.score_raw,
+        "score_raw_after": after_metrics.score_raw,
+        "changed": record.get("changed"),
+    }
+    if record.get("changed") is False:
+        verification["status"] = "no_change" if resolved else "no_change_unresolved"
+        return verification, after_results
+
+    rollback_reasons = []
+    if score_worsened:
+        rollback_reasons.append("raw score worsened")
+    if new_unsafe:
+        rollback_reasons.append("new unsafe probes appeared")
+    if no_target_improvement:
+        rollback_reasons.append("related probes did not improve")
+    runtime_diag = record.get("runtime_seccomp_diagnostic") or {}
+    seccomp_runtime_config_required = (
+        record.get("kind") == "workload_hardening_patch"
+        and "AgentFence.IDENTITY.SECCOMP_BYPASS_OK" in probe_ids
+        and "AgentFence.IDENTITY.SECCOMP_BYPASS_OK" in still_unsafe
+        and (runtime_diag.get("runtime") or {}).get("family") in ("gvisor", "kata")
+        and runtime_diag.get("all_expected_containers_configured") is True
+        and not score_worsened
+    )
+    if seccomp_runtime_config_required:
+        rollback_reasons = [
+            reason
+            for reason in rollback_reasons
+            if reason != "related probes did not improve"
+        ]
+        if not rollback_reasons:
+            verification["status"] = "runtime_config_required"
+            verification["verification_warnings"] = [
+                runtime_diag.get("recommendation")
+                or "Runtime-specific seccomp enablement is still required."
+            ]
+            return verification, after_results
+    warning_only = (
+        record.get("kind") == "workload_hardening_patch"
+        and bool(resolved)
+        and new_unsafe
+        and after_metrics.score_raw < before_metrics.score_raw
+        and not score_worsened
+    )
+    if warning_only:
+        verification["status"] = "verified_with_warnings"
+        verification["verification_warnings"] = [
+            "new unsafe probes appeared during workload-hardening verification, "
+            "but related probes improved and the raw score decreased"
+        ]
+        return verification, after_results
+    if rollback_reasons:
+        rollback = rollback_auto_record(ctx, record)
+        verification["status"] = (
+            "rolled_back" if rollback.get("status") in ("complete", "warning") else "rollback_failed"
+        )
+        verification["rollback_reasons"] = rollback_reasons
+        verification["rollback"] = rollback
+        return verification, run_all_probes(ctx)
+    return verification, after_results
 
 
-# ---------------- smart recommendation and learning layer ----------------
-SMART_HISTORY_PATH = os.environ.get('COMBINED_AUDIT_HISTORY', os.path.expanduser('~/.combined_audit_history.json'))
-APP_MODE_DEFAULT = os.environ.get('AGENTFENCE_APP_MODE', 'default').strip().lower() or 'default'
-AI_MODEL_DEFAULT = os.environ.get('AGENTFENCE_OPENAI_MODEL', 'gpt-5-mini').strip() or 'gpt-5-mini'
-AI_API_BASE_DEFAULT = os.environ.get('AGENTFENCE_OPENAI_BASE_URL', 'https://api.openai.com/v1').rstrip('/')
-AI_KEYCHAIN_SERVICE = os.environ.get('AGENTFENCE_OPENAI_KEYCHAIN_SERVICE', 'AgentFence OpenAI API Key').strip() or 'AgentFence OpenAI API Key'
-AI_KEYCHAIN_ACCOUNT = os.environ.get('AGENTFENCE_OPENAI_KEYCHAIN_ACCOUNT', 'default').strip() or 'default'
+def reconcile_seccomp_verification_with_runtime(
+    verification: Dict[str, Any],
+    runtime_seccomp: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not runtime_seccomp.get("runtime_config_required"):
+        return verification
+    pid = "AgentFence.IDENTITY.SECCOMP_BYPASS_OK"
+    resolved = set(verification.get("resolved_probe_ids") or [])
+    still_unsafe = set(verification.get("still_unsafe_probe_ids") or [])
+    if pid not in resolved and pid in still_unsafe:
+        return verification
+    if pid in resolved:
+        resolved.remove(pid)
+        still_unsafe.add(pid)
+        verification["resolved_probe_ids"] = sorted(resolved)
+        verification["still_unsafe_probe_ids"] = sorted(still_unsafe)
+    warning = (
+        runtime_seccomp.get("recommendation")
+        or "Runtime-specific seccomp enablement is still required."
+    )
+    verification["verification_warnings"] = sorted(
+        set((verification.get("verification_warnings") or []) + [warning])
+    )
+    verification["status"] = (
+        "runtime_config_required"
+        if not verification.get("resolved_probe_ids")
+        else "verified_with_warnings"
+    )
+    return verification
 
-RUNTIME_INTELLIGENCE = {
-    'cua': {
-        'expected_services': [6901, 5901, 8000],
-        'summary': 'Hardened OCI baseline with higher chance of app-level exposure by default.',
-        'recommended_profiles': ['agentic-desktop-compatible', 'baseline-safe'],
+
+def apply_remediation_actions(
+    ctx: RunContext,
+    remediation_plan: Dict[str, Any],
+    backup_checkpoint: Optional[Dict[str, Any]],
+    baseline_results: Optional[List[TestResult]] = None,
+) -> Dict[str, Any]:
+    actionable = remediation_plan.get("actionable_items") or []
+    if not actionable:
+        return {
+            "schema": "agentfence-remediation-apply-v1",
+            "status": "nothing_to_apply",
+            "dry_run": ctx.dry_run,
+            "applied_count": 0,
+            "failed_count": 0,
+            "manual_count": 0,
+            "records": [],
+        }
+    if not checkpoint_allows_mutation(backup_checkpoint, ctx.dry_run):
+        return {
+            "schema": "agentfence-remediation-apply-v1",
+            "status": "blocked",
+            "dry_run": ctx.dry_run,
+            "reason": "restore checkpoint is not verified; refusing to mutate",
+            "backup_status": (backup_checkpoint or {}).get("status"),
+            "applied_count": 0,
+            "failed_count": 0,
+            "manual_count": len(actionable),
+            "records": [],
+        }
+
+    records: List[Dict[str, Any]] = []
+    current_results = baseline_results
+    workload_patch_infos, patch_info = build_workload_hardening_patches(ctx, remediation_plan)
+
+    refresh_record = refresh_run_context_target(ctx)
+    if refresh_record.get("status") != "unchanged":
+        records.append(refresh_record)
+
+    manifests, manual_net_notes = network_policy_manifests(ctx, remediation_plan, patch_info)
+    for manifest in manifests:
+        result = apply_json_manifest(ctx, manifest, ctx.dry_run)
+        record = {
+            "kind": "network_policy",
+            "name": (manifest.get("metadata") or {}).get("name"),
+            "probe_ids": network_policy_probe_ids(manifest),
+            "manifest": manifest,
+            **result,
+        }
+        verification, verified_results = verify_auto_record(ctx, record, current_results)
+        record["verification"] = verification
+        record["resolved_probe_ids"] = verification.get("resolved_probe_ids") or []
+        if verification.get("status") in ("rolled_back", "rollback_failed"):
+            record["status"] = verification["status"]
+        if verified_results is not None:
+            current_results = verified_results
+        records.append(record)
+    records.extend(manual_net_notes)
+
+    sysctl_records, sysctl_results = apply_node_sysctl_hardening(ctx, current_results)
+    if sysctl_records:
+        records.extend(sysctl_records)
+    if sysctl_results is not None:
+        current_results = sysctl_results
+
+    for stage_info in workload_patch_infos:
+        patch = stage_info.get("patch")
+        if not patch:
+            continue
+        result = kubectl_patch_workload(
+            ctx,
+            str(stage_info["resource"]),
+            str(stage_info["name"]),
+            patch,
+            ctx.dry_run,
+        )
+        record = {
+            "kind": "workload_hardening_patch",
+            "stage": stage_info.get("stage"),
+            "risk_level": stage_info.get("risk_level"),
+            "resource": stage_info.get("resource"),
+            "name": stage_info.get("name"),
+            "probe_ids": stage_info.get("probe_ids") or [],
+            "artifact_kinds": stage_info.get("artifact_kinds") or [],
+            "workload": stage_info.get("workload_reference"),
+            "workload_config_before": stage_info.get("workload_config_before"),
+            "patch": patch,
+            **result,
+        }
+        workload_health = verify_workload_online_after_patch(ctx, stage_info, result)
+        record["workload_revalidation"] = workload_health
+        if result.get("status") == "applied" and not workload_health.get("healthy"):
+            rollback = rollback_auto_record(ctx, record)
+            record["status"] = "rolled_back" if rollback.get("status") in ("complete", "warning") else "rollback_failed"
+            record["verification"] = {
+                "status": record["status"],
+                "probe_ids": record.get("probe_ids") or [],
+                "resolved_probe_ids": [],
+                "still_unsafe_probe_ids": record.get("probe_ids") or [],
+                "rollback_reasons": [workload_health.get("reason") or "workload revalidation failed"],
+                "rollback": rollback,
+            }
+            refresh_after_rollback = refresh_run_context_target(ctx)
+            if refresh_after_rollback.get("status") != "unchanged":
+                record["target_refresh_after_rollback"] = refresh_after_rollback
+            current_results = run_all_probes(ctx) if not ctx.dry_run else current_results
+        else:
+            runtime_seccomp = build_runtime_seccomp_diagnostic(ctx, stage_info, None)
+            if runtime_seccomp:
+                record["runtime_seccomp_diagnostic"] = runtime_seccomp
+            verification, verified_results = verify_auto_record(ctx, record, current_results)
+            runtime_seccomp = build_runtime_seccomp_diagnostic(ctx, stage_info, verification)
+            if runtime_seccomp:
+                record["runtime_seccomp_diagnostic"] = runtime_seccomp
+                verification = reconcile_seccomp_verification_with_runtime(
+                    verification, runtime_seccomp
+                )
+            record["verification"] = verification
+            record["resolved_probe_ids"] = verification.get("resolved_probe_ids") or []
+            if verification.get("status") == "runtime_config_required":
+                record["status"] = "applied_with_verification_warning"
+                record["verification_warnings"] = verification.get("verification_warnings") or []
+                refresh_after_rollout = refresh_run_context_target(ctx)
+                if refresh_after_rollout.get("status") != "unchanged":
+                    record["target_refresh_after_rollout"] = refresh_after_rollout
+                runtime_record, runtime_results = apply_kata_node_seccomp_runtime_remediation(
+                    ctx,
+                    stage_info,
+                    runtime_seccomp,
+                )
+                if runtime_record.get("status") != "not_applicable":
+                    records.append(runtime_record)
+                if runtime_results is not None:
+                    current_results = runtime_results
+            elif verification.get("status") in ("rolled_back", "rollback_failed"):
+                record["status"] = verification["status"]
+                refresh_after_rollback = refresh_run_context_target(ctx)
+                if refresh_after_rollback.get("status") != "unchanged":
+                    record["target_refresh_after_rollback"] = refresh_after_rollback
+            elif verification.get("status") == "verified_with_warnings":
+                record["status"] = "applied_with_verification_warning"
+                record["verification_warnings"] = verification.get("verification_warnings") or []
+                refresh_after_rollout = refresh_run_context_target(ctx)
+                if refresh_after_rollout.get("status") != "unchanged":
+                    record["target_refresh_after_rollout"] = refresh_after_rollout
+            elif record.get("changed"):
+                refresh_after_rollout = refresh_run_context_target(ctx)
+                if refresh_after_rollout.get("status") != "unchanged":
+                    record["target_refresh_after_rollout"] = refresh_after_rollout
+            if verified_results is not None and verification.get("status") != "runtime_config_required":
+                current_results = verified_results
+        records.append(record)
+    if not workload_patch_infos:
+        records.append({"kind": "workload_hardening_patch", "status": "not_applicable", **patch_info})
+
+    auto_probe_ids = set()
+    attempted_auto_probe_ids = set()
+    for record in records:
+        if record.get("status") in ("applied", "applied_with_verification_warning", "dry_run_planned"):
+            attempted_auto_probe_ids.update(record.get("probe_ids") or [])
+            if ctx.dry_run:
+                auto_probe_ids.update(record.get("probe_ids") or [])
+            else:
+                auto_probe_ids.update(record.get("resolved_probe_ids") or [])
+
+    compatibility = (patch_info.get("compatibility") or {}) if isinstance(patch_info, dict) else {}
+    guarded_auto = {"AgentFence.ID.RUN_AS_UID_ZERO"}
+    if compatibility.get("auto_security_context") is False:
+        guarded_auto.update(
+            {
+                "AgentFence.DEVICE.RAW_SOCKET_USABLE",
+                "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK",
+                "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE",
+            }
+        )
+    if compatibility.get("auto_service_account_token") is False:
+        guarded_auto.add("AgentFence.ID.SA_TOKEN_READABLE")
+    manual_records_by_probe = {
+        r.get("probe_id"): r
+        for r in records
+        if r.get("status") == "manual_recommendation" and r.get("probe_id")
+    }
+    runtime_seccomp_by_probe = {}
+    for record in records:
+        diagnostic = record.get("runtime_seccomp_diagnostic")
+        if not diagnostic:
+            continue
+        for probe_id in record.get("probe_ids") or []:
+            runtime_seccomp_by_probe[probe_id] = diagnostic
+    for item in actionable:
+        pid = item.get("probe_id")
+        if pid in auto_probe_ids:
+            continue
+        if pid in manual_records_by_probe:
+            manual_records_by_probe[pid].setdefault("title", item.get("title"))
+            manual_records_by_probe[pid].setdefault("action_type", item.get("action_type"))
+            manual_records_by_probe[pid].setdefault("recommendation", item.get("recommendation"))
+            continue
+        if item.get("action_type") in ("manual_recommendation", "hybrid"):
+            records.append(
+                {
+                    "kind": "manual_recommendation",
+                    "status": "manual_recommendation",
+                    "probe_id": pid,
+                    "title": item.get("title"),
+                    "action_type": item.get("action_type"),
+                    "recommendation": item.get("recommendation"),
+                }
+            )
+        elif pid in guarded_auto:
+            reason = "mechanically patchable but unsafe to apply blindly; some images must start as root and drop privileges internally"
+            if pid == "AgentFence.ID.SA_TOKEN_READABLE":
+                reason = compatibility.get("service_account_reason") or "service-account token use needs workload/RBAC review"
+            records.append(
+                {
+                    "kind": "compatibility_guard",
+                    "status": "manual_recommendation",
+                    "probe_id": pid,
+                    "title": item.get("title"),
+                    "action_type": item.get("action_type"),
+                    "recommendation": item.get("recommendation"),
+                    "reason": reason,
+                }
+            )
+        elif item.get("action_type") == "auto_fix":
+            runtime_seccomp = runtime_seccomp_by_probe.get(pid) or {}
+            if runtime_seccomp.get("runtime_config_required"):
+                reason = (
+                    "workload-level RuntimeDefault seccomp was applied and the workload was revalidated, "
+                    "but the runtime did not verify process-level seccomp; runtime configuration is required"
+                )
+            else:
+                reason = (
+                    "automatic remediation was attempted but did not verify"
+                    if pid in attempted_auto_probe_ids
+                    else "automatic remediation is available but was not safe to apply automatically"
+                )
+            records.append(
+                {
+                    "kind": "manual_recommendation",
+                    "status": "manual_recommendation",
+                    "probe_id": pid,
+                    "title": item.get("title"),
+                    "action_type": item.get("action_type"),
+                    "recommendation": item.get("recommendation"),
+                    "reason": reason,
+                    "runtime_seccomp_diagnostic": runtime_seccomp or None,
+                }
+            )
+
+    applied_count = sum(1 for r in records if r.get("status") in ("applied", "applied_with_verification_warning", "dry_run_planned"))
+    failed_count = sum(1 for r in records if r.get("status") in ("failed", "rolled_back", "rollback_failed"))
+    manual_count = sum(1 for r in records if r.get("status") == "manual_recommendation")
+    if ctx.dry_run:
+        status = "dry_run_planned"
+    elif failed_count and applied_count:
+        status = "partial"
+    elif failed_count:
+        status = "failed"
+    elif applied_count:
+        status = "applied"
+    else:
+        status = "manual_only"
+    return {
+        "schema": "agentfence-remediation-apply-v1",
+        "status": status,
+        "dry_run": ctx.dry_run,
+        "applied_count": applied_count,
+        "failed_count": failed_count,
+        "manual_count": manual_count,
+        "records": records,
+        "note": "Automatic remediation applies bounded workload securityContext, seccomp RuntimeDefault, service-account, namespace-isolation, and NetworkPolicy changes; workload-level patches capture pre-fix config, require rollout/workload revalidation, then post-remediation analysis runs again.",
+    }
+
+
+def now_stamp() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def kubectl_base(kubeconfig: str) -> List[str]:
+    cmd = ["kubectl"]
+    if kubeconfig:
+        expanded = os.path.expanduser(kubeconfig)
+        if os.path.exists(expanded):
+            cmd += ["--kubeconfig", expanded]
+    return cmd
+
+
+def run_kubectl(
+    kubeconfig: str, args: List[str], timeout: int = 60
+) -> Tuple[int, str, str]:
+    cmd = kubectl_base(kubeconfig)
+    if ACTIVE_KUBE_CONTEXT:
+        cmd += ["--context", ACTIVE_KUBE_CONTEXT]
+    cmd += args
+    try:
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except Exception as e:
+        return 1, "", f"{type(e).__name__}: {e}"
+
+
+def kubectl_get_json(kubeconfig: str, args: List[str]) -> Optional[Any]:
+    rc, out, err = run_kubectl(kubeconfig, args + ["-o", "json"], timeout=45)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+def kubectl_exec(
+    kubeconfig: str,
+    namespace: str,
+    pod: str,
+    container: str,
+    shell_cmd: str,
+    timeout: int,
+) -> Tuple[int, str]:
+    args = ["exec", "-n", namespace, pod]
+    if container:
+        args += ["-c", container]
+    args += ["--", "sh", "-c", shell_cmd]
+    rc, out, err = run_kubectl(kubeconfig, args, timeout=timeout)
+    return rc, (out + err).strip()
+
+
+def first_container(pod: Dict[str, Any]) -> str:
+    cts = (pod.get("spec") or {}).get("containers") or []
+    if not cts:
+        return ""
+    return cts[0].get("name") or ""
+
+
+def pod_is_ready(pod: Dict[str, Any]) -> bool:
+    if (pod.get("status") or {}).get("phase") != "Running":
+        return False
+    if (pod.get("metadata") or {}).get("deletionTimestamp"):
+        return False
+    statuses = (pod.get("status") or {}).get("containerStatuses") or []
+    return bool(statuses) and all(bool(s.get("ready")) for s in statuses)
+
+
+def sorted_ready_pods(pods: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ready = [p for p in pods if pod_is_ready(p)]
+    return sorted(
+        ready,
+        key=lambda p: str((p.get("metadata") or {}).get("creationTimestamp") or ""),
+        reverse=True,
+    )
+
+
+def auto_select_target(
+    kubeconfig: str, namespace: str, override: Optional[str]
+) -> Tuple[str, str]:
+    if override:
+        pod = kubectl_get_json(
+            kubeconfig, ["get", "pod", override, "-n", namespace]
+        )
+        if not pod:
+            raise RuntimeError(f"override pod {override} not found")
+        return override, first_container(pod)
+
+    rc, out, _ = run_kubectl(
+        kubeconfig,
+        ["get", "pods", "-n", namespace, "-l", "role=target", "-o", "json"],
+        timeout=30,
+    )
+    pods = []
+    if rc == 0 and out:
+        try:
+            pods = json.loads(out).get("items") or []
+        except json.JSONDecodeError:
+            pods = []
+    ready_pods = sorted_ready_pods(pods)
+    if ready_pods:
+        p = ready_pods[0]
+        name = p["metadata"]["name"]
+        return name, first_container(p)
+
+    rc, out, _ = run_kubectl(
+        kubeconfig,
+        ["get", "pods", "-n", namespace, "-o", "json"],
+        timeout=30,
+    )
+    if rc != 0 or not out:
+        raise RuntimeError(f"cannot list pods in {namespace}: {out}")
+    data = json.loads(out)
+    cands = []
+    for p in data.get("items") or []:
+        name = p.get("metadata", {}).get("name") or ""
+        if name.startswith("target-"):
+            cands.append((name, p))
+    if len(cands) == 1:
+        n, p = cands[0]
+        return n, first_container(p)
+    if len(cands) > 1:
+        names = [x[0] for x in cands]
+        raise RuntimeError(
+            f"multiple target-* pods: {names}; use --target-pod NAME"
+        )
+    raise RuntimeError(
+        "no target pod: add label role=target or name prefix target-; "
+        "or pass --target-pod"
+    )
+
+
+def auto_select_attacker(kubeconfig: str, namespace: str) -> Tuple[str, str]:
+    for label in ("role=attacker", "app=attacker"):
+        rc, out, _ = run_kubectl(
+            kubeconfig,
+            ["get", "pods", "-n", namespace, "-l", label, "-o", "json"],
+            timeout=30,
+        )
+        if rc != 0 or not out:
+            continue
+        try:
+            items = json.loads(out).get("items") or []
+        except json.JSONDecodeError:
+            continue
+        running = [
+            p
+            for p in items
+            if (p.get("status") or {}).get("phase") == "Running"
+        ]
+        if running:
+            p = running[0]
+            return p["metadata"]["name"], first_container(p)
+    raise RuntimeError(
+        "no attacker pod (label role=attacker or app=attacker, Running)"
+    )
+
+
+def pod_ip(kubeconfig: str, namespace: str, pod_name: str) -> str:
+    rc, out, _ = run_kubectl(
+        kubeconfig,
+        [
+            "get",
+            "pod",
+            pod_name,
+            "-n",
+            namespace,
+            "-o",
+            "jsonpath={.status.podIP}",
+        ],
+        timeout=20,
+    )
+    ip = (out or "").strip()
+    if not ip:
+        raise RuntimeError(f"no podIP for {pod_name}")
+    return ip
+
+
+def refresh_run_context_target(ctx: RunContext) -> Dict[str, Any]:
+    if ctx.dry_run:
+        return {"kind": "target_refresh", "status": "dry_run_not_executed"}
+    before = {
+        "target_pod": ctx.target_pod,
+        "target_container": ctx.target_container,
+        "target_ip": ctx.target_ip,
+    }
+    try:
+        current = load_target_pod_json(ctx)
+        if (
+            isinstance(current, dict)
+            and ((current.get("metadata") or {}).get("name") == ctx.target_pod)
+            and pod_is_ready(current)
+        ):
+            target_pod = ctx.target_pod
+            target_container = first_container(current) or ctx.target_container
+            target_ip = str(((current.get("status") or {}).get("podIP")) or ctx.target_ip)
+        else:
+            target_pod, target_container = auto_select_target(ctx.kubeconfig, ctx.namespace, None)
+            target_ip = pod_ip(ctx.kubeconfig, ctx.namespace, target_pod)
+    except Exception as e:
+        return {
+            "kind": "target_refresh",
+            "status": "failed",
+            "before": before,
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+    ctx.target_pod = target_pod
+    ctx.target_container = target_container
+    ctx.target_ip = target_ip
+    after = {
+        "target_pod": ctx.target_pod,
+        "target_container": ctx.target_container,
+        "target_ip": ctx.target_ip,
+    }
+    return {
+        "kind": "target_refresh",
+        "status": "updated" if after != before else "unchanged",
+        "before": before,
+        "after": after,
+    }
+
+
+def load_target_pod_json(ctx: RunContext) -> Optional[Dict[str, Any]]:
+    return kubectl_get_json(
+        ctx.kubeconfig,
+        ["get", "pod", ctx.target_pod, "-n", ctx.namespace],
+    )
+
+
+def tr(
+    pid: str,
+    sev: Severity,
+    status: Status,
+    evidence: str = "",
+    clause: str = "",
+    ms: int = 0,
+) -> TestResult:
+    return TestResult(
+        id=pid,
+        severity=sev,
+        status=status,
+        evidence=evidence[:4000],
+        matched_clause=clause,
+        duration_ms=ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Probe implementations (39) — each returns TestResult for its catalog id
+# ---------------------------------------------------------------------------
+
+
+def probe_run_as_uid_zero(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.ID.RUN_AS_UID_ZERO", "high", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        "id -u 2>/dev/null || true",
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    u = (out or "").strip().splitlines()[-1] if out else ""
+    try:
+        uid = int(u)
+    except ValueError:
+        return tr("AgentFence.ID.RUN_AS_UID_ZERO", "high", "skip", out, "non-numeric id", ms)
+    if uid == 0:
+        return tr("AgentFence.ID.RUN_AS_UID_ZERO", "high", "pass", out, "uid==0", ms)
+    return tr("AgentFence.ID.RUN_AS_UID_ZERO", "high", "fail", out, "uid!=0", ms)
+
+
+def probe_rootfs_write(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.ID.ROOTFS_WRITE_OK", "high", "skip", "dry-run")
+    script = (
+        "f=/.afp_w_$$; rm -f \"$f\" 2>/dev/null; "
+        "if touch \"$f\" 2>/dev/null; then rm -f \"$f\"; echo OK; else echo FAIL; fi"
+    )
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    if "OK" in (out or ""):
+        return tr("AgentFence.ID.ROOTFS_WRITE_OK", "high", "pass", out, "touch / succeeded", ms)
+    return tr("AgentFence.ID.ROOTFS_WRITE_OK", "high", "fail", out, "rootfs not writable at /", ms)
+
+
+def probe_sa_token(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.ID.SA_TOKEN_READABLE", "high", "skip", "dry-run")
+    script = (
+        "p=/var/run/secrets/kubernetes.io/serviceaccount/token; "
+        "if test -r \"$p\"; then wc -c < \"$p\"; else echo 0; fi"
+    )
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    try:
+        n = int((out or "").strip().splitlines()[-1])
+    except ValueError:
+        return tr("AgentFence.ID.SA_TOKEN_READABLE", "high", "skip", out, ms=ms)
+    if n > 0:
+        return tr("AgentFence.ID.SA_TOKEN_READABLE", "high", "pass", f"bytes={n}", "token readable", ms)
+    return tr("AgentFence.ID.SA_TOKEN_READABLE", "high", "fail", out, "no token", ms)
+
+
+def probe_remote_unauth(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE", "high", "skip", "dry-run")
+    tip = ctx.target_ip
+    ports = []
+    pj = load_target_pod_json(ctx)
+    if pj:
+        for c in (pj.get("spec") or {}).get("containers") or []:
+            for p in c.get("ports") or []:
+                cp = p.get("containerPort")
+                if isinstance(cp, int):
+                    ports.append(cp)
+    ports = sorted(set(ports)) or [80, 443, 8000, 8080, 5901, 6901]
+    script_parts = []
+    for port in ports[:12]:
+        script_parts.append(
+            f"echo PORT:{port}; "
+            f"(nc -z -w2 {shlex.quote(tip)} {port} 2>/dev/null && echo OPEN:{port}) || true"
+        )
+    script = "; ".join(script_parts)
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.attacker_pod,
+        ctx.attacker_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    open_ports = []
+    for m in re.finditer(r"OPEN:(\d+)", out or ""):
+        open_ports.append(int(m.group(1)))
+    if not open_ports:
+        return tr(
+            "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE",
+            "high",
+            "fail",
+            out or "",
+            "no tcp open from attacker",
+            ms,
+        )
+    # Try HTTP or RFB on first few open ports
+    for p in open_ports[:6]:
+        curl_script = (
+            f"code=$(wget -qO- --timeout=2 http://{shlex.quote(tip)}:{p}/ 2>/dev/null | head -c 20 | wc -c); "
+            f"echo HTTPBYTES:{p}:$code"
+        )
+        _, o2 = kubectl_exec(
+            ctx.kubeconfig,
+            ctx.namespace,
+            ctx.attacker_pod,
+            ctx.attacker_container,
+            curl_script,
+            ctx.probe_timeout,
+        )
+        if o2 and "HTTPBYTES" in o2:
+            for line in (o2 or "").splitlines():
+                if "HTTPBYTES:" in line and ":0" not in line.split(":")[-1]:
+                    return tr(
+                        "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE",
+                        "high",
+                        "pass",
+                        f"open={open_ports} detail={line}",
+                        "service responded without auth gate",
+                        ms,
+                    )
+        if p in (5901, 6901):
+            rfb = (
+                f"python3 - <<'PY'\n"
+                f"import socket\n"
+                f"s=socket.create_connection(({repr(tip)}, {p}), 2)\n"
+                f"d=s.recv(12)\n"
+                f"print('RFB' if d.startswith(b'RFB') else d[:20])\n"
+                f"PY"
+            )
+            _, o3 = kubectl_exec(
+                ctx.kubeconfig,
+                ctx.namespace,
+                ctx.attacker_pod,
+                ctx.attacker_container,
+                rfb,
+                ctx.probe_timeout,
+            )
+            if o3 and "RFB" in o3:
+                return tr(
+                    "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE",
+                    "high",
+                    "pass",
+                    f"open={open_ports} rfb={p}",
+                    "RFB banner",
+                    ms,
+                )
+    return tr(
+        "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE",
+        "high",
+        "fail",
+        f"open={open_ports}",
+        "ports open but no unauth HTTP/RFB signal",
+        ms,
+    )
+
+
+def probe_hostpath_write(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.HOSTPATH.SENSITIVE_WRITE_OK", "high", "skip", "dry-run")
+    pj = load_target_pod_json(ctx)
+    if not pj:
+        return tr("AgentFence.HOSTPATH.SENSITIVE_WRITE_OK", "high", "skip", "no pod json")
+    mounts = []
+    for vol in (pj.get("spec") or {}).get("volumes") or []:
+        hp = vol.get("hostPath")
+        if not hp:
+            continue
+        path = hp.get("path") or ""
+        for c in (pj.get("spec") or {}).get("containers") or []:
+            for vm in c.get("volumeMounts") or []:
+                if vm.get("name") == vol.get("name"):
+                    mp = vm.get("mountPath")
+                    if mp:
+                        mounts.append(mp)
+    if not mounts:
+        return tr(
+            "AgentFence.HOSTPATH.SENSITIVE_WRITE_OK",
+            "high",
+            "fail",
+            "",
+            "no hostPath mounts",
+            int((time.time() - t0) * 1000),
+        )
+    for mp in mounts[:5]:
+        script = (
+            f"test -d {shlex.quote(mp)} || exit 2; "
+            f"f={shlex.quote(mp)}/.afp_hp_$$; rm -f \"$f\" 2>/dev/null; "
+            f"if touch \"$f\" 2>/dev/null; then rm -f \"$f\"; echo OK:{shlex.quote(mp)}; "
+            f"else echo NO:{shlex.quote(mp)}; fi"
+        )
+        rc, out = kubectl_exec(
+            ctx.kubeconfig,
+            ctx.namespace,
+            ctx.target_pod,
+            ctx.target_container,
+            script,
+            ctx.probe_timeout,
+        )
+        if "OK:" in (out or ""):
+            return tr(
+                "AgentFence.HOSTPATH.SENSITIVE_WRITE_OK",
+                "high",
+                "pass",
+                out,
+                "hostPath writable",
+                int((time.time() - t0) * 1000),
+            )
+    return tr(
+        "AgentFence.HOSTPATH.SENSITIVE_WRITE_OK",
+        "high",
+        "fail",
+        "mounts=" + ",".join(mounts),
+        "no writable hostPath",
+        int((time.time() - t0) * 1000),
+    )
+
+
+def _py_syscall_probe(ctx: RunContext, script: str, probe_id: str, sev: Severity) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr(probe_id, sev, "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    if "UNSAFE" in (out or ""):
+        return tr(probe_id, sev, "pass", out, "unsafe syscall outcome", ms)
+    if "SAFE" in (out or ""):
+        return tr(probe_id, sev, "fail", out, "blocked", ms)
+    return tr(probe_id, sev, "skip", out or "", "ambiguous", ms)
+
+
+def probe_kexec(ctx: RunContext) -> TestResult:
+    script = r"""python3 - <<'PY'
+import ctypes, errno, os
+libc = ctypes.CDLL(None, use_errno=True)
+SYS_kexec_load = getattr(os, 'SYS_kexec_load', 246)
+libc.syscall.restype = ctypes.c_long
+ret = libc.syscall(SYS_kexec_load, 0, 0, 0, 0)
+err = ctypes.get_errno()
+if ret == -1 and err in (errno.EPERM, errno.ENOSYS):
+    print('SAFE', 'errno', err)
+elif ret == -1 and err == errno.EINVAL:
+    print('SAFE', 'EINVAL')
+else:
+    print('UNSAFE', 'ret', ret, 'errno', err)
+PY"""
+    return _py_syscall_probe(ctx, script, "AgentFence.KERNEL.KEXEC_REACHABLE", "high")
+
+
+def probe_init_module(ctx: RunContext) -> TestResult:
+    script = r"""python3 - <<'PY'
+import ctypes, errno, os
+libc = ctypes.CDLL(None, use_errno=True)
+SYS_init_module = getattr(os, 'SYS_init_module', 175)
+libc.syscall.restype = ctypes.c_long
+ret = libc.syscall(SYS_init_module, 0, 0, 0)
+err = ctypes.get_errno()
+if ret == -1 and err in (errno.EPERM, errno.ENOSYS, errno.EFAULT, errno.EINVAL):
+    print('SAFE', 'errno', err)
+else:
+    print('UNSAFE', 'ret', ret, 'errno', err)
+PY"""
+    return _py_syscall_probe(ctx, script, "AgentFence.KERNEL.INIT_MODULE_REACHABLE", "high")
+
+
+def probe_bpf(ctx: RunContext) -> TestResult:
+    script = r"""python3 - <<'PY'
+import ctypes, errno, os
+libc = ctypes.CDLL(None, use_errno=True)
+SYS_bpf = getattr(os, 'SYS_bpf', 321)
+BPF_PROG_LOAD = 5
+libc.syscall.restype = ctypes.c_long
+ret = libc.syscall(SYS_bpf, BPF_PROG_LOAD, 0, 0)
+err = ctypes.get_errno()
+if ret == -1 and err in (errno.EPERM, errno.ENOSYS):
+    print('SAFE', 'errno', err)
+elif ret == -1 and err in (errno.EINVAL, errno.E2BIG, errno.ENOMEM):
+    print('UNSAFE', 'reached kernel err', err)
+else:
+    print('UNSAFE', 'ret', ret, 'errno', err)
+PY"""
+    return _py_syscall_probe(ctx, script, "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE", "high")
+
+
+def probe_userfaultfd(ctx: RunContext) -> TestResult:
+    script = r"""python3 - <<'PY'
+import ctypes, errno, os
+libc = ctypes.CDLL(None, use_errno=True)
+SYS_userfaultfd = getattr(os, 'SYS_userfaultfd', 323)
+libc.syscall.restype = ctypes.c_long
+fd = libc.syscall(SYS_userfaultfd, 0)
+err = ctypes.get_errno()
+if fd >= 0:
+    print('UNSAFE', 'fd', fd)
+elif err in (errno.EPERM, errno.ENOSYS):
+    print('SAFE', 'errno', err)
+else:
+    print('UNSAFE', 'errno', err)
+PY"""
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.KERNEL.USERFAULTFD_REACHABLE", "high", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    if "UNSAFE" in (out or ""):
+        return tr("AgentFence.KERNEL.USERFAULTFD_REACHABLE", "high", "pass", out, "userfaultfd", ms)
+    return tr("AgentFence.KERNEL.USERFAULTFD_REACHABLE", "high", "fail", out, "blocked", ms)
+
+
+def probe_perf_event(ctx: RunContext) -> TestResult:
+    script = r"""python3 - <<'PY'
+import ctypes, errno, os
+libc = ctypes.CDLL(None, use_errno=True)
+SYS_perf_event_open = getattr(os, 'SYS_perf_event_open', 298)
+libc.syscall.restype = ctypes.c_long
+ret = libc.syscall(SYS_perf_event_open, 0, 0, -1, 0, 0)
+err = ctypes.get_errno()
+if ret >= 0:
+    print('UNSAFE', 'fd', ret)
+elif err in (errno.EPERM, errno.EACCES, errno.ENOSYS):
+    print('SAFE', 'errno', err)
+else:
+    print('UNSAFE', 'errno', err)
+PY"""
+    return _py_syscall_probe(ctx, script, "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE", "high")
+
+
+def probe_kallsyms(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.KERNEL.KALLSYMS_VISIBLE", "high", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        "head -n 3 /proc/kallsyms 2>/dev/null || true",
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and re.match(r"^[0-9a-fA-F]+$", parts[0]):
+            if parts[0].strip("0") or parts[0] == "0":
+                if parts[0] != "0000000000000000":
+                    return tr("AgentFence.KERNEL.KALLSYMS_VISIBLE", "high", "pass", line, "non-zero symbol addr", ms)
+    return tr("AgentFence.KERNEL.KALLSYMS_VISIBLE", "high", "fail", out, "hidden or empty", ms)
+
+
+def probe_dmesg(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.KERNEL.DMESG_VISIBLE", "high", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        "dmesg 2>&1 | head -n 2",
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    o = (out or "").lower()
+    if "operation not permitted" in o or "klogctl" in o and "permission" in o:
+        return tr("AgentFence.KERNEL.DMESG_VISIBLE", "high", "fail", out, "dmesg denied", ms)
+    if (out or "").strip():
+        return tr("AgentFence.KERNEL.DMESG_VISIBLE", "high", "pass", out, "dmesg output", ms)
+    return tr("AgentFence.KERNEL.DMESG_VISIBLE", "high", "fail", out, "empty", ms)
+
+
+def probe_shell_pattern(ctx: RunContext, pid: str, sev: Severity, script: str, unsafe_if: Callable[[str], bool]) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr(pid, sev, "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    if unsafe_if(out or ""):
+        return tr(pid, sev, "pass", out, "unsafe condition", ms)
+    return tr(pid, sev, "fail", out, "safe", ms)
+
+
+def probe_host_proc(ctx: RunContext) -> TestResult:
+    script = "tr '\\0' ' ' < /proc/1/cmdline 2>/dev/null; echo"
+    def unsafe(o: str) -> bool:
+        s = o.lower()
+        return "kubelet" in s or "/usr/lib/systemd/systemd" in s or s.strip().startswith("/sbin/init ")
+
+    return probe_shell_pattern(ctx, "AgentFence.FS.HOST_PROC_VISIBLE", "medium", script, unsafe)
+
+
+def probe_host_sys(ctx: RunContext) -> TestResult:
+    script = "ls /sys/class/dmi/id 2>/dev/null | head"
+    def unsafe(o: str) -> bool:
+        return bool(o.strip())
+
+    return probe_shell_pattern(ctx, "AgentFence.FS.HOST_SYS_VISIBLE", "medium", script, unsafe)
+
+
+def probe_kcore(ctx: RunContext) -> TestResult:
+    script = "dd if=/proc/kcore of=/dev/null bs=1 count=1 2>&1; echo EXIT:$?"
+    def unsafe(o: str) -> bool:
+        return "EXIT:0" in o and "Permission denied" not in o
+
+    return probe_shell_pattern(ctx, "AgentFence.FS.KCORE_READABLE", "medium", script, unsafe)
+
+
+def probe_host_devices(ctx: RunContext) -> TestResult:
+    script = "ls /dev/sda /dev/nvme0n1 /dev/vda 2>/dev/null | head -n 1"
+    def unsafe(o: str) -> bool:
+        return bool((o or "").strip())
+
+    return probe_shell_pattern(ctx, "AgentFence.FS.HOST_DEVICES_VISIBLE", "medium", script, unsafe)
+
+
+def probe_rootfs_host_shared(ctx: RunContext) -> TestResult:
+    script = "awk '$2==\"/\" {print $3,$4}' /proc/self/mountinfo 2>/dev/null | head -n 1"
+    def unsafe(o: str) -> bool:
+        # host bind mounts often show as bind vs overlay for container root
+        return "bind" in (o or "") and "overlay" not in (o or "").lower()
+
+    return probe_shell_pattern(ctx, "AgentFence.FS.ROOTFS_HOST_SHARED", "medium", script, unsafe)
+
+
+def probe_host_fs_via_proc(ctx: RunContext) -> TestResult:
+    script = "ls /proc/1/root/etc/hostname 2>&1 | head -n 1"
+    def unsafe(o: str) -> bool:
+        return "hostname" in o and "Permission denied" not in o and "No such file" not in o
+
+    return probe_shell_pattern(ctx, "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC", "medium", script, unsafe)
+
+
+def probe_file_exists(ctx: RunContext, pid: str, sev: Severity, path: str) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr(pid, sev, "skip", "dry-run")
+    script = f"test -e {shlex.quote(path)} && echo YES || echo NO"
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    if "YES" in (out or ""):
+        return tr(pid, sev, "pass", out, "exists", ms)
+    return tr(pid, sev, "fail", out, "absent", ms)
+
+
+def probe_kvm(ctx: RunContext) -> TestResult:
+    return probe_file_exists(ctx, "AgentFence.DEVICE.KVM_PRESENT", "high", "/dev/kvm")
+
+
+def probe_tun(ctx: RunContext) -> TestResult:
+    return probe_file_exists(ctx, "AgentFence.DEVICE.TUN_TAP_PRESENT", "high", "/dev/net/tun")
+
+
+def probe_usb(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.DEVICE.USB_PRESENT", "high", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        "ls /dev/bus/usb 2>/dev/null | head -n 1",
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    if (out or "").strip():
+        return tr("AgentFence.DEVICE.USB_PRESENT", "high", "pass", out, "usb devfs", ms)
+    return tr("AgentFence.DEVICE.USB_PRESENT", "high", "fail", out, "no usb", ms)
+
+
+def probe_raw_socket(ctx: RunContext) -> TestResult:
+    script = r"""python3 - <<'PY'
+import socket
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    s.close()
+    print('UNSAFE')
+except PermissionError:
+    print('SAFE')
+except OSError as e:
+    print('SAFE', e)
+PY"""
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.DEVICE.RAW_SOCKET_USABLE", "high", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    if "UNSAFE" in (out or ""):
+        return tr("AgentFence.DEVICE.RAW_SOCKET_USABLE", "high", "pass", out, "raw icmp", ms)
+    return tr("AgentFence.DEVICE.RAW_SOCKET_USABLE", "high", "fail", out, "blocked", ms)
+
+
+def _pod_spec_flags(ctx: RunContext) -> Tuple[bool, bool, bool]:
+    pj = load_target_pod_json(ctx) or {}
+    spec = pj.get("spec") or {}
+    return (
+        bool(spec.get("hostNetwork")),
+        bool(spec.get("hostPID")),
+        bool(spec.get("hostIPC")),
+    )
+
+
+def probe_pid_ns_host(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    hn, hp, hi = _pod_spec_flags(ctx)
+    ms = int((time.time() - t0) * 1000)
+    if hp:
+        return tr("AgentFence.NS.PID_NS_SHARES_HOST", "medium", "pass", "hostPID=true", "spec", ms)
+    return tr("AgentFence.NS.PID_NS_SHARES_HOST", "medium", "fail", "hostPID=false", "spec", ms)
+
+
+def probe_user_ns_map(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT", "medium", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        "cat /proc/self/uid_map 2>/dev/null || true",
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    for line in (out or "").splitlines():
+        p = line.split()
+        if len(p) >= 3 and p[0] == "0" and p[1] == "0":
+            return tr("AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT", "medium", "pass", line, "0 0 map", ms)
+    return tr("AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT", "medium", "fail", out, "no 0 0 map", ms)
+
+
+def probe_ipc_ns(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    _, _, hi = _pod_spec_flags(ctx)
+    ms = int((time.time() - t0) * 1000)
+    if hi:
+        return tr("AgentFence.NS.IPC_NS_SHARES_HOST", "medium", "pass", "hostIPC=true", ms=ms)
+    return tr("AgentFence.NS.IPC_NS_SHARES_HOST", "medium", "fail", "hostIPC=false", ms=ms)
+
+
+def probe_net_ns(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    hn, _, _ = _pod_spec_flags(ctx)
+    ms = int((time.time() - t0) * 1000)
+    if hn:
+        return tr("AgentFence.NS.NET_NS_SHARES_HOST", "medium", "pass", "hostNetwork=true", ms=ms)
+    return tr("AgentFence.NS.NET_NS_SHARES_HOST", "medium", "fail", "hostNetwork=false", ms=ms)
+
+
+def probe_uts_ns(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    hn, _, _ = _pod_spec_flags(ctx)
+    ms = int((time.time() - t0) * 1000)
+    if hn:
+        return tr("AgentFence.NS.UTS_NS_SHARES_HOST", "medium", "pass", "hostNetwork implies host UTS risk", ms=ms)
+    return tr("AgentFence.NS.UTS_NS_SHARES_HOST", "medium", "fail", "isolated UTS likely", ms=ms)
+
+
+def node_internal_ip(ctx: RunContext) -> Optional[str]:
+    pj = load_target_pod_json(ctx) or {}
+    node = (pj.get("spec") or {}).get("nodeName")
+    if not node:
+        return None
+    n = kubectl_get_json(ctx.kubeconfig, ["get", "node", node, "-o", "json"])
+    if not n:
+        return None
+    for addr in (n.get("status") or {}).get("addresses") or []:
+        if addr.get("type") == "InternalIP":
+            return addr.get("address")
+    return None
+
+
+def probe_host_net_reach(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.NET.HOST_NETWORK_REACHABLE", "high", "skip", "dry-run")
+    ip = node_internal_ip(ctx)
+    if not ip:
+        return tr("AgentFence.NET.HOST_NETWORK_REACHABLE", "high", "skip", "no node IP")
+    script = f"nc -z -w2 {shlex.quote(ip)} 22 2>/dev/null && echo OPEN || echo CLOSED"
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    if "OPEN" in (out or ""):
+        return tr("AgentFence.NET.HOST_NETWORK_REACHABLE", "high", "pass", out, f"ssh port on {ip}", ms)
+    return tr("AgentFence.NET.HOST_NETWORK_REACHABLE", "high", "fail", out, "node ssh not reachable", ms)
+
+
+def probe_imds(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.NET.IMDS_REACHABLE", "high", "skip", "dry-run")
+    script = r"""if command -v python3 >/dev/null 2>&1; then
+python3 - <<'PY'
+import socket
+sock = None
+try:
+    sock = socket.create_connection(("169.254.169.254", 80), 2.0)
+    sock.settimeout(2.0)
+    sock.sendall(b"GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n")
+    data = sock.recv(256)
+    print("HTTP_BYTES", len(data))
+    print(data[:200].decode("latin1", "replace"))
+except Exception as exc:
+    print("CONNECT_FAILED", type(exc).__name__, str(exc)[:120])
+finally:
+    if sock:
+        sock.close()
+PY
+elif command -v wget >/dev/null 2>&1; then
+  wget -qO- --timeout=2 http://169.254.169.254/latest/meta-data/ 2>&1 | head -c 240
+elif command -v curl >/dev/null 2>&1; then
+  curl -fsS --max-time 2 http://169.254.169.254/latest/meta-data/ 2>&1 | head -c 240
+else
+  echo NO_HTTP_CLIENT
+fi"""
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    o = out or ""
+    low = o.lower()
+    if "NO_HTTP_CLIENT" in o:
+        return tr("AgentFence.NET.IMDS_REACHABLE", "high", "skip", o[:500], "no HTTP client available", ms)
+    if "CONNECT_FAILED" in o:
+        return tr("AgentFence.NET.IMDS_REACHABLE", "high", "fail", o[:500], "metadata TCP connect failed", ms)
+    if "not found" in low and ("wget" in low or "curl" in low or "python3" in low):
+        return tr("AgentFence.NET.IMDS_REACHABLE", "high", "skip", o[:500], "metadata probe client unavailable", ms)
+    m = re.search(r"HTTP_BYTES\s+(\d+)", o)
+    if m and int(m.group(1)) > 0:
+        return tr("AgentFence.NET.IMDS_REACHABLE", "high", "pass", o[:500], "metadata HTTP response", ms)
+    if "ami-" in low or "instance-id" in low or "metadata-flavor" in low or "http/" in low:
+        return tr("AgentFence.NET.IMDS_REACHABLE", "high", "pass", o[:500], "metadata-like HTTP response", ms)
+    if "connection refused" in low or "timed out" in low or "network is unreachable" in low:
+        return tr("AgentFence.NET.IMDS_REACHABLE", "high", "fail", o[:500], "no IMDS", ms)
+    return tr("AgentFence.NET.IMDS_REACHABLE", "high", "fail", o[:500], "no IMDS", ms)
+
+
+def probe_kubelet(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.NET.KUBELET_API_REACHABLE", "high", "skip", "dry-run")
+    ip = node_internal_ip(ctx)
+    if not ip:
+        return tr("AgentFence.NET.KUBELET_API_REACHABLE", "high", "skip", "no node IP")
+    script = (
+        f"wget -qO- --timeout=2 --no-check-certificate "
+        f"https://{shlex.quote(ip)}:10250/pods 2>&1 | head -c 120"
+    )
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    o = out or ""
+    if "Unauthorized" in o or '"kind"' in o or "pods" in o.lower():
+        return tr("AgentFence.NET.KUBELET_API_REACHABLE", "high", "pass", o, "kubelet responded", ms)
+    return tr("AgentFence.NET.KUBELET_API_REACHABLE", "high", "fail", o, "no kubelet API", ms)
+
+
+def probe_apiserver_direct(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.NET.APISERVER_DIRECT_REACHABLE", "high", "skip", "dry-run")
+    script = (
+        "wget -qO- --timeout=3 --no-check-certificate "
+        "https://kubernetes.default.svc/version 2>&1 | head -c 200"
+    )
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    o = out or ""
+    if "gitVersion" in o or '"major"' in o:
+        return tr("AgentFence.NET.APISERVER_DIRECT_REACHABLE", "high", "pass", o[:500], "apiserver json", ms)
+    return tr("AgentFence.NET.APISERVER_DIRECT_REACHABLE", "high", "fail", o[:500], "no version", ms)
+
+
+def probe_seccomp_bypass(ctx: RunContext) -> TestResult:
+    script = r"""python3 - <<'PY'
+import ctypes, errno, os
+libc = ctypes.CDLL(None, use_errno=True)
+SYS_add_key = 248
+libc.syscall.restype = ctypes.c_long
+ret = libc.syscall(SYS_add_key, 0, 0, 0, 0)
+err = ctypes.get_errno()
+if ret == -1 and err == errno.EPERM:
+    print('SAFE', 'EPERM')
+else:
+    print('UNSAFE', 'ret', ret, 'errno', err)
+PY"""
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.IDENTITY.SECCOMP_BYPASS_OK", "medium", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    o = out or ""
+    if rc != 0:
+        return tr("AgentFence.IDENTITY.SECCOMP_BYPASS_OK", "medium", "skip", o, "exec failed", ms)
+    if "UNSAFE" in o:
+        state = seccomp_state_for_context(ctx)
+        if gvisor_runtime_seccomp_verified(state):
+            evidence = (
+                f"{o}\n"
+                f"GVISOR_RUNTIME_SECCOMP_VERIFIED {format_seccomp_state_evidence(state)}"
+            )
+            return tr(
+                "AgentFence.IDENTITY.SECCOMP_BYPASS_OK",
+                "medium",
+                "fail",
+                evidence,
+                "gvisor RuntimeDefault mediation",
+                ms,
+            )
+        return tr("AgentFence.IDENTITY.SECCOMP_BYPASS_OK", "medium", "pass", out, "syscall not EPERM", ms)
+    if "SAFE" in o and "EPERM" in o:
+        return tr("AgentFence.IDENTITY.SECCOMP_BYPASS_OK", "medium", "fail", out, "EPERM", ms)
+    return tr("AgentFence.IDENTITY.SECCOMP_BYPASS_OK", "medium", "skip", o, "unexpected probe output", ms)
+
+
+def probe_no_new_privs_bypass(ctx: RunContext) -> TestResult:
+    # Heuristic: try to read nnp from status
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK", "medium", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        "grep -E '^NoNewPrivs:' /proc/self/status 2>/dev/null || true",
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    if "NoNewPrivs:\t0" in (out or "") or "NoNewPrivs: 0" in (out or ""):
+        return tr("AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK", "medium", "pass", out, "nnp off", ms)
+    return tr("AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK", "medium", "fail", out, "nnp on or unknown", ms)
+
+
+def probe_cap_bounding(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE", "medium", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        "grep ^CapBnd: /proc/self/status 2>/dev/null",
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    m = re.search(r"CapBnd:\s*([0-9a-fA-F]+)", out or "")
+    if not m:
+        return tr("AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE", "medium", "skip", out, ms=ms)
+    mask = int(m.group(1), 16)
+    bad = (1 << 21) | (1 << 12) | (1 << 1)  # SYS_ADMIN, NET_ADMIN, DAC_OVERRIDE
+    if mask & bad:
+        return tr("AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE", "medium", "pass", out, "dangerous cap in bounding set", ms)
+    return tr("AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE", "medium", "fail", out, "tight caps", ms)
+
+
+def probe_procfs_hidepid(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.IDENTITY.PROCFS_HIDEPID_LAX", "medium", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        "ls /proc 2>/dev/null | grep -E '^[0-9]+$' | wc -l",
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    try:
+        n = int((out or "").strip())
+    except ValueError:
+        return tr("AgentFence.IDENTITY.PROCFS_HIDEPID_LAX", "medium", "skip", out, ms=ms)
+    if n > 80:
+        return tr("AgentFence.IDENTITY.PROCFS_HIDEPID_LAX", "medium", "pass", out, "many pids visible", ms)
+    return tr("AgentFence.IDENTITY.PROCFS_HIDEPID_LAX", "medium", "fail", out, "few pids", ms)
+
+
+def probe_cpuinfo_leak(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.SIDE.HOST_CPUINFO_LEAKED", "low", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        "grep -i hypervisor /proc/cpuinfo 2>/dev/null | head -n1",
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    o = (out or "").lower()
+    if "hypervisor" in o:
+        return tr("AgentFence.SIDE.HOST_CPUINFO_LEAKED", "low", "fail", out, "guest cpuinfo", ms)
+    return tr("AgentFence.SIDE.HOST_CPUINFO_LEAKED", "low", "pass", out, "no hypervisor flag (possible host leak)", ms)
+
+
+def probe_dmi_leak(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.SIDE.HOST_DMI_LEAKED", "low", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        "cat /sys/class/dmi/id/sys_vendor 2>/dev/null; cat /sys/class/dmi/id/product_name 2>/dev/null",
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    if (out or "").strip():
+        return tr("AgentFence.SIDE.HOST_DMI_LEAKED", "low", "pass", out, "DMI visible", ms)
+    return tr("AgentFence.SIDE.HOST_DMI_LEAKED", "low", "fail", out, "no DMI", ms)
+
+
+def probe_high_res_timer(ctx: RunContext) -> TestResult:
+    script = r"""python3 - <<'PY'
+import ctypes, os
+class timespec(ctypes.Structure):
+    _fields_ = [('tv_sec', ctypes.c_long), ('tv_nsec', ctypes.c_long)]
+CLOCK_MONOTONIC_RAW = 4
+try:
+    libc = ctypes.CDLL(None)
+    ts = timespec()
+    if hasattr(libc, 'clock_getres'):
+        libc.clock_getres(CLOCK_MONOTONIC_RAW, ctypes.byref(ts))
+        ns = ts.tv_nsec + ts.tv_sec * 1_000_000_000
+        print('RES', ns)
+    else:
+        print('SKIP')
+except Exception as e:
+    print('SKIP', e)
+PY"""
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE", "low", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        script,
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    m = re.search(r"RES\s+(\d+)", out or "")
+    if m and int(m.group(1)) < 1000:
+        return tr("AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE", "low", "pass", out, "sub-microsecond", ms)
+    if "SKIP" in (out or ""):
+        return tr("AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE", "low", "skip", out, ms=ms)
+    return tr("AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE", "low", "fail", out, "coarse timer", ms)
+
+
+def probe_cache_topology(ctx: RunContext) -> TestResult:
+    t0 = time.time()
+    if ctx.dry_run:
+        return tr("AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED", "low", "skip", "dry-run")
+    rc, out = kubectl_exec(
+        ctx.kubeconfig,
+        ctx.namespace,
+        ctx.target_pod,
+        ctx.target_container,
+        "cat /sys/devices/system/cpu/cpu0/cache/index0/size 2>/dev/null || true",
+        ctx.probe_timeout,
+    )
+    ms = int((time.time() - t0) * 1000)
+    if re.search(r"\d+K", out or ""):
+        return tr("AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED", "low", "pass", out, "cache size visible", ms)
+    return tr("AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED", "low", "fail", out, "no cache info", ms)
+
+
+PROBE_RUNNERS: Dict[str, Callable[[RunContext], TestResult]] = {
+    "AgentFence.ID.RUN_AS_UID_ZERO": probe_run_as_uid_zero,
+    "AgentFence.ID.ROOTFS_WRITE_OK": probe_rootfs_write,
+    "AgentFence.ID.SA_TOKEN_READABLE": probe_sa_token,
+    "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE": probe_remote_unauth,
+    "AgentFence.HOSTPATH.SENSITIVE_WRITE_OK": probe_hostpath_write,
+    "AgentFence.KERNEL.KEXEC_REACHABLE": probe_kexec,
+    "AgentFence.KERNEL.INIT_MODULE_REACHABLE": probe_init_module,
+    "AgentFence.KERNEL.BPF_PROG_LOAD_REACHABLE": probe_bpf,
+    "AgentFence.KERNEL.USERFAULTFD_REACHABLE": probe_userfaultfd,
+    "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": probe_perf_event,
+    "AgentFence.KERNEL.KALLSYMS_VISIBLE": probe_kallsyms,
+    "AgentFence.KERNEL.DMESG_VISIBLE": probe_dmesg,
+    "AgentFence.FS.HOST_PROC_VISIBLE": probe_host_proc,
+    "AgentFence.FS.HOST_SYS_VISIBLE": probe_host_sys,
+    "AgentFence.FS.KCORE_READABLE": probe_kcore,
+    "AgentFence.FS.HOST_DEVICES_VISIBLE": probe_host_devices,
+    "AgentFence.FS.ROOTFS_HOST_SHARED": probe_rootfs_host_shared,
+    "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC": probe_host_fs_via_proc,
+    "AgentFence.DEVICE.KVM_PRESENT": probe_kvm,
+    "AgentFence.DEVICE.TUN_TAP_PRESENT": probe_tun,
+    "AgentFence.DEVICE.USB_PRESENT": probe_usb,
+    "AgentFence.DEVICE.RAW_SOCKET_USABLE": probe_raw_socket,
+    "AgentFence.NS.PID_NS_SHARES_HOST": probe_pid_ns_host,
+    "AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT": probe_user_ns_map,
+    "AgentFence.NS.IPC_NS_SHARES_HOST": probe_ipc_ns,
+    "AgentFence.NS.NET_NS_SHARES_HOST": probe_net_ns,
+    "AgentFence.NS.UTS_NS_SHARES_HOST": probe_uts_ns,
+    "AgentFence.NET.HOST_NETWORK_REACHABLE": probe_host_net_reach,
+    "AgentFence.NET.IMDS_REACHABLE": probe_imds,
+    "AgentFence.NET.KUBELET_API_REACHABLE": probe_kubelet,
+    "AgentFence.NET.APISERVER_DIRECT_REACHABLE": probe_apiserver_direct,
+    "AgentFence.IDENTITY.SECCOMP_BYPASS_OK": probe_seccomp_bypass,
+    "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK": probe_no_new_privs_bypass,
+    "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE": probe_cap_bounding,
+    "AgentFence.IDENTITY.PROCFS_HIDEPID_LAX": probe_procfs_hidepid,
+    "AgentFence.SIDE.HOST_CPUINFO_LEAKED": probe_cpuinfo_leak,
+    "AgentFence.SIDE.HOST_DMI_LEAKED": probe_dmi_leak,
+    "AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE": probe_high_res_timer,
+    "AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED": probe_cache_topology,
+}
+
+
+def run_all_probes(ctx: RunContext) -> List[TestResult]:
+    """Single loop over unified CATALOG — no separate pools."""
+    out: List[TestResult] = []
+    for spec in CATALOG:
+        fn = PROBE_RUNNERS.get(spec.id)
+        if not fn:
+            out.append(
+                tr(spec.id, spec.severity, "skip", "", "no runner registered")
+            )
+            continue
+        try:
+            out.append(fn(ctx))
+        except Exception as e:
+            out.append(
+                tr(
+                    spec.id,
+                    spec.severity,
+                    "skip",
+                    str(e),
+                    "runner exception",
+                )
+            )
+    return out
+
+
+def build_context(
+    namespace: str,
+    kubeconfig: str,
+    target_override: Optional[str],
+    dry_run: bool,
+    timeout: int,
+    allow_node_runtime_remediation: bool = False,
+) -> RunContext:
+    if dry_run:
+        target = target_override or "dry-run-target"
+        return RunContext(
+            namespace=namespace,
+            kubeconfig=kubeconfig,
+            target_pod=target,
+            target_container="dry-run-container",
+            attacker_pod="dry-run-attacker",
+            attacker_container="dry-run-container",
+            target_ip="0.0.0.0",
+            dry_run=True,
+            probe_timeout=timeout,
+            allow_node_runtime_remediation=allow_node_runtime_remediation,
+        )
+    tp, tc = auto_select_target(kubeconfig, namespace, target_override)
+    ap, ac = auto_select_attacker(kubeconfig, namespace)
+    tip = pod_ip(kubeconfig, namespace, tp)
+    return RunContext(
+        namespace=namespace,
+        kubeconfig=kubeconfig,
+        target_pod=tp,
+        target_container=tc,
+        attacker_pod=ap,
+        attacker_container=ac,
+        target_ip=tip,
+        dry_run=dry_run,
+        probe_timeout=timeout,
+        allow_node_runtime_remediation=allow_node_runtime_remediation,
+    )
+
+
+def write_json(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def write_text_file(path: str, text: str, executable: bool = False) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    if executable:
+        os.chmod(path, 0o755)
+
+
+PROBE_REPORT_OVERRIDES: Dict[str, Dict[str, str]] = {
+    "AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE": {
+        "title": "Review sibling-pod service reachability",
+        "explanation": "A sibling pod can reach target listeners. This is review-only because the port may be required application ingress; AgentFence needs declared communication intent before scoring it as a policy violation.",
+        "manual_fix": "Inventory required callers, ports, and authentication gates. If sibling pods are not approved callers, replace broad same-namespace allow rules with target-specific allowlists.",
     },
-    'gvisor': {
-        'expected_services': [],
-        'summary': 'User-space kernel isolation; unexpected listeners should generally be treated as posture regressions.',
-        'recommended_profiles': ['restricted-pod', 'sandbox-strict'],
+    "AgentFence.KERNEL.PERF_EVENT_OPEN_REACHABLE": {
+        "title": "Tighten perf_event_open exposure",
+        "explanation": "The workload can reach performance-monitoring syscall surface. That can leak host information and side-channel signals, and on weak kernels it may assist exploitation.",
+        "manual_fix": "Restrict perf_event_open with node/runtime policy, review kernel.perf_event_paranoid, and keep explicit observability exceptions only for workloads that require them.",
     },
-    'kata': {
-        'expected_services': [],
-        'summary': 'MicroVM isolation; focus on workload posture and service exposure, not just runtime boundary.',
-        'recommended_profiles': ['restricted-pod', 'sandbox-strict'],
+    "AgentFence.KERNEL.DMESG_VISIBLE": {
+        "title": "Restrict kernel log visibility",
+        "explanation": "Kernel log output can reveal runtime, host, driver, and exploit-relevant details to the workload.",
+        "manual_fix": "Enable node dmesg restrictions, remove unnecessary privileged/capability grants, and prefer a runtime profile that blocks kernel log access for untrusted workloads.",
     },
-    'wasm': {
-        'expected_services': [],
-        'summary': 'Capability-oriented runtime; broad filesystem, root, or metadata exposure is especially suspicious.',
-        'recommended_profiles': ['sandbox-strict', 'restricted-pod'],
+    "AgentFence.FS.HOST_SYS_VISIBLE": {
+        "title": "Limit sysfs exposure from the container",
+        "explanation": "Visible host sysfs paths expose hardware, platform, and kernel interface details that help fingerprint the node.",
+        "manual_fix": "Remove broad sysfs/hostPath mounts, avoid privileged mode, and use stronger sandbox or VM isolation where sysfs masking is required.",
+    },
+    "AgentFence.FS.HOST_FS_REACHABLE_VIA_PROC": {
+        "title": "Block proc-based host filesystem reachability",
+        "explanation": "The workload can traverse host-like filesystem paths through proc. That weakens filesystem isolation and may expose sensitive node files.",
+        "manual_fix": "Remove dangerous host mounts, avoid shared process namespaces, tighten runtime procfs masking, and re-run the probe after runtimeClass or mount changes.",
+    },
+    "AgentFence.DEVICE.TUN_TAP_PRESENT": {
+        "title": "Review TUN/TAP device exposure",
+        "explanation": "TUN/TAP devices can enable packet tunneling and bypass expected pod network controls when exposed unnecessarily.",
+        "manual_fix": "Remove /dev/net/tun unless the workload explicitly needs VPN or tunneling behavior; otherwise isolate it with a dedicated profile and network policy.",
+    },
+    "AgentFence.NS.USER_NS_ROOT_MAPS_HOST_ROOT": {
+        "title": "Review user namespace / UID mapping configuration",
+        "explanation": "A root-to-root user namespace mapping weakens UID isolation and can make container-root semantics more sensitive.",
+        "manual_fix": "Enable user namespace remapping where supported, align image USER with pod runAsUser/runAsGroup, and document residual mapping risk where remapping is unavailable.",
+    },
+    "AgentFence.NET.IMDS_REACHABLE": {
+        "title": "Block cloud metadata egress",
+        "explanation": "Metadata service reachability can expose instance identity, bootstrap data, or cloud credentials depending on provider configuration.",
+        "manual_fix": "Deny 169.254.169.254/32 and provider equivalents using CNI/VPC controls or tightly scoped NetworkPolicy after validating workload identity behavior.",
+    },
+    "AgentFence.IDENTITY.SECCOMP_BYPASS_OK": {
+        "title": "Enforce a restrictive seccomp profile",
+        "explanation": "A weak or ineffective seccomp profile leaves risky syscall surface available to the workload.",
+        "manual_fix": "Start with RuntimeDefault, then validate whether the runtime actually blocks the probe. Use a Localhost profile or runtime-specific policy when RuntimeDefault is insufficient.",
+    },
+    "AgentFence.IDENTITY.NO_NEW_PRIVS_BYPASS_OK": {
+        "title": "Enable no-new-privileges",
+        "explanation": "NoNewPrivs disabled can permit privilege-gaining execution paths such as setuid helpers.",
+        "manual_fix": "Set allowPrivilegeEscalation: false when compatible, remove setuid helpers where possible, and validate process startup and helper behavior.",
+    },
+    "AgentFence.IDENTITY.CAP_BOUNDING_PERMISSIVE": {
+        "title": "Minimize Linux capability bounding set",
+        "explanation": "Dangerous capabilities increase kernel, filesystem, and network attack surface after compromise.",
+        "manual_fix": "Drop ALL capabilities by default, re-add only documented required capabilities, and validate network diagnostics or observability workflows separately.",
+    },
+    "AgentFence.SIDE.HOST_DMI_LEAKED": {
+        "title": "Mask host DMI information",
+        "explanation": "DMI/SMBIOS values reveal platform details and can help fingerprint the host environment.",
+        "manual_fix": "Remove DMI sysfs exposure, review runtime masking options, and document residual hardware fingerprinting risk where full masking is not feasible.",
+    },
+    "AgentFence.SIDE.HIGH_RES_TIMER_AVAILABLE": {
+        "title": "Assess high-resolution timer exposure",
+        "explanation": "High-resolution timers can improve timing side-channel experiments against shared resources.",
+        "manual_fix": "Treat this as residual risk on shared kernels, use stronger isolation or dedicated nodes for hostile workloads, and document timer resolution in the threat model.",
+    },
+    "AgentFence.SIDE.HOST_CACHE_TOPOLOGY_LEAKED": {
+        "title": "Reduce cache topology leakage",
+        "explanation": "Cache topology details can support side-channel planning and host fingerprinting.",
+        "manual_fix": "Prefer VM/sandbox isolation or dedicated nodes for hostile workloads, and document residual cache topology exposure when it cannot be masked.",
     },
 }
 
 
-def normalize_app_mode(app_mode):
-    mode = str(app_mode or APP_MODE_DEFAULT or 'default').strip().lower()
-    return mode if mode in ('default', 'ai') else 'default'
+def probe_title(probe_id: str) -> str:
+    override = PROBE_REPORT_OVERRIDES.get(probe_id) or {}
+    if override.get("title"):
+        return override["title"]
+    recipe = REMEDIATION_RECIPES.get(probe_id)
+    return recipe.title if recipe else probe_id
 
 
-def ai_mode_enabled(app_mode):
-    return normalize_app_mode(app_mode) == 'ai'
+def report_fix_class(item: Optional[Dict[str, Any]], recipe: Optional[RemediationRecipe]) -> str:
+    if item and item.get("action_type") == "auto_fix" and item.get("auto_applicable"):
+        return "auto_fix"
+    if recipe and recipe.action_type == "auto_fix":
+        return "guarded_auto"
+    if recipe and recipe.action_type == "hybrid":
+        return "hybrid_manual"
+    return "manual"
 
 
-def ai_config_from_env(app_mode=None):
-    mode = normalize_app_mode(app_mode)
-    api_key, key_source = resolve_openai_api_key()
+def result_dict_map(results: Optional[List[Any]]) -> Dict[str, Dict[str, Any]]:
+    return {r.get("id"): r for r in result_dicts(results) if r.get("id")}
+
+
+def result_from_dict(d: Dict[str, Any]) -> TestResult:
+    return TestResult(
+        id=canonical_probe_id(d.get("id")),
+        severity=d.get("severity") or "low",
+        status=d.get("status") or "skip",
+        evidence=str(d.get("evidence") or ""),
+        matched_clause=str(d.get("matched_clause") or ""),
+        duration_ms=int(d.get("duration_ms") or 0),
+    )
+
+
+def remediation_item_map(remediation_plan: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for item in (remediation_plan or {}).get("items", []):
+        if not item.get("probe_id"):
+            continue
+        normalized = dict(item)
+        normalized["probe_id"] = canonical_probe_id(item.get("probe_id"))
+        out[normalized["probe_id"]] = normalized
+    return out
+
+
+def fixed_probe_ids_from_apply(remediation_apply: Optional[Dict[str, Any]]) -> set:
+    fixed = set()
+    for record in (remediation_apply or {}).get("records") or []:
+        fixed.update(
+            canonical_probe_id(x)
+            for x in record.get("resolved_probe_ids") or []
+            if x and is_scored_probe(x)
+        )
+    return fixed
+
+
+def records_by_probe(remediation_apply: Optional[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for record in (remediation_apply or {}).get("records") or []:
+        probe_ids = list(record.get("probe_ids") or [])
+        if record.get("probe_id"):
+            probe_ids.append(record["probe_id"])
+        for pid in probe_ids:
+            out.setdefault(canonical_probe_id(pid), []).append(record)
+    return out
+
+
+def enriched_probe_entry(
+    probe: ProbeSpec,
+    result: Optional[Dict[str, Any]],
+    item: Optional[Dict[str, Any]],
+    remediation_apply: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    recipe = REMEDIATION_RECIPES.get(probe.id)
+    override = PROBE_REPORT_OVERRIDES.get(probe.id) or {}
+    status = (result or {}).get("status") or "not_observed"
+    review_only = is_review_only_probe(probe.id)
+    fix_class = "manual_review" if review_only else report_fix_class(item, recipe)
+    fix_group = (recipe.dry_run_artifact if recipe else "") or "manual"
+    related_records = records_by_probe(remediation_apply).get(probe.id, [])
+    fixed = probe.id in fixed_probe_ids_from_apply(remediation_apply)
+    attempted = any(r.get("kind") != "manual_recommendation" for r in related_records)
+    layer = "Review" if review_only else ("TBE" if probe.id in TBE_PROBE_IDS else "ELE")
+    status_meaning = {
+        "pass": "unsafe condition observed",
+        "fail": "safe for this probe",
+        "skip": "not assessed",
+        "not_observed": "not present in this report",
+    }.get(status, status)
+    if review_only and status == "pass":
+        status_meaning = "review-only communication exposure observed; score unaffected"
     return {
-        'app_mode': mode,
-        'enabled': mode == 'ai',
-        'provider': 'openai',
-        'model': AI_MODEL_DEFAULT,
-        'api_key_present': bool(api_key),
-        'api_key_source': key_source,
-        'api_base': AI_API_BASE_DEFAULT,
-        'timeout_seconds': float(os.environ.get('AGENTFENCE_OPENAI_TIMEOUT', '60') or '60'),
+        "id": probe.id,
+        "title": probe_title(probe.id),
+        "layer": layer,
+        "severity": (result or {}).get("severity") or probe.severity,
+        "status": status,
+        "status_meaning": status_meaning,
+        "evidence": (result or {}).get("evidence") or "",
+        "matched_clause": (result or {}).get("matched_clause") or "",
+        "issue_explanation": override.get("explanation") or (recipe.risk if recipe else "No issue explanation available."),
+        "security_impact": recipe.risk if recipe else "",
+        "fix_class": fix_class,
+        "fix_group": fix_group,
+        "review_only": review_only,
+        "score_contributes": not review_only,
+        "score_weight": 0.0 if review_only else SEVERITY_WEIGHTS.get((result or {}).get("severity") or probe.severity, 0.0),
+        "auto_fix_available": False if review_only else fix_class in ("auto_fix", "guarded_auto"),
+        "auto_fix_description": "" if review_only else (recipe.recommendation if recipe else ""),
+        "manual_fix": override.get("manual_fix") or (recipe.recommendation if recipe else ""),
+        "operator_steps": list(recipe.operator_steps) if recipe else [],
+        "validation": recipe.validation if recipe else "",
+        "fixed_by_remediation": False if review_only else fixed,
+        "auto_attempted": False if review_only else attempted,
+        "remediation_records": [
+            {
+                "kind": r.get("kind"),
+                "status": r.get("status"),
+                "name": r.get("name"),
+                "resolved_probe_ids": r.get("resolved_probe_ids") or [],
+                "verification": r.get("verification"),
+                "reason": r.get("reason"),
+            }
+            for r in related_records
+        ],
     }
 
 
-def read_openai_api_key_from_keychain(service=AI_KEYCHAIN_SERVICE, account=AI_KEYCHAIN_ACCOUNT):
-    if platform.system() != 'Darwin':
+def build_enriched_report(
+    action: str,
+    context: Dict[str, Any],
+    metrics_before: Any,
+    results_before: Optional[List[Any]],
+    remediation_plan: Optional[Dict[str, Any]] = None,
+    remediation_apply: Optional[Dict[str, Any]] = None,
+    metrics_after: Optional[Any] = None,
+    results_after: Optional[List[Any]] = None,
+    evaluation: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    before_map = result_dict_map(results_before)
+    after_map = result_dict_map(results_after)
+    current_map = after_map or before_map
+    item_map = remediation_item_map(remediation_plan)
+    coverage = [
+        enriched_probe_entry(probe, current_map.get(probe.id), item_map.get(probe.id), remediation_apply)
+        for probe in CATALOG
+    ]
+    unsafe = [e for e in coverage if e["status"] == "pass" and e["score_contributes"]]
+    review_only = [e for e in coverage if e["status"] == "pass" and e["review_only"]]
+    skipped = [e for e in coverage if e["status"] == "skip"]
+    fixed = sorted(pid for pid in (set(before_map) - set(after_map) if after_map else set()) if is_scored_probe(pid))
+    if after_map:
+        fixed = sorted(
+            pid
+            for pid, r in before_map.items()
+            if is_scored_probe(pid)
+            and r.get("status") == "pass"
+            and (after_map.get(pid) or {}).get("status") != "pass"
+        )
+    fixed_from_apply = sorted(fixed_probe_ids_from_apply(remediation_apply))
+    before_metrics = metrics_to_dict(metrics_before)
+    after_metrics = metrics_to_dict(metrics_after)
+    comparison = None
+    if after_metrics:
+        comparison = {
+            "issue_count_before": before_metrics.get("issue_count"),
+            "issue_count_after": after_metrics.get("issue_count"),
+            "issue_delta": (after_metrics.get("issue_count") or 0) - (before_metrics.get("issue_count") or 0),
+            "score_raw_before": before_metrics.get("score_raw"),
+            "score_raw_after": after_metrics.get("score_raw"),
+            "score_raw_delta": round((after_metrics.get("score_raw") or 0) - (before_metrics.get("score_raw") or 0), 4),
+            "headline_before": before_metrics.get("score_normalized"),
+            "headline_after": after_metrics.get("score_normalized"),
+            "headline_delta": round((after_metrics.get("score_normalized") or 0) - (before_metrics.get("score_normalized") or 0), 4),
+            "fixed_probe_ids": fixed,
+            "verified_fixed_probe_ids": fixed_from_apply,
+            "new_unsafe_probe_ids": sorted(
+                pid
+                for pid, r in after_map.items()
+                if is_scored_probe(pid)
+                and r.get("status") == "pass"
+                and (before_map.get(pid) or {}).get("status") != "pass"
+            ),
+            "score_basis": "review-only communication reachability findings are excluded from issue counts and scores",
+        }
+    return {
+        "schema": "agentfence-enriched-report-v1",
+        "action": action,
+        "context": context,
+        "probe_coverage_count": len(coverage),
+        "probe_coverage": coverage,
+        "unsafe_findings": unsafe,
+        "review_only_findings": review_only,
+        "skipped_findings": skipped,
+        "auto_fixable_probe_ids": [e["id"] for e in unsafe if e["auto_fix_available"]],
+        "manual_probe_ids": [e["id"] for e in unsafe if not e["auto_fix_available"]],
+        "review_only_probe_ids": [e["id"] for e in review_only],
+        "fixed_probe_ids": comparison.get("fixed_probe_ids") if comparison else [],
+        "verified_fixed_probe_ids": fixed_from_apply,
+        "workload_revalidations": [
+            r.get("workload_revalidation")
+            for r in (remediation_apply or {}).get("records") or []
+            if r.get("workload_revalidation")
+        ],
+        "workload_config_snapshots_before_autofix": [
+            r.get("workload_config_before")
+            for r in (remediation_apply or {}).get("records") or []
+            if r.get("workload_config_before")
+        ],
+        "runtime_seccomp_diagnostics": [
+            r.get("runtime_seccomp_diagnostic")
+            for r in (remediation_apply or {}).get("records") or []
+            if r.get("runtime_seccomp_diagnostic")
+        ],
+        "remaining_manual_findings": [e for e in unsafe + review_only if not e["fixed_by_remediation"]],
+        "score_comparison": comparison,
+        "f1_f5_summary": {
+            k: (evaluation or {}).get(k)
+            for k in (
+                "F1_runtime_placement",
+                "F2_attack_path_containment",
+                "F3_remediation_effectiveness",
+                "F4_artifact_consistency",
+                "F5_recoverability",
+            )
+        }
+        if evaluation
+        else None,
+    }
+
+
+def md_escape(value: Any, limit: int = 160) -> str:
+    text = str(value or "").replace("\n", " ").replace("|", "\\|")
+    return text[:limit]
+
+
+def write_md(
+    path: str,
+    title: str,
+    results: List[TestResult],
+    metrics: ScoreBundle,
+    remediation_plan: Optional[Dict[str, Any]] = None,
+    remediation_apply: Optional[Dict[str, Any]] = None,
+    evaluation: Optional[Dict[str, Any]] = None,
+    action: str = "analyze",
+    context: Optional[Dict[str, Any]] = None,
+    results_after: Optional[List[TestResult]] = None,
+    metrics_after: Optional[ScoreBundle] = None,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    enriched = build_enriched_report(
+        action=action,
+        context=context or {},
+        metrics_before=metrics,
+        results_before=results,
+        remediation_plan=remediation_plan,
+        remediation_apply=remediation_apply,
+        metrics_after=metrics_after,
+        results_after=results_after,
+        evaluation=evaluation,
+    )
+    display_results = results_after or results
+    display_metrics = metrics_after or metrics
+    unsafe = enriched["unsafe_findings"]
+    review_only = enriched["review_only_findings"]
+    auto_fixable = [e for e in unsafe if e["auto_fix_available"]]
+    manual = [e for e in unsafe if not e["auto_fix_available"]]
+    comparison = enriched.get("score_comparison")
+    lines = [
+        f"# {title}",
+        "",
+        "## Context",
+        "",
+        f"- namespace: `{(context or {}).get('namespace', '')}`",
+        f"- target_pod: `{(context or {}).get('target_pod', '')}`",
+        f"- target_container: `{(context or {}).get('target_container', '')}`",
+        f"- attacker_pod: `{(context or {}).get('attacker_pod', '')}`",
+        "",
+        "## Executive Summary",
+        "",
+        f"- catalog_version: {display_metrics.catalog_version}",
+        f"- probes covered: **{enriched['probe_coverage_count']} / {len(CATALOG)}**",
+        f"- scored unsafe findings shown here: **{len(unsafe)}**",
+        f"- review-only communication findings: **{len(review_only)}**",
+        f"- auto-fixable or guarded-auto unsafe findings: **{len(auto_fixable)}**",
+        f"- manual/remains-manual unsafe findings: **{len(manual)}**",
+        f"- headline_alpha: **{display_metrics.headline_alpha}**",
+        f"- **TBE**: issues={display_metrics.tbe_issue_count}, raw={display_metrics.tbe_score_raw}, norm/10={display_metrics.tbe_score_normalized}",
+        f"- **ELE**: issues={display_metrics.ele_issue_count}, raw={display_metrics.ele_score_raw}, norm/10={display_metrics.ele_score_normalized}",
+        f"- **Total unsafe**: issues={display_metrics.issue_count}, raw={display_metrics.score_raw}",
+        f"- **Headline** (/10): **{display_metrics.score_normalized}**",
+        f"- skipped probes: {len(display_metrics.skipped)}",
+    ]
+    if comparison:
+        lines.extend(
+            [
+                "",
+                "## Before/After Comparison",
+                "",
+                f"- issues: {comparison.get('issue_count_before')} -> {comparison.get('issue_count_after')} ({comparison.get('issue_delta')})",
+                f"- raw score: {comparison.get('score_raw_before')} -> {comparison.get('score_raw_after')} ({comparison.get('score_raw_delta')})",
+                f"- headline: {comparison.get('headline_before')} -> {comparison.get('headline_after')} ({comparison.get('headline_delta')})",
+                f"- score basis: {comparison.get('score_basis')}",
+                f"- fixed probes: {', '.join(comparison.get('fixed_probe_ids') or []) or 'none'}",
+                f"- verified fixed probes: {', '.join(comparison.get('verified_fixed_probe_ids') or []) or 'none'}",
+                f"- new unsafe probes: {', '.join(comparison.get('new_unsafe_probe_ids') or []) or 'none'}",
+            ]
+        )
+    if evaluation:
+        lines.extend(["", "## F1-F5 Summary", ""])
+        for key in (
+            "F1_runtime_placement",
+            "F2_attack_path_containment",
+            "F3_remediation_effectiveness",
+            "F4_artifact_consistency",
+            "F5_recoverability",
+        ):
+            factor = evaluation.get(key) or {}
+            detail = ""
+            if key == "F3_remediation_effectiveness":
+                detail = f" headline {factor.get('headline_before')} -> {factor.get('headline_after')}"
+            elif key == "F5_recoverability":
+                detail = f" restore_ready={factor.get('restore_ready')}"
+            lines.append(f"- **{key}**: {factor.get('status', 'unknown')}{detail}")
+
+    fixed_entries = [e for e in enriched["probe_coverage"] if e["fixed_by_remediation"]]
+    if remediation_apply:
+        lines.extend(
+            [
+                "",
+                "## Remediation Results",
+                "",
+                f"- status: {remediation_apply.get('status')}",
+                f"- applied records: {remediation_apply.get('applied_count', 0)}",
+                f"- failed/rolled-back records: {remediation_apply.get('failed_count', 0)}",
+                f"- manual recommendations: {remediation_apply.get('manual_count', 0)}",
+            ]
+        )
+        for record in (remediation_apply.get("records") or []):
+            label = record.get("name") or record.get("probe_id") or record.get("kind")
+            resolved = ", ".join(record.get("resolved_probe_ids") or [])
+            verification = (record.get("verification") or {}).get("status")
+            lines.append(f"- `{record.get('kind')}` {label}: {record.get('status')} verification={verification or 'n/a'} resolved={resolved or 'none'}")
+            workload_health = record.get("workload_revalidation") or {}
+            if workload_health:
+                lines.append(
+                    f"  - workload revalidation: {workload_health.get('status')} "
+                    f"pod_recreated={workload_health.get('pod_recreated')} "
+                    f"running_pods={workload_health.get('running_pod_count')}"
+                )
+                conn = workload_health.get("connectivity_checks") or []
+                if conn:
+                    ok = sum(1 for c in conn if c.get("status") == "reachable")
+                    lines.append(f"  - captured TCP egress checks: {ok}/{len(conn)} reachable")
+            snapshot = record.get("workload_config_before") or {}
+            if snapshot:
+                containers = ", ".join(c.get("name") or "" for c in snapshot.get("containers") or [])
+                lines.append(
+                    f"  - pre-auto-fix workload snapshot: `{snapshot.get('workload_kind')}/{snapshot.get('workload_name')}` "
+                    f"containers={containers or 'none'} runtime={snapshot.get('runtime_class') or 'default'}"
+                )
+            runtime_diag = record.get("runtime_seccomp_diagnostic") or {}
+            if runtime_diag:
+                runtime = runtime_diag.get("runtime") or {}
+                lines.append(
+                    f"  - runtime seccomp: family={runtime.get('family')} handler={runtime.get('handler') or 'default'} "
+                    f"pod_profile={runtime_diag.get('pod_seccomp_profile')} "
+                    f"process_active={runtime_diag.get('process_seccomp_active')} "
+                    f"runtime_config_required={runtime_diag.get('runtime_config_required')}"
+                )
+                if runtime_diag.get("recommendation"):
+                    lines.append(f"  - runtime recommendation: {runtime_diag.get('recommendation')}")
+
+    if review_only:
+        lines.extend(["", "## Review-Only Communication Exposure", ""])
+        for e in review_only:
+            lines.extend(
+                [
+                    f"### `{e['id']}` — {e['title']}",
+                    "",
+                    f"- layer: {e['layer']} | severity: {e['severity']} | status: {e['status']} ({e['status_meaning']})",
+                    f"- score impact: none | automatic remediation: none",
+                    f"- issue: {e['issue_explanation']}",
+                    f"- evidence: `{md_escape(e['evidence'], 220)}`",
+                    f"- manual fix: {e['manual_fix'] or 'manual review required'}",
+                    f"- validation: {e['validation'] or 're-run the probe after defining communication intent'}",
+                ]
+            )
+            if e["operator_steps"]:
+                lines.append("- operator steps:")
+                for step in e["operator_steps"]:
+                    lines.append(f"  - {step}")
+            lines.append("")
+    if fixed_entries:
+        lines.extend(["", "## Auto-Fixed Issues", ""])
+        for e in fixed_entries:
+            lines.extend(
+                [
+                    f"### `{e['id']}` — {e['title']}",
+                    "",
+                    f"- layer: {e['layer']} | severity: {e['severity']} | fix_class: {e['fix_class']} | fix_group: {e['fix_group']}",
+                    f"- issue: {e['issue_explanation']}",
+                    f"- auto fix applied/verified: {e['fixed_by_remediation']}",
+                    f"- validation: {e['validation']}",
+                    "",
+                ]
+            )
+
+    if unsafe:
+        lines.extend(["", "## Unsafe Findings Requiring Attention", ""])
+        for e in unsafe:
+            lines.extend(
+                [
+                    f"### `{e['id']}` — {e['title']}",
+                    "",
+                    f"- layer: {e['layer']} | severity: {e['severity']} | status: {e['status']} ({e['status_meaning']})",
+                    f"- fix_class: {e['fix_class']} | fix_group: {e['fix_group']} | auto_fix_available: {e['auto_fix_available']}",
+                    f"- issue: {e['issue_explanation']}",
+                    f"- evidence: `{md_escape(e['evidence'], 220)}`",
+                    f"- automatic remediation path: {e['auto_fix_description'] or 'none'}",
+                    f"- manual fix: {e['manual_fix'] or 'manual review required'}",
+                    f"- validation: {e['validation'] or 're-run the probe after remediation'}",
+                ]
+            )
+            if e["operator_steps"]:
+                lines.append("- operator steps:")
+                for step in e["operator_steps"]:
+                    lines.append(f"  - {step}")
+            lines.append("")
+
+    lines.extend(
+        [
+            "",
+            "## Probe Coverage: All 39",
+            "",
+            "| layer | id | title | severity | status | fix_class | evidence (trunc) |",
+            "|---|---|---|---|---|---|---|",
+        ]
+    )
+    for e in enriched["probe_coverage"]:
+        lines.append(
+            f"| {e['layer']} | {e['id']} | {md_escape(e['title'], 80)} | {e['severity']} | {e['status']} | {e['fix_class']} | {md_escape(e['evidence'], 120)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Raw Results",
+        "",
+        "| layer | id | severity | status | matched | evidence (trunc) |",
+        "|---|---|---|---|---|---|",
+    ]
+    )
+    for r in display_results:
+        cid = canonical_probe_id(r.id)
+        layer = "Review" if is_review_only_probe(cid) else ("TBE" if cid in TBE_PROBE_IDS else "ELE")
+        ev = md_escape(r.evidence, 120)
+        lines.append(
+            f"| {layer} | {cid} | {r.severity} | {r.status} | {r.matched_clause} | {ev} |"
+        )
+    if remediation_plan:
+        lines.extend(
+            [
+                "",
+                "## Remediation Coverage Summary",
+                "",
+                f"- recipes: {remediation_plan.get('coverage', {}).get('recipe_count')} / {remediation_plan.get('coverage', {}).get('catalog_count')}",
+                f"- actionable findings: {remediation_plan.get('actionable_count', 0)}",
+            ]
+        )
+        for item in (remediation_plan.get("actionable_items") or []):
+            lines.append(
+                f"- `{item.get('probe_id')}` -> `{item.get('action_type')}`: {item.get('title')}"
+            )
+    lines.append("")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def context_from_ctx(ctx: RunContext) -> Dict[str, Any]:
+    return {
+        "namespace": ctx.namespace,
+        "target_pod": ctx.target_pod,
+        "target_container": ctx.target_container,
+        "attacker_pod": ctx.attacker_pod,
+        "attacker_container": ctx.attacker_container,
+        "target_ip": ctx.target_ip,
+        "dry_run": ctx.dry_run,
+    }
+
+
+# Namespaced API objects to snapshot into a rollback-oriented bundle (order = preferred apply order).
+BACKUP_NAMESPACE_KINDS: Tuple[str, ...] = (
+    "serviceaccounts",
+    "roles",
+    "rolebindings",
+    "configmaps",
+    "networkpolicies",
+    "services",
+    "ingresses",
+    "persistentvolumeclaims",
+    "deployments",
+    "statefulsets",
+    "daemonsets",
+    "replicasets",
+    "horizontalpodautoscalers",
+    "poddisruptionbudgets",
+    "limitranges",
+    "resourcequotas",
+)
+
+_BACKUP_KIND_ORDER: Dict[str, int] = {k: i for i, k in enumerate(BACKUP_NAMESPACE_KINDS)}
+
+COMPREHENSIVE_BACKUP_SCHEMA = "agentfence-restore-checkpoint-v2"
+
+BASE_NAMESPACE_RESOURCES: Tuple[str, ...] = (
+    "serviceaccounts",
+    "roles.rbac.authorization.k8s.io",
+    "rolebindings.rbac.authorization.k8s.io",
+    "configmaps",
+    "secrets",
+    "services",
+    "endpoints",
+    "networkpolicies.networking.k8s.io",
+    "persistentvolumeclaims",
+    "pods",
+    "replicasets.apps",
+    "deployments.apps",
+    "statefulsets.apps",
+    "daemonsets.apps",
+    "jobs.batch",
+    "cronjobs.batch",
+    "horizontalpodautoscalers.autoscaling",
+    "poddisruptionbudgets.policy",
+    "limitranges",
+    "resourcequotas",
+    "ingresses.networking.k8s.io",
+    "gateways.gateway.networking.k8s.io",
+    "httproutes.gateway.networking.k8s.io",
+    "referencegrants.gateway.networking.k8s.io",
+)
+
+CLUSTER_DEPENDENCY_RESOURCES: Tuple[str, ...] = (
+    "runtimeclasses.node.k8s.io",
+    "storageclasses.storage.k8s.io",
+    "volumesnapshotclasses.snapshot.storage.k8s.io",
+    "priorityclasses.scheduling.k8s.io",
+)
+
+
+def _strip_managed_fields(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        obj.pop("managedFields", None)
+        for v in obj.values():
+            _strip_managed_fields(v)
+    elif isinstance(obj, list):
+        for x in obj:
+            _strip_managed_fields(x)
+    return obj
+
+
+def _safe_backup_filename(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", s)[:200] or "unnamed"
+
+
+def _write_bundle_checksums(bundle_dir: str) -> str:
+    checksum_path = os.path.join(bundle_dir, "checksums.sha256")
+    lines: List[str] = []
+    for root, _, files in os.walk(bundle_dir):
+        for fn in sorted(files):
+            if fn == "checksums.sha256":
+                continue
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, bundle_dir)
+            h = hashlib.sha256()
+            with open(fp, "rb") as bf:
+                for chunk in iter(lambda: bf.read(65536), b""):
+                    h.update(chunk)
+            lines.append(f"{h.hexdigest()}  {rel}\n")
+    with open(checksum_path, "w", encoding="utf-8") as cf:
+        cf.writelines(lines)
+    return checksum_path
+
+
+def create_namespace_backup_bundle(
+    kubeconfig: str,
+    namespace: str,
+    parent_dir: str,
+    *,
+    include_secrets: bool = False,
+    run_velero: bool = False,
+) -> Dict[str, Any]:
+    """Dump namespaced objects to JSON plus manifest, restore script, and checksums."""
+    stamp = now_stamp()
+    bundle_name = f"rollback_bundle_{_safe_backup_filename(namespace)}_{stamp}"
+    bundle_dir = os.path.join(parent_dir, bundle_name)
+    objects_dir = os.path.join(bundle_dir, "objects")
+    os.makedirs(objects_dir, exist_ok=True)
+
+    kinds = list(BACKUP_NAMESPACE_KINDS)
+    if include_secrets:
+        kinds.append("secrets")
+
+    captured: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    for kind in kinds:
+        data = kubectl_get_json(kubeconfig, ["get", kind, "-n", namespace])
+        if data is None:
+            errors.append({"kind": kind, "error": "kubectl get failed or invalid JSON"})
+            continue
+        items = data.get("items") or []
+        for item in items:
+            meta = item.get("metadata") or {}
+            name = meta.get("name") or "unknown"
+            api = item.get("apiVersion") or ""
+            okind = item.get("kind") or kind
+            item_copy = json.loads(json.dumps(item))
+            _strip_managed_fields(item_copy)
+            fn = f"{kind}__{_safe_backup_filename(name)}.json"
+            obj_path = os.path.join(objects_dir, fn)
+            with open(obj_path, "w", encoding="utf-8") as wf:
+                json.dump(item_copy, wf, indent=2, sort_keys=True)
+            captured.append(
+                {
+                    "kind": kind,
+                    "apiVersion": api,
+                    "objectKind": okind,
+                    "name": name,
+                    "file": fn,
+                }
+            )
+
+    manifest: Dict[str, Any] = {
+        "schema": "agentfence-backup-bundle-v1",
+        "created_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "namespace": namespace,
+        "kubeconfig_basename": os.path.basename(kubeconfig) if kubeconfig else "",
+        "catalog_version": CATALOG_VERSION,
+        "include_secrets": include_secrets,
+        "objects": sorted(
+            captured,
+            key=lambda o: (_BACKUP_KIND_ORDER.get(str(o.get("kind")), 999), str(o.get("name"))),
+        ),
+        "errors": errors,
+        "velero_backup_name": None,
+        "velero_message": None,
+    }
+
+    if run_velero:
+        vb = f"af-pre-{_safe_backup_filename(namespace)}-{stamp}"
+        if shutil.which("velero"):
+            try:
+                pr = subprocess.run(
+                    [
+                        "velero",
+                        "backup",
+                        "create",
+                        vb,
+                        "--include-namespaces",
+                        namespace,
+                        "--wait",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                    check=False,
+                )
+                if pr.returncode == 0:
+                    manifest["velero_backup_name"] = vb
+                    manifest["velero_message"] = (pr.stdout or "").strip()[:2000]
+                else:
+                    manifest["velero_message"] = ((pr.stderr or "") + (pr.stdout or "")).strip()[:2000]
+            except Exception as e:
+                manifest["velero_message"] = f"{type(e).__name__}: {e}"
+        else:
+            manifest["velero_message"] = "velero CLI not found in PATH; skipped"
+
+    manifest_path = os.path.join(bundle_dir, "backup_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as mf:
+        json.dump(manifest, mf, indent=2, sort_keys=True)
+
+    restore_path = os.path.join(bundle_dir, "restore_commands.sh")
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        'ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+        'if test -z "${KUBECONFIG:-}"; then echo "Set KUBECONFIG to the target cluster kubeconfig." >&2; exit 1; fi',
+        f'NS="{namespace}"',
+        'echo "Applying objects in bundle order (namespace must exist)."',
+    ]
+    for obj in manifest["objects"]:
+        fn = obj.get("file")
+        if not fn:
+            continue
+        lines.append(f'echo "kubectl apply -f objects/{fn}"')
+        lines.append(f'kubectl apply -f "$ROOT/objects/{fn}"')
+    with open(restore_path, "w", encoding="utf-8") as rf:
+        rf.write("\n".join(lines) + "\n")
+    os.chmod(restore_path, 0o755)
+
+    checksum_path = _write_bundle_checksums(bundle_dir)
+
+    status = "complete"
+    if errors and not captured:
+        status = "failed"
+    elif errors:
+        status = "partial"
+
+    return {
+        "status": status,
+        "bundle_dir": bundle_dir,
+        "manifest_path": manifest_path,
+        "restore_script": restore_path,
+        "checksums_path": checksum_path,
+        "object_count": len(captured),
+        "error_count": len(errors),
+        "manifest": manifest,
+    }
+
+
+def _restore_error_is_empty_apply(message: str) -> bool:
+    msg = (message or "").lower()
+    return "no objects passed to apply" in msg or "no objects passed to create" in msg
+
+
+def _object_list_from_kubectl_json(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if data.get("kind") == "List":
+        return [x for x in (data.get("items") or []) if isinstance(x, dict) and x.get("kind")]
+    if data.get("kind"):
+        return [data]
+    return []
+
+
+def _restore_file_objects(kubeconfig: str, path: str) -> Tuple[List[Dict[str, Any]], str]:
+    """Load backup objects without requiring PyYAML; kubectl parses YAML bundles for us."""
+    if path.endswith(".json"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return _object_list_from_kubectl_json(data), ""
+        except Exception as e:
+            return [], f"{type(e).__name__}: {e}"
+
+    rc, out, err = run_kubectl(
+        kubeconfig,
+        ["apply", "--dry-run=client", "-f", path, "-o", "json"],
+        timeout=120,
+    )
+    if rc != 0:
+        msg = err or out or f"exit {rc}"
+        if _restore_error_is_empty_apply(msg):
+            return [], ""
+        return [], msg[:2000]
+    try:
+        return _object_list_from_kubectl_json(json.loads(out)), ""
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+
+
+def _write_temp_restore_manifest(objects: List[Dict[str, Any]]) -> str:
+    payload: Dict[str, Any]
+    if len(objects) == 1:
+        payload = objects[0]
+    else:
+        payload = {"apiVersion": "v1", "kind": "List", "items": objects}
+    tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False)
+    with tmp:
+        json.dump(payload, tmp, indent=2, sort_keys=True)
+    return tmp.name
+
+
+def _apply_restore_objects(
+    kubeconfig: str,
+    objects: List[Dict[str, Any]],
+    *,
+    server_side_force: bool = False,
+) -> Tuple[int, str, str]:
+    tmp_path = _write_temp_restore_manifest(objects)
+    try:
+        args = ["apply", "-f", tmp_path]
+        if server_side_force:
+            args = ["apply", "--server-side", "--force-conflicts", "-f", tmp_path]
+        return run_kubectl(kubeconfig, args, timeout=180)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _restore_apply_file_resilient(
+    kubeconfig: str,
+    path: str,
+    rel: str,
+) -> Dict[str, Any]:
+    rc, out, err = run_kubectl(kubeconfig, ["apply", "-f", path], timeout=120)
+    if rc == 0:
+        objects, _ = _restore_file_objects(kubeconfig, path)
+        return {
+            "status": "applied",
+            "file": rel,
+            "method": "plain_apply",
+            "message": (out or "").strip()[:1200],
+            "objects": [reapplyable_manifest(x) for x in objects],
+        }
+
+    first_error = (err or out or f"exit {rc}")[:4000]
+    if _restore_error_is_empty_apply(first_error):
+        return {
+            "status": "skipped_empty",
+            "file": rel,
+            "method": "plain_apply",
+            "message": first_error,
+            "objects": [],
+        }
+
+    objects, load_error = _restore_file_objects(kubeconfig, path)
+    if load_error:
+        return {
+            "status": "failed",
+            "file": rel,
+            "method": "load_for_sanitized_apply",
+            "error": load_error,
+            "initial_error": first_error,
+            "objects": [],
+        }
+    if not objects:
+        return {
+            "status": "skipped_empty",
+            "file": rel,
+            "method": "load_for_sanitized_apply",
+            "message": "restore file contained no applyable objects",
+            "initial_error": first_error,
+            "objects": [],
+        }
+
+    clean_objects = [reapplyable_manifest(obj) for obj in objects]
+    rc2, out2, err2 = _apply_restore_objects(kubeconfig, clean_objects)
+    if rc2 == 0:
+        return {
+            "status": "applied",
+            "file": rel,
+            "method": "sanitized_apply",
+            "message": (out2 or "").strip()[:1200],
+            "initial_error": first_error,
+            "objects": clean_objects,
+        }
+
+    second_error = (err2 or out2 or f"exit {rc2}")[:4000]
+    rc3, out3, err3 = _apply_restore_objects(kubeconfig, clean_objects, server_side_force=True)
+    if rc3 == 0:
+        return {
+            "status": "applied",
+            "file": rel,
+            "method": "sanitized_server_side_force_conflicts",
+            "message": (out3 or "").strip()[:1200],
+            "initial_error": first_error,
+            "sanitized_error": second_error,
+            "objects": clean_objects,
+        }
+
+    return {
+        "status": "failed",
+        "file": rel,
+        "method": "sanitized_server_side_force_conflicts",
+        "error": (err3 or out3 or f"exit {rc3}")[:4000],
+        "initial_error": first_error,
+        "sanitized_error": second_error,
+        "objects": clean_objects,
+    }
+
+
+def _public_restore_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    public = {k: v for k, v in result.items() if k != "objects"}
+    rel = str(public.get("file") or "").lower()
+    if "secret" in rel:
+        for key in ("message", "initial_error", "sanitized_error", "error"):
+            if public.get(key):
+                public[key] = "[redacted: Secret restore details are not printed]"
+    return public
+
+
+def _json_pointer_escape(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
+
+
+def _value_at_path(obj: Dict[str, Any], path: List[Any]) -> Tuple[bool, Any]:
+    cur: Any = obj
+    for part in path:
+        if isinstance(part, int):
+            if not isinstance(cur, list) or part < 0 or part >= len(cur):
+                return False, None
+            cur = cur[part]
+        else:
+            if not isinstance(cur, dict) or part not in cur:
+                return False, None
+            cur = cur[part]
+    return True, cur
+
+
+def _json_patch_remove(path: List[Any]) -> Dict[str, str]:
+    pointer = "".join(
+        "/" + (str(part) if isinstance(part, int) else _json_pointer_escape(str(part)))
+        for part in path
+    )
+    return {"op": "remove", "path": pointer}
+
+
+def _pod_spec_path_for_restore(kind: str) -> Optional[List[Any]]:
+    if kind in {"Deployment", "DaemonSet", "ReplicaSet", "StatefulSet", "Job"}:
+        return ["spec", "template", "spec"]
+    if kind == "CronJob":
+        return ["spec", "jobTemplate", "spec", "template", "spec"]
+    if kind == "Pod":
+        return ["spec"]
+    return None
+
+
+def _restore_absent_security_json_patches(
+    expected: Dict[str, Any],
+    live: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    kind = str(expected.get("kind") or "")
+    pod_path = _pod_spec_path_for_restore(kind)
+    if not pod_path:
+        return []
+    exp_ok, exp_pod_spec = _value_at_path(expected, pod_path)
+    live_ok, live_pod_spec = _value_at_path(live, pod_path)
+    if not exp_ok or not live_ok or not isinstance(exp_pod_spec, dict) or not isinstance(live_pod_spec, dict):
+        return []
+
+    patches: List[Dict[str, str]] = []
+    exp_pod_sc = exp_pod_spec.get("securityContext")
+    live_pod_sc = live_pod_spec.get("securityContext")
+    if isinstance(live_pod_sc, dict):
+        if not isinstance(exp_pod_sc, dict):
+            patches.append(_json_patch_remove(pod_path + ["securityContext"]))
+        else:
+            for key in sorted(live_pod_sc):
+                if key not in exp_pod_sc:
+                    patches.append(_json_patch_remove(pod_path + ["securityContext", key]))
+
+    exp_containers = {
+        str(c.get("name") or ""): c
+        for c in (exp_pod_spec.get("containers") or [])
+        if isinstance(c, dict) and c.get("name")
+    }
+    for idx, live_container in enumerate(live_pod_spec.get("containers") or []):
+        if not isinstance(live_container, dict):
+            continue
+        cname = str(live_container.get("name") or "")
+        exp_container = exp_containers.get(cname)
+        if not exp_container:
+            continue
+        live_sc = live_container.get("securityContext")
+        exp_sc = exp_container.get("securityContext")
+        if not isinstance(live_sc, dict):
+            continue
+        if not isinstance(exp_sc, dict):
+            patches.append(_json_patch_remove(pod_path + ["containers", idx, "securityContext"]))
+        else:
+            for key in sorted(live_sc):
+                if key not in exp_sc:
+                    patches.append(_json_patch_remove(pod_path + ["containers", idx, "securityContext", key]))
+    return patches
+
+
+def _restore_resource_args(kind: str, name: str, namespace: str) -> List[str]:
+    args = ["get", kind, name]
+    if namespace:
+        args += ["-n", namespace]
+    return args
+
+
+def _patch_restore_json(kubeconfig: str, kind: str, name: str, namespace: str, patch: List[Dict[str, str]]) -> Dict[str, Any]:
+    args = ["patch", kind, name, "--type=json", "-p", json.dumps(patch)]
+    if namespace:
+        args += ["-n", namespace]
+    rc, out, err = run_kubectl(kubeconfig, args, timeout=90)
+    return {
+        "status": "patched" if rc == 0 else "failed",
+        "kind": kind,
+        "name": name,
+        "namespace": namespace,
+        "method": "json_patch",
+        "message": (out if rc == 0 else err or out or f"exit {rc}")[:2000],
+        "patch_count": len(patch),
+    }
+
+
+def _patch_restore_merge(kubeconfig: str, kind: str, name: str, namespace: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    args = ["patch", kind, name, "--type=merge", "-p", json.dumps(patch)]
+    if namespace:
+        args += ["-n", namespace]
+    rc, out, err = run_kubectl(kubeconfig, args, timeout=90)
+    return {
+        "status": "patched" if rc == 0 else "failed",
+        "kind": kind,
+        "name": name,
+        "namespace": namespace,
+        "method": "merge_patch",
+        "message": (out if rc == 0 else err or out or f"exit {rc}")[:2000],
+    }
+
+
+def _restore_cleanup_agentfence_markers(
+    kubeconfig: str,
+    expected: Dict[str, Any],
+    live: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    kind, name, namespace = manifest_resource_ref(expected)
+    if not kind or not name:
+        return []
+    live_meta = live.get("metadata") or {}
+    live_labels = live_meta.get("labels") or {}
+    live_annotations = live_meta.get("annotations") or {}
+    results: List[Dict[str, Any]] = []
+
+    for key, value in sorted(live_labels.items()):
+        if key == "app.kubernetes.io/managed-by" and value == "agentfence":
+            args = ["label", kind, name, f"{key}-"]
+            if namespace:
+                args += ["-n", namespace]
+            rc, out, err = run_kubectl(kubeconfig, args, timeout=60)
+            results.append(
+                {
+                    "status": "patched" if rc == 0 else "failed",
+                    "kind": kind,
+                    "name": name,
+                    "namespace": namespace,
+                    "method": "remove_agentfence_label",
+                    "key": key,
+                    "message": (out if rc == 0 else err or out or f"exit {rc}")[:1200],
+                }
+            )
+
+    for key, value in sorted(live_annotations.items()):
+        if key.startswith("agentfence.dev/"):
+            args = ["annotate", kind, name, f"{key}-"]
+            if namespace:
+                args += ["-n", namespace]
+            rc, out, err = run_kubectl(kubeconfig, args, timeout=60)
+            results.append(
+                {
+                    "status": "patched" if rc == 0 else "failed",
+                    "kind": kind,
+                    "name": name,
+                    "namespace": namespace,
+                    "method": "remove_agentfence_annotation",
+                    "key": key,
+                    "message": (out if rc == 0 else err or out or f"exit {rc}")[:1200],
+                }
+            )
+    return results
+
+
+def _reconcile_restored_object(kubeconfig: str, expected: Dict[str, Any]) -> List[Dict[str, Any]]:
+    kind, name, namespace = manifest_resource_ref(expected)
+    if not kind or not name:
+        return []
+    live = kubectl_get_json(kubeconfig, _restore_resource_args(kind, name, namespace))
+    if not isinstance(live, dict) or not live.get("kind"):
+        return [
+            {
+                "status": "failed",
+                "kind": kind,
+                "name": name,
+                "namespace": namespace,
+                "method": "live_lookup",
+                "message": "resource not found after restore apply",
+            }
+        ]
+
+    results: List[Dict[str, Any]] = []
+    exp_spec = expected.get("spec")
+    live_spec = live.get("spec")
+    if kind == "NetworkPolicy" and isinstance(exp_spec, dict) and isinstance(live_spec, dict):
+        exp_selector = exp_spec.get("podSelector") or {}
+        if live_spec.get("podSelector") != exp_selector:
+            results.append(
+                _patch_restore_merge(
+                    kubeconfig,
+                    kind,
+                    name,
+                    namespace,
+                    {"spec": {"podSelector": exp_selector}},
+                )
+            )
+            live = kubectl_get_json(kubeconfig, _restore_resource_args(kind, name, namespace)) or live
+
+    security_patches = _restore_absent_security_json_patches(expected, live)
+    if security_patches:
+        results.append(_patch_restore_json(kubeconfig, kind, name, namespace, security_patches))
+        live = kubectl_get_json(kubeconfig, _restore_resource_args(kind, name, namespace)) or live
+
+    results.extend(_restore_cleanup_agentfence_markers(kubeconfig, expected, live))
+    return results
+
+
+def _reconcile_restored_objects(kubeconfig: str, objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    reconciled: List[Dict[str, Any]] = []
+    by_ref: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for obj in objects:
+        expected = reapplyable_manifest(obj)
+        ref = manifest_resource_ref(expected)
+        if not ref[0] or not ref[1]:
+            continue
+        by_ref[ref] = expected
+    for expected in by_ref.values():
+        reconciled.extend(_reconcile_restored_object(kubeconfig, expected))
+    return reconciled
+
+
+def restore_namespace_bundle(
+    kubeconfig: str,
+    bundle_dir: str,
+    *,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Restore namespace bundles with sanitized retry and universal drift reconciliation."""
+    manifest_path = os.path.join(bundle_dir, "backup_manifest.json")
+    if not os.path.isfile(manifest_path):
+        return {"status": "error", "message": f"missing {manifest_path}"}
+    with open(manifest_path, "r", encoding="utf-8") as mf:
+        manifest = json.load(mf)
+    if manifest.get("schema") == COMPREHENSIVE_BACKUP_SCHEMA:
+        restore_items = list(manifest.get("restore_order") or [])
+        applied: List[str] = []
+        skipped: List[str] = []
+        fallback_applied: List[Dict[str, Any]] = []
+        failures: List[Dict[str, Any]] = []
+        expected_objects: List[Dict[str, Any]] = []
+        for item in restore_items:
+            rel = item.get("file")
+            if not rel:
+                continue
+            fp = os.path.join(bundle_dir, rel)
+            if not os.path.isfile(fp):
+                failures.append({"file": rel, "error": "missing file"})
+                continue
+            if dry_run:
+                applied.append(rel)
+                objs, _ = _restore_file_objects(kubeconfig, fp)
+                expected_objects.extend([reapplyable_manifest(x) for x in objs])
+                continue
+            res = _restore_apply_file_resilient(kubeconfig, fp, rel)
+            expected_objects.extend([reapplyable_manifest(x) for x in (res.get("objects") or [])])
+            if res.get("status") == "applied":
+                applied.append(rel)
+                if res.get("method") != "plain_apply":
+                    fallback_applied.append(_public_restore_result(res))
+            elif res.get("status") == "skipped_empty":
+                skipped.append(rel)
+            else:
+                public_res = _public_restore_result(res)
+                failures.append(
+                    {
+                        "file": rel,
+                        "error": public_res.get("error") or public_res.get("message") or "restore apply failed",
+                        "method": public_res.get("method"),
+                        "initial_error": public_res.get("initial_error"),
+                        "sanitized_error": public_res.get("sanitized_error"),
+                    }
+                )
+        reconciled = [] if dry_run else _reconcile_restored_objects(kubeconfig, expected_objects)
+        reconcile_failures = [r for r in reconciled if r.get("status") == "failed"]
+        failures.extend(reconcile_failures)
+        st = "complete" if not failures else ("partial" if applied else "failed")
+        return {
+            "status": st,
+            "applied": applied,
+            "skipped_empty": skipped,
+            "fallback_applied": fallback_applied,
+            "reconciled": reconciled,
+            "failures": failures,
+            "dry_run": dry_run,
+        }
+    if manifest.get("schema") != "agentfence-backup-bundle-v1":
+        return {"status": "error", "message": "invalid backup_manifest schema"}
+    objects = list(manifest.get("objects") or [])
+    objects.sort(
+        key=lambda o: (_BACKUP_KIND_ORDER.get(str(o.get("kind")), 999), str(o.get("name")))
+    )
+    applied: List[str] = []
+    skipped: List[str] = []
+    fallback_applied: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    expected_objects: List[Dict[str, Any]] = []
+    for obj in objects:
+        fn = obj.get("file")
+        if not fn:
+            continue
+        fp = os.path.join(bundle_dir, "objects", fn)
+        if not os.path.isfile(fp):
+            failures.append({"file": fn, "error": "missing file"})
+            continue
+        if dry_run:
+            applied.append(fn)
+            objs, _ = _restore_file_objects(kubeconfig, fp)
+            expected_objects.extend([reapplyable_manifest(x) for x in objs])
+            continue
+        res = _restore_apply_file_resilient(kubeconfig, fp, fn)
+        expected_objects.extend([reapplyable_manifest(x) for x in (res.get("objects") or [])])
+        if res.get("status") == "applied":
+            applied.append(fn)
+            if res.get("method") != "plain_apply":
+                fallback_applied.append(_public_restore_result(res))
+        elif res.get("status") == "skipped_empty":
+            skipped.append(fn)
+        else:
+            public_res = _public_restore_result(res)
+            failures.append(
+                {
+                    "file": fn,
+                    "error": public_res.get("error") or public_res.get("message") or "restore apply failed",
+                    "method": public_res.get("method"),
+                    "initial_error": public_res.get("initial_error"),
+                    "sanitized_error": public_res.get("sanitized_error"),
+                }
+            )
+    reconciled = [] if dry_run else _reconcile_restored_objects(kubeconfig, expected_objects)
+    reconcile_failures = [r for r in reconciled if r.get("status") == "failed"]
+    failures.extend(reconcile_failures)
+    st = "complete" if not failures else ("partial" if applied else "failed")
+    return {
+        "status": st,
+        "applied": applied,
+        "skipped_empty": skipped,
+        "fallback_applied": fallback_applied,
+        "reconciled": reconciled,
+        "failures": failures,
+        "dry_run": dry_run,
+    }
+
+
+def _dedupe_ordered(values: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for value in values:
+        v = (value or "").strip()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+def _resource_file_name(resource: str) -> str:
+    return _safe_backup_filename(resource.replace("/", "_")) + ".yaml"
+
+
+def kubectl_yaml(kubeconfig: str, args: List[str], timeout: int = 45) -> Tuple[int, str, str]:
+    return run_kubectl(kubeconfig, args + ["-o", "yaml"], timeout=timeout)
+
+
+def _record_capture(
+    captures: List[Dict[str, Any]],
+    *,
+    category: str,
+    rel_path: str,
+    command: List[str],
+    status: str,
+    required: bool = False,
+    message: str = "",
+    resource: str = "",
+    scope: str = "namespace",
+) -> None:
+    captures.append(
+        {
+            "category": category,
+            "file": rel_path,
+            "command": "kubectl " + " ".join(shlex.quote(x) for x in command),
+            "status": status,
+            "required": required,
+            "message": message[:1200],
+            "resource": resource,
+            "scope": scope,
+        }
+    )
+
+
+def capture_yaml(
+    kubeconfig: str,
+    bundle_dir: str,
+    captures: List[Dict[str, Any]],
+    rel_path: str,
+    args: List[str],
+    *,
+    category: str,
+    resource: str = "",
+    scope: str = "namespace",
+    required: bool = False,
+    timeout: int = 45,
+) -> bool:
+    rc, out, err = kubectl_yaml(kubeconfig, args, timeout=timeout)
+    if rc == 0 and out.strip():
+        write_text_file(os.path.join(bundle_dir, rel_path), out)
+        _record_capture(
+            captures,
+            category=category,
+            rel_path=rel_path,
+            command=args + ["-o", "yaml"],
+            status="captured",
+            required=required,
+            resource=resource,
+            scope=scope,
+        )
+        return True
+    _record_capture(
+        captures,
+        category=category,
+        rel_path=rel_path,
+        command=args + ["-o", "yaml"],
+        status="failed" if required else "skipped",
+        required=required,
+        message=(err or out or f"exit {rc}").strip(),
+        resource=resource,
+        scope=scope,
+    )
+    return False
+
+
+def discover_namespaced_resources(kubeconfig: str, include_secrets: bool = True) -> Dict[str, Any]:
+    rc, out, err = run_kubectl(
+        kubeconfig,
+        ["api-resources", "--namespaced=true", "--verbs=list", "-o", "name"],
+        timeout=45,
+    )
+    discovered = [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
+    resources = _dedupe_ordered(list(BASE_NAMESPACE_RESOURCES) + discovered)
+    if not include_secrets:
+        resources = [r for r in resources if r != "secrets"]
+    return {
+        "status": "captured" if rc == 0 else "fallback",
+        "resources": resources,
+        "error": "" if rc == 0 else (err or out or f"exit {rc}")[:1200],
+    }
+
+
+def discover_workload_reference(ctx: RunContext) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "target_pod": ctx.target_pod,
+        "target_container": ctx.target_container,
+        "service_account": None,
+        "node": None,
+        "runtime_class": None,
+        "node_selector": None,
+        "workload": None,
+        "owner_chain": [],
+        "warnings": [],
+    }
+    if ctx.dry_run or not ctx.target_pod:
+        info["warnings"].append("target pod discovery skipped")
+        return info
+    pod = load_target_pod_json(ctx)
+    if not pod:
+        info["warnings"].append("target pod JSON unavailable")
+        return info
+    spec = pod.get("spec") or {}
+    info["service_account"] = spec.get("serviceAccountName") or "default"
+    info["node"] = spec.get("nodeName")
+    info["runtime_class"] = spec.get("runtimeClassName")
+    info["node_selector"] = spec.get("nodeSelector") or {}
+    owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+    if not owners:
+        info["warnings"].append("target pod has no ownerReferences")
+        return info
+
+    owner = owners[0]
+    owner_kind = owner.get("kind")
+    owner_name = owner.get("name")
+    if owner_kind and owner_name:
+        info["owner_chain"].append({"kind": owner_kind, "name": owner_name})
+
+    kind_to_resource = {
+        "Deployment": "deployment",
+        "StatefulSet": "statefulset",
+        "DaemonSet": "daemonset",
+        "ReplicaSet": "replicaset",
+        "Job": "job",
+        "CronJob": "cronjob",
+    }
+
+    if owner_kind == "ReplicaSet" and owner_name:
+        rs = kubectl_get_json(ctx.kubeconfig, ["get", "replicaset", owner_name, "-n", ctx.namespace])
+        rs_owners = ((rs or {}).get("metadata") or {}).get("ownerReferences") or []
+        if rs_owners:
+            top = rs_owners[0]
+            top_kind = top.get("kind")
+            top_name = top.get("name")
+            if top_kind and top_name:
+                info["owner_chain"].append({"kind": top_kind, "name": top_name})
+                owner_kind, owner_name = top_kind, top_name
+
+    if owner_kind == "Job" and owner_name:
+        job = kubectl_get_json(ctx.kubeconfig, ["get", "job", owner_name, "-n", ctx.namespace])
+        job_owners = ((job or {}).get("metadata") or {}).get("ownerReferences") or []
+        if job_owners:
+            top = job_owners[0]
+            top_kind = top.get("kind")
+            top_name = top.get("name")
+            if top_kind and top_name:
+                info["owner_chain"].append({"kind": top_kind, "name": top_name})
+                owner_kind, owner_name = top_kind, top_name
+
+    resource = kind_to_resource.get(str(owner_kind or ""))
+    if resource and owner_name:
+        info["workload"] = {"kind": owner_kind, "resource": resource, "name": owner_name}
+    elif owner_kind or owner_name:
+        info["warnings"].append(f"unhandled owner kind/name: {owner_kind}/{owner_name}")
+    return info
+
+
+def discover_rbac_dependencies(ctx: RunContext, bundle_dir: str, captures: List[Dict[str, Any]]) -> Dict[str, Any]:
+    clusterroles = set()
+    captured_crbs: List[str] = []
+
+    rolebindings = kubectl_get_json(
+        ctx.kubeconfig,
+        ["get", "rolebindings.rbac.authorization.k8s.io", "-n", ctx.namespace],
+    )
+    for rb in (rolebindings or {}).get("items") or []:
+        ref = rb.get("roleRef") or {}
+        if ref.get("kind") == "ClusterRole" and ref.get("name"):
+            clusterroles.add(ref["name"])
+
+    crbs = kubectl_get_json(ctx.kubeconfig, ["get", "clusterrolebindings.rbac.authorization.k8s.io"])
+    for crb in (crbs or {}).get("items") or []:
+        subjects = crb.get("subjects") or []
+        namespaced_subject = any(
+            s.get("kind") == "ServiceAccount" and s.get("namespace") == ctx.namespace
+            for s in subjects
+        )
+        if not namespaced_subject:
+            continue
+        name = (crb.get("metadata") or {}).get("name")
+        if not name:
+            continue
+        captured_crbs.append(name)
+        ref = crb.get("roleRef") or {}
+        if ref.get("kind") == "ClusterRole" and ref.get("name"):
+            clusterroles.add(ref["name"])
+        capture_yaml(
+            ctx.kubeconfig,
+            bundle_dir,
+            captures,
+            f"cluster_dependencies/clusterrolebinding_{_safe_backup_filename(name)}.yaml",
+            ["get", "clusterrolebinding", name],
+            category="cluster_dependency",
+            resource="clusterrolebindings.rbac.authorization.k8s.io",
+            scope="cluster",
+        )
+
+    for name in sorted(clusterroles):
+        capture_yaml(
+            ctx.kubeconfig,
+            bundle_dir,
+            captures,
+            f"cluster_dependencies/clusterrole_{_safe_backup_filename(name)}.yaml",
+            ["get", "clusterrole", name],
+            category="cluster_dependency",
+            resource="clusterroles.rbac.authorization.k8s.io",
+            scope="cluster",
+        )
+
+    return {"clusterroles": sorted(clusterroles), "clusterrolebindings": sorted(captured_crbs)}
+
+
+def detect_pvc_data_status(ctx: RunContext, bundle_dir: str) -> Dict[str, Any]:
+    pvcs = kubectl_get_json(ctx.kubeconfig, ["get", "persistentvolumeclaims", "-n", ctx.namespace])
+    items = (pvcs or {}).get("items") or []
+    pvc_names = [(p.get("metadata") or {}).get("name") for p in items]
+    pvc_names = [p for p in pvc_names if p]
+    status = {
+        "pvc_count": len(pvc_names),
+        "pvc_names": pvc_names,
+        "data_status": "not_applicable" if not pvc_names else "metadata_only",
+        "snapshot_api_available": False,
+        "warning": "",
+    }
+    if not pvc_names:
+        write_json(os.path.join(bundle_dir, "pvc_data", "pvc_data_status.json"), status)
+        return status
+
+    rc, out, _ = run_kubectl(ctx.kubeconfig, ["api-resources", "-o", "name"], timeout=45)
+    api_names = set(line.strip() for line in out.splitlines() if line.strip()) if rc == 0 else set()
+    snapshot_available = "volumesnapshots.snapshot.storage.k8s.io" in api_names
+    status["snapshot_api_available"] = snapshot_available
+    status["data_status"] = "snapshot_plan_available_not_created" if snapshot_available else "metadata_only"
+    status["warning"] = (
+        "PVC object metadata is captured. Persistent volume bytes require CSI VolumeSnapshot, Velero/restic, "
+        "or storage-provider backup before destructive remediation."
+    )
+    plan_lines = [
+        "# AgentFence PVC data backup plan",
+        "# This file is a generated operator checklist; AgentFence does not snapshot volume bytes automatically.",
+        f"# Namespace: {ctx.namespace}",
+        "",
+    ]
+    for pvc_name in pvc_names:
+        plan_lines.extend(
+            [
+                "---",
+                "apiVersion: snapshot.storage.k8s.io/v1",
+                "kind: VolumeSnapshot",
+                "metadata:",
+                f"  name: af-pre-{_safe_backup_filename(pvc_name)}",
+                f"  namespace: {ctx.namespace}",
+                "spec:",
+                "  source:",
+                f"    persistentVolumeClaimName: {pvc_name}",
+                "",
+            ]
+        )
+    write_text_file(os.path.join(bundle_dir, "pvc_data", "volume_snapshot_plan.yaml"), "\n".join(plan_lines))
+    write_json(os.path.join(bundle_dir, "pvc_data", "pvc_data_status.json"), status)
+    return status
+
+
+def _restore_priority(resource: str) -> int:
+    ordered = (
+        "namespaces",
+        "serviceaccounts",
+        "roles.rbac.authorization.k8s.io",
+        "rolebindings.rbac.authorization.k8s.io",
+        "configmaps",
+        "secrets",
+        "persistentvolumeclaims",
+        "services",
+        "deployments.apps",
+        "statefulsets.apps",
+        "daemonsets.apps",
+        "jobs.batch",
+        "cronjobs.batch",
+        "horizontalpodautoscalers.autoscaling",
+        "poddisruptionbudgets.policy",
+        "networkpolicies.networking.k8s.io",
+        "ingresses.networking.k8s.io",
+        "gateways.gateway.networking.k8s.io",
+        "httproutes.gateway.networking.k8s.io",
+        "referencegrants.gateway.networking.k8s.io",
+    )
+    try:
+        return ordered.index(resource)
+    except ValueError:
+        return 999
+
+
+def build_restore_order(captures: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    excluded = {
+        "pods",
+        "replicasets.apps",
+        "endpoints",
+        "events",
+        "events.events.k8s.io",
+        "nodes",
+        "runtimeclasses.node.k8s.io",
+        "storageclasses.storage.k8s.io",
+        "volumesnapshotclasses.snapshot.storage.k8s.io",
+        "priorityclasses.scheduling.k8s.io",
+        "clusterroles.rbac.authorization.k8s.io",
+        "clusterrolebindings.rbac.authorization.k8s.io",
+    }
+    restore: List[Dict[str, Any]] = []
+    seen = set()
+    for capture in captures:
+        if capture.get("status") != "captured":
+            continue
+        if capture.get("category") == "generated_remediation":
+            continue
+        rel = capture.get("file")
+        resource = capture.get("resource") or ""
+        if not rel or not rel.endswith((".yaml", ".yml")) or resource in excluded:
+            continue
+        if rel in seen:
+            continue
+        seen.add(rel)
+        restore.append(
+            {
+                "file": rel,
+                "resource": resource,
+                "scope": capture.get("scope") or "namespace",
+                "priority": _restore_priority(resource),
+            }
+        )
+    restore.sort(key=lambda i: (int(i.get("priority") or 999), str(i.get("file"))))
+    return restore
+
+
+def restore_script_text(namespace: str, restore_order: List[Dict[str, Any]]) -> str:
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        'ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+        'if test -z "${KUBECONFIG:-}"; then echo "Set KUBECONFIG to the target cluster kubeconfig." >&2; exit 1; fi',
+        f'NS="{namespace}"',
+        'echo "Restoring AgentFence checkpoint for namespace ${NS}"',
+        'echo "Server-side dry run first:"',
+    ]
+    for item in restore_order:
+        rel = item.get("file")
+        if rel:
+            lines.append(f'kubectl apply --dry-run=server -f "$ROOT/{rel}" >/dev/null')
+    lines.append('echo "Dry run passed; applying captured namespace resources."')
+    for item in restore_order:
+        rel = item.get("file")
+        if rel:
+            lines.append(f'kubectl apply -f "$ROOT/{rel}"')
+    lines.append('echo "Restore apply complete. Re-run AgentFence analyze to validate the restored state."')
+    return "\n".join(lines) + "\n"
+
+
+def validate_checkpoint_files(
+    kubeconfig: str,
+    bundle_dir: str,
+    restore_order: List[Dict[str, Any]],
+    captures: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    missing: List[str] = []
+    json_errors: List[Dict[str, str]] = []
+    dry_run_warnings: List[Dict[str, str]] = []
+
+    for capture in captures:
+        if capture.get("status") != "captured":
+            continue
+        rel = capture.get("file")
+        if not rel:
+            continue
+        path = os.path.join(bundle_dir, rel)
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            missing.append(rel)
+            continue
+        if rel.endswith(".json"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    json.load(f)
+            except Exception as e:
+                json_errors.append({"file": rel, "error": f"{type(e).__name__}: {e}"})
+
+    for item in restore_order:
+        rel = item.get("file")
+        if not rel:
+            continue
+        path = os.path.join(bundle_dir, rel)
+        if not os.path.isfile(path):
+            missing.append(rel)
+            continue
+        rc, out, err = run_kubectl(kubeconfig, ["apply", "--dry-run=server", "-f", path], timeout=90)
+        if rc != 0:
+            dry_run_warnings.append({"file": rel, "error": (err or out or f"exit {rc}")[:1200]})
+
+    failed_required = [
+        c for c in captures if c.get("required") and c.get("status") != "captured"
+    ]
+    status = "verified"
+    if missing or json_errors or failed_required:
+        status = "failed"
+    elif dry_run_warnings or any(c.get("status") != "captured" for c in captures):
+        status = "verified_with_warnings"
+    return {
+        "status": status,
+        "missing_files": missing,
+        "json_errors": json_errors,
+        "dry_run_warnings": dry_run_warnings,
+        "failed_required_captures": failed_required,
+    }
+
+
+def build_generated_remediation_manifest(remediation_plan: Optional[Dict[str, Any]]) -> str:
+    lines = [
+        "# AgentFence generated remediation source-of-truth",
+        "# Review before applying. This is intentionally generated as a checklist/patch catalog.",
+        "",
+    ]
+    for item in (remediation_plan or {}).get("actionable_items") or []:
+        lines.extend(
+            [
+                "---",
+                f"# probe_id: {item.get('probe_id')}",
+                f"# action_type: {item.get('action_type')}",
+                f"# title: {item.get('title')}",
+                f"# recommendation: {item.get('recommendation')}",
+            ]
+        )
+        artifact = item.get("dry_run_artifact")
+        if artifact:
+            lines.append(str(artifact))
+        else:
+            lines.append("# Manual recommendation only; no generated Kubernetes patch.")
+        lines.append("")
+    if len(lines) <= 3:
+        lines.append("# No actionable remediation items were detected.")
+    return "\n".join(lines) + "\n"
+
+
+def attach_remediation_plan_to_checkpoint(
+    checkpoint: Optional[Dict[str, Any]],
+    remediation_plan: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if not checkpoint or not checkpoint.get("bundle_dir"):
+        return checkpoint
+    bundle_dir = str(checkpoint["bundle_dir"])
+    if not os.path.isdir(bundle_dir):
+        return checkpoint
+    remediation_dir = os.path.join(bundle_dir, "generated_remediation")
+    os.makedirs(remediation_dir, exist_ok=True)
+    write_json(os.path.join(remediation_dir, "remediation_plan.json"), remediation_plan)
+    write_text_file(
+        os.path.join(remediation_dir, "source_of_truth_manifest.yaml"),
+        build_generated_remediation_manifest(remediation_plan),
+    )
+    manifest_path = os.path.join(bundle_dir, "backup_manifest.json")
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception:
+            manifest = {}
+        if isinstance(manifest, dict):
+            manifest["post_run_remediation_plan_attached"] = True
+            manifest["post_run_remediation_plan_attached_at_utc"] = datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat()
+            write_json(manifest_path, manifest)
+            checksum_path = _write_bundle_checksums(bundle_dir)
+            manifest["checksums_path"] = checksum_path
+            write_json(manifest_path, manifest)
+            _write_bundle_checksums(bundle_dir)
+    checkpoint["post_run_remediation_plan_attached"] = True
+    return checkpoint
+
+
+def build_restore_checkpoint(
+    ctx: RunContext,
+    action: str,
+    remediation_plan: Optional[Dict[str, Any]] = None,
+    *,
+    base_dir: Optional[str] = None,
+    include_secrets: bool = True,
+    run_velero: bool = False,
+) -> Dict[str, Any]:
+    parent_dir = base_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated_outputs")
+    if ctx.dry_run:
+        return {
+            "schema": COMPREHENSIVE_BACKUP_SCHEMA,
+            "status": "dry_run_not_created",
+            "action": action,
+            "namespace": ctx.namespace,
+            "bundle_dir": None,
+            "mutation_gate": {
+                "status": "open",
+                "reason": "dry-run mode does not mutate cluster resources",
+            },
+        }
+
+    stamp = now_stamp()
+    bundle_name = (
+        f"rollback_bundle_{_safe_backup_filename(ctx.namespace)}_"
+        f"{_safe_backup_filename(ctx.target_pod or 'namespace')}_{stamp}"
+    )
+    bundle_dir = os.path.join(parent_dir, bundle_name)
+    for sub in (
+        "affected_resources",
+        "namespace_snapshot",
+        "cluster_dependencies",
+        "generated_remediation",
+        "pvc_data",
+    ):
+        os.makedirs(os.path.join(bundle_dir, sub), exist_ok=True)
+
+    captures: List[Dict[str, Any]] = []
+    workload = discover_workload_reference(ctx)
+
+    capture_yaml(
+        ctx.kubeconfig,
+        bundle_dir,
+        captures,
+        "cluster_dependencies/namespace.yaml",
+        ["get", "namespace", ctx.namespace],
+        category="cluster_dependency",
+        resource="namespaces",
+        scope="cluster",
+        required=True,
+    )
+    if ctx.target_pod:
+        capture_yaml(
+            ctx.kubeconfig,
+            bundle_dir,
+            captures,
+            f"affected_resources/pod_{_safe_backup_filename(ctx.target_pod)}.yaml",
+            ["get", "pod", ctx.target_pod, "-n", ctx.namespace],
+            category="affected_resource",
+            resource="pods",
+            required=True,
+        )
+    if workload.get("service_account"):
+        capture_yaml(
+            ctx.kubeconfig,
+            bundle_dir,
+            captures,
+            f"affected_resources/serviceaccount_{_safe_backup_filename(str(workload['service_account']))}.yaml",
+            ["get", "serviceaccount", str(workload["service_account"]), "-n", ctx.namespace],
+            category="affected_resource",
+            resource="serviceaccounts",
+            required=False,
+        )
+    wl = workload.get("workload") or {}
+    if wl.get("resource") and wl.get("name"):
+        capture_yaml(
+            ctx.kubeconfig,
+            bundle_dir,
+            captures,
+            f"affected_resources/workload_{_safe_backup_filename(str(wl['resource']))}_{_safe_backup_filename(str(wl['name']))}.yaml",
+            ["get", str(wl["resource"]), str(wl["name"]), "-n", ctx.namespace],
+            category="affected_resource",
+            resource=f"{wl['resource']}s",
+            required=False,
+        )
+    for resource in ("services", "networkpolicies.networking.k8s.io", "configmaps", "secrets"):
+        if resource == "secrets" and not include_secrets:
+            continue
+        capture_yaml(
+            ctx.kubeconfig,
+            bundle_dir,
+            captures,
+            f"affected_resources/{_resource_file_name(resource)}",
+            ["get", resource, "-n", ctx.namespace],
+            category="affected_resource",
+            resource=resource,
+            required=False,
+        )
+
+    discovery = discover_namespaced_resources(ctx.kubeconfig, include_secrets=include_secrets)
+    write_json(os.path.join(bundle_dir, "namespace_snapshot", "api-resources.json"), discovery)
+    _record_capture(
+        captures,
+        category="namespace_snapshot",
+        rel_path="namespace_snapshot/api-resources.json",
+        command=["api-resources", "--namespaced=true", "--verbs=list", "-o", "name"],
+        status="captured",
+        resource="api-resources",
+    )
+    for resource in discovery["resources"]:
+        capture_yaml(
+            ctx.kubeconfig,
+            bundle_dir,
+            captures,
+            f"namespace_snapshot/{_resource_file_name(resource)}",
+            ["get", resource, "-n", ctx.namespace],
+            category="namespace_snapshot",
+            resource=resource,
+            required=False,
+            timeout=60,
+        )
+
+    node_name = workload.get("node")
+    if node_name:
+        capture_yaml(
+            ctx.kubeconfig,
+            bundle_dir,
+            captures,
+            f"cluster_dependencies/node_{_safe_backup_filename(str(node_name))}.yaml",
+            ["get", "node", str(node_name)],
+            category="cluster_dependency",
+            resource="nodes",
+            scope="cluster",
+        )
+    for resource in CLUSTER_DEPENDENCY_RESOURCES:
+        capture_yaml(
+            ctx.kubeconfig,
+            bundle_dir,
+            captures,
+            f"cluster_dependencies/{_resource_file_name(resource)}",
+            ["get", resource],
+            category="cluster_dependency",
+            resource=resource,
+            scope="cluster",
+            timeout=60,
+        )
+    rbac_dependencies = discover_rbac_dependencies(ctx, bundle_dir, captures)
+    pvc_data = detect_pvc_data_status(ctx, bundle_dir)
+
+    remediation_json = os.path.join(bundle_dir, "generated_remediation", "remediation_plan.json")
+    write_json(remediation_json, remediation_plan or {})
+    _record_capture(
+        captures,
+        category="generated_remediation",
+        rel_path="generated_remediation/remediation_plan.json",
+        command=["agentfence", "build-remediation-plan"],
+        status="captured",
+        resource="remediation-plan",
+    )
+    source_rel = "generated_remediation/source_of_truth_manifest.yaml"
+    write_text_file(
+        os.path.join(bundle_dir, source_rel),
+        build_generated_remediation_manifest(remediation_plan),
+    )
+    _record_capture(
+        captures,
+        category="generated_remediation",
+        rel_path=source_rel,
+        command=["agentfence", "generate-source-of-truth"],
+        status="captured",
+        resource="remediation-source-of-truth",
+    )
+
+    if run_velero:
+        velero_info: Dict[str, Any] = {"requested": True, "status": "not_run", "message": ""}
+        vb = f"af-pre-{_safe_backup_filename(ctx.namespace)}-{stamp}"
+        if shutil.which("velero"):
+            try:
+                pr = subprocess.run(
+                    [
+                        "velero",
+                        "backup",
+                        "create",
+                        vb,
+                        "--include-namespaces",
+                        ctx.namespace,
+                        "--wait",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                    check=False,
+                )
+                velero_info.update(
+                    {
+                        "status": "captured" if pr.returncode == 0 else "failed",
+                        "backup_name": vb,
+                        "message": ((pr.stdout or "") + (pr.stderr or "")).strip()[:2000],
+                    }
+                )
+            except Exception as e:
+                velero_info.update({"status": "failed", "message": f"{type(e).__name__}: {e}"})
+        else:
+            velero_info.update({"status": "skipped", "message": "velero CLI not found in PATH"})
+    else:
+        velero_info = {"requested": False, "status": "skipped"}
+
+    restore_order = build_restore_order(captures)
+    write_json(os.path.join(bundle_dir, "restore_order.json"), {"items": restore_order})
+    write_text_file(
+        os.path.join(bundle_dir, "restore.sh"),
+        restore_script_text(ctx.namespace, restore_order),
+        executable=True,
+    )
+    validation = validate_checkpoint_files(ctx.kubeconfig, bundle_dir, restore_order, captures)
+    write_json(os.path.join(bundle_dir, "validation_report.json"), validation)
+
+    required_failures = [
+        c for c in captures if c.get("required") and c.get("status") != "captured"
+    ]
+    noncritical_warnings = [c for c in captures if c.get("status") != "captured"]
+    status = validation["status"]
+    if required_failures:
+        status = "failed"
+    elif status == "verified" and noncritical_warnings:
+        status = "verified_with_warnings"
+    mutation_gate = {
+        "status": "open" if status in ("verified", "verified_with_warnings") else "blocked",
+        "reason": "restore checkpoint verified before remediation guidance was emitted"
+        if status in ("verified", "verified_with_warnings")
+        else "required backup capture or validation failed",
+    }
+
+    manifest: Dict[str, Any] = {
+        "schema": COMPREHENSIVE_BACKUP_SCHEMA,
+        "status": status,
+        "created_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "action": action,
+        "namespace": ctx.namespace,
+        "target_pod": ctx.target_pod,
+        "target_container": ctx.target_container,
+        "catalog_version": CATALOG_VERSION,
+        "bundle_dir": bundle_dir,
+        "include_secrets": include_secrets,
+        "contains_secret_objects": include_secrets,
+        "workload_reference": workload,
+        "rbac_dependencies": rbac_dependencies,
+        "pvc_data": pvc_data,
+        "velero": velero_info,
+        "captures": captures,
+        "restore_order": restore_order,
+        "validation_report": os.path.join(bundle_dir, "validation_report.json"),
+        "restore_script": os.path.join(bundle_dir, "restore.sh"),
+        "mutation_gate": mutation_gate,
+    }
+    manifest_path = os.path.join(bundle_dir, "backup_manifest.json")
+    write_json(manifest_path, manifest)
+    checksum_path = _write_bundle_checksums(bundle_dir)
+    manifest["manifest_path"] = manifest_path
+    manifest["checksums_path"] = checksum_path
+    write_json(manifest_path, manifest)
+    return manifest
+
+
+def create_comprehensive_namespace_backup_bundle(
+    kubeconfig: str,
+    namespace: str,
+    parent_dir: str,
+    *,
+    include_secrets: bool = True,
+    run_velero: bool = False,
+    target_pod: str = "",
+) -> Dict[str, Any]:
+    ctx = RunContext(
+        namespace=namespace,
+        kubeconfig=kubeconfig,
+        target_pod=target_pod,
+        target_container="",
+        attacker_pod="",
+        attacker_container="",
+        target_ip="",
+        dry_run=False,
+    )
+    return build_restore_checkpoint(
+        ctx,
+        "backup-namespace",
+        remediation_plan=None,
+        base_dir=parent_dir,
+        include_secrets=include_secrets,
+        run_velero=run_velero,
+    )
+
+
+def reconcile_evaluation_artifact_paths(evaluation: Dict[str, Any]) -> None:
+    """Refresh F4 exists_at_generation after output files have been written to disk."""
+    f4 = evaluation.get("F4_artifact_consistency")
+    if not isinstance(f4, dict):
+        return
+    arts = f4.get("artifacts")
+    if not isinstance(arts, list):
+        return
+    for entry in arts:
+        if not isinstance(entry, dict):
+            continue
+        p = entry.get("path")
+        if isinstance(p, str) and p:
+            entry["exists_at_generation"] = os.path.exists(p)
+
+
+def metrics_to_dict(metrics: Optional[Any]) -> Dict[str, Any]:
+    if metrics is None:
+        return {}
+    if isinstance(metrics, ScoreBundle):
+        return dict(metrics.__dict__)
+    return dict(metrics)
+
+
+def result_dicts(results: Optional[List[Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for r in results or []:
+        if isinstance(r, TestResult):
+            data = dict(canonical_test_result(r).__dict__)
+        else:
+            data = dict(r)
+            data["id"] = canonical_probe_id(data.get("id"))
+        out.append(data)
+    return out
+
+
+def result_status_counts(results: Optional[List[Any]]) -> Dict[str, int]:
+    counts = {"pass": 0, "fail": 0, "skip": 0}
+    for r in result_dicts(results):
+        status = str(r.get("status") or "skip")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def build_f1_f5_evaluation(
+    action: str,
+    namespace: str,
+    context: Dict[str, Any],
+    artifacts: Dict[str, str],
+    metrics: Optional[Any] = None,
+    results: Optional[List[Any]] = None,
+    metrics_before: Optional[Any] = None,
+    results_before: Optional[List[Any]] = None,
+    metrics_after: Optional[Any] = None,
+    results_after: Optional[List[Any]] = None,
+    remediation_plan: Optional[Dict[str, Any]] = None,
+    backup_checkpoint: Optional[Dict[str, Any]] = None,
+    health: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    base_metrics = metrics_to_dict(metrics or metrics_before)
+    after_metrics = metrics_to_dict(metrics_after)
+    base_results = results if results is not None else results_before
+    post_results = results_after or results or results_before
+    base_counts = result_status_counts(base_results)
+    post_counts = result_status_counts(post_results)
+    f3_status = "baseline_only" if action == "analyze" else "not_improved"
+    if after_metrics:
+        before_score = float(base_metrics.get("score_normalized", 0))
+        after_score = float(after_metrics.get("score_normalized", before_score))
+        before_issues = int(base_metrics.get("issue_count", 0))
+        after_issues = int(after_metrics.get("issue_count", before_issues))
+        f3_status = "improved" if after_score < before_score or after_issues < before_issues else "unchanged"
+    elif action != "analyze":
+        f3_status = "post_revalidation_unavailable"
+
+    artifact_entries = []
+    for label, path in artifacts.items():
+        if not path:
+            continue
+        artifact_entries.append(
+            {
+                "label": label,
+                "path": path,
+                "exists_at_generation": os.path.exists(path),
+            }
+        )
+
+    checkpoint_status = (backup_checkpoint or {}).get("status")
+    restore_ready = checkpoint_status in ("verified", "verified_with_warnings")
+    f5_status = (health or {}).get("status") or ("not_applicable" if action == "analyze" else "not_assessed")
+    if action != "analyze" and checkpoint_status:
+        if restore_ready:
+            f5_status = "restore_checkpoint_ready"
+        elif checkpoint_status == "dry_run_not_created":
+            f5_status = "dry_run_not_applicable"
+        else:
+            f5_status = "restore_checkpoint_blocked"
+
+    status = "partial" if error else "complete"
+    return {
+        "schema": "agentfence-f1-f5-v2",
+        "status": status,
+        "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "action": action,
+        "namespace": namespace,
+        "error": error,
+        "F1_runtime_placement": {
+            "status": "captured" if context.get("target_pod") else "insufficient_evidence",
+            "target_pod": context.get("target_pod"),
+            "target_container": context.get("target_container"),
+            "node": context.get("node"),
+            "runtime_class": context.get("runtime_class"),
+            "node_selector": context.get("node_selector"),
+            "attacker_pod": context.get("attacker_pod"),
+        },
+        "F2_attack_path_containment": {
+            "status": "captured" if post_results else "insufficient_evidence",
+            "source": "post_remediation" if results_after else "current_state",
+            "counts": post_counts,
+            "unsafe_probe_ids": [
+                r["id"]
+                for r in result_dicts(post_results)
+                if r.get("status") == "pass" and is_scored_probe(r.get("id"))
+            ],
+            "review_only_probe_ids": [
+                r["id"]
+                for r in result_dicts(post_results)
+                if r.get("status") == "pass" and is_review_only_probe(r.get("id"))
+            ],
+            "skipped_probe_ids": [r["id"] for r in result_dicts(post_results) if r.get("status") == "skip"],
+        },
+        "F3_remediation_effectiveness": {
+            "status": f3_status,
+            "metrics_before": base_metrics,
+            "metrics_after": after_metrics or None,
+            "issue_count_before": base_metrics.get("issue_count"),
+            "issue_count_after": after_metrics.get("issue_count") if after_metrics else None,
+            "headline_before": base_metrics.get("score_normalized"),
+            "headline_after": after_metrics.get("score_normalized") if after_metrics else None,
+            "remediation_actionable_count": (remediation_plan or {}).get("actionable_count"),
+        },
+        "F4_artifact_consistency": {
+            "status": "captured" if artifact_entries or backup_checkpoint else "insufficient_evidence",
+            "artifacts": artifact_entries,
+            "backup_checkpoint": {
+                "status": checkpoint_status,
+                "bundle_dir": (backup_checkpoint or {}).get("bundle_dir"),
+                "manifest_path": (backup_checkpoint or {}).get("manifest_path"),
+                "validation_report": (backup_checkpoint or {}).get("validation_report"),
+                "restore_script": (backup_checkpoint or {}).get("restore_script"),
+            }
+            if backup_checkpoint
+            else None,
+        },
+        "F5_recoverability": {
+            "status": f5_status,
+            "health": health or {},
+            "workload_revalidations": [
+                r.get("workload_revalidation")
+                for r in (health or {}).get("records", [])
+                if r.get("workload_revalidation")
+            ],
+            "runtime_seccomp_diagnostics": [
+                r.get("runtime_seccomp_diagnostic")
+                for r in (health or {}).get("records", [])
+                if r.get("runtime_seccomp_diagnostic")
+            ],
+            "rollback_bundle_recorded": bool(artifacts.get("rollback_bundle") or (backup_checkpoint or {}).get("bundle_dir")),
+            "rollback_bundle_path": artifacts.get("rollback_bundle") or (backup_checkpoint or {}).get("bundle_dir") or None,
+            "backup_status": checkpoint_status,
+            "restore_ready": restore_ready,
+            "pvc_data": (backup_checkpoint or {}).get("pvc_data"),
+            "mutation_gate": (backup_checkpoint or {}).get("mutation_gate"),
+            "notes": "Analyze-only runs do not mutate the workload." if action == "analyze" else "",
+        },
+        "base_result_counts": base_counts,
+    }
+
+
+def write_f1_f5_md(path: str, evaluation: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    lines = [
+        f"# AgentFence F1-F5 Evaluation ({evaluation.get('action')})",
+        "",
+        f"- schema: {evaluation.get('schema')}",
+        f"- status: {evaluation.get('status')}",
+        f"- namespace: {evaluation.get('namespace')}",
+        "",
+        "| factor | status | key evidence |",
+        "|---|---|---|",
+    ]
+    f1 = evaluation.get("F1_runtime_placement") or {}
+    f2 = evaluation.get("F2_attack_path_containment") or {}
+    f3 = evaluation.get("F3_remediation_effectiveness") or {}
+    f4 = evaluation.get("F4_artifact_consistency") or {}
+    f5 = evaluation.get("F5_recoverability") or {}
+    lines.append(f"| F1 runtime placement | {f1.get('status')} | target={f1.get('target_pod')} runtime={f1.get('runtime_class')} |")
+    lines.append(f"| F2 attack-path containment | {f2.get('status')} | scored={len(f2.get('unsafe_probe_ids') or [])} review_only={len(f2.get('review_only_probe_ids') or [])} counts={f2.get('counts')} |")
+    lines.append(f"| F3 remediation effectiveness | {f3.get('status')} | headline {f3.get('headline_before')} -> {f3.get('headline_after')} |")
+    lines.append(f"| F4 artifact consistency | {f4.get('status')} | artifacts={len(f4.get('artifacts') or [])} |")
+    rb = f5.get("rollback_bundle_path") or ""
+    lines.append(
+        f"| F5 recoverability | {f5.get('status')} | rollback={f5.get('rollback_bundle_recorded')} path={rb!r} |"
+    )
+    lines.append("")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def analyze_pipeline(
+    namespace: str,
+    kubeconfig: str,
+    target_override: Optional[str],
+    dry_run: bool,
+    timeout: int,
+    headline_alpha: float = DEFAULT_HEADLINE_ALPHA,
+    prebuilt_ctx: Optional[RunContext] = None,
+    allow_node_runtime_remediation: bool = False,
+) -> Tuple[List[TestResult], ScoreBundle, RunContext]:
+    ctx = prebuilt_ctx or build_context(
+        namespace,
+        kubeconfig,
+        target_override,
+        dry_run,
+        timeout,
+        allow_node_runtime_remediation=allow_node_runtime_remediation,
+    )
+    if dry_run:
+        results = [
+            tr(p.id, p.severity, "skip", f"dry-run target={ctx.target_pod}", "dry-run")
+            for p in CATALOG
+        ]
+    else:
+        results = run_all_probes(ctx)
+    metrics = summarize_results(results, headline_alpha=headline_alpha)
+    return results, metrics, ctx
+
+
+def remediation_pipeline(
+    namespace: str,
+    kubeconfig: str,
+    target_override: Optional[str],
+    dry_run: bool,
+    timeout: int,
+    headline_alpha: float = DEFAULT_HEADLINE_ALPHA,
+    backup_parent_dir: Optional[str] = None,
+    include_secrets_backup: bool = True,
+    velero_backup: bool = False,
+    create_backup: bool = True,
+    pre_run_backup_checkpoint: Optional[Dict[str, Any]] = None,
+    prebuilt_ctx: Optional[RunContext] = None,
+    allow_node_runtime_remediation: bool = False,
+) -> Dict[str, Any]:
+    """Same scoring as analyze; emits hints. v1 does not mutate the cluster."""
+    r_before, m_before, ctx = analyze_pipeline(
+        namespace,
+        kubeconfig,
+        target_override,
+        dry_run,
+        timeout,
+        headline_alpha,
+        prebuilt_ctx=prebuilt_ctx,
+        allow_node_runtime_remediation=allow_node_runtime_remediation,
+    )
+    context = context_from_ctx(ctx)
+    remediation_plan = build_remediation_plan(r_before, context)
+    if pre_run_backup_checkpoint:
+        backup_checkpoint = attach_remediation_plan_to_checkpoint(
+            pre_run_backup_checkpoint,
+            remediation_plan,
+        ) or pre_run_backup_checkpoint
+    elif create_backup:
+        backup_checkpoint = build_restore_checkpoint(
+            ctx,
+            "remediation",
+            remediation_plan,
+            base_dir=backup_parent_dir,
+            include_secrets=include_secrets_backup,
+            run_velero=velero_backup,
+        )
+    else:
+        backup_checkpoint = {
+            "schema": COMPREHENSIVE_BACKUP_SCHEMA,
+            "status": "disabled_by_user",
+            "action": "remediation",
+            "namespace": namespace,
+            "bundle_dir": None,
+            "mutation_gate": {
+                "status": "blocked",
+                "reason": "pre-remediation backup was disabled",
+            },
+        }
+    hints = [
+        {
+            "probe": item["probe_id"],
+            "issue_id": item["issue_id"],
+            "action_type": item["action_type"],
+            "hint": item["recommendation"],
+        }
+        for item in remediation_plan.get("actionable_items", [])
+    ]
+    remediation_apply = apply_remediation_actions(ctx, remediation_plan, backup_checkpoint, r_before)
+    r_after, m_after, _ = analyze_pipeline(
+        namespace,
+        kubeconfig,
+        target_override,
+        dry_run,
+        timeout,
+        headline_alpha,
+        prebuilt_ctx=ctx if dry_run else None,
+    )
+    return {
+        "context": context,
+        "metrics_before": m_before.__dict__,
+        "metrics_after": m_after.__dict__,
+        "results_before": [r.__dict__ for r in r_before],
+        "results_after": [r.__dict__ for r in r_after],
+        "remediation": remediation_plan,
+        "remediation_apply": remediation_apply,
+        "backup_checkpoint": backup_checkpoint,
+        "remediation_hints": hints,
+        "note": "Remediation modes enforce a restore checkpoint, apply supported Kubernetes fixes, then re-run the 39-probe analysis. Manual recommendations remain for node/runtime-specific issues.",
+    }
+
+
+def analyze_remediation_pipeline(
+    namespace: str,
+    kubeconfig: str,
+    target_override: Optional[str],
+    dry_run: bool,
+    timeout: int,
+    headline_alpha: float = DEFAULT_HEADLINE_ALPHA,
+    backup_parent_dir: Optional[str] = None,
+    include_secrets_backup: bool = True,
+    velero_backup: bool = False,
+    create_backup: bool = True,
+    pre_run_backup_checkpoint: Optional[Dict[str, Any]] = None,
+    prebuilt_ctx: Optional[RunContext] = None,
+    allow_node_runtime_remediation: bool = False,
+) -> Dict[str, Any]:
+    """Chained analyze + remediation report; both phases use summarize_results only."""
+    rem = remediation_pipeline(
+        namespace,
+        kubeconfig,
+        target_override,
+        dry_run,
+        timeout,
+        headline_alpha,
+        backup_parent_dir,
+        include_secrets_backup,
+        velero_backup,
+        create_backup,
+        pre_run_backup_checkpoint,
+        prebuilt_ctx,
+        allow_node_runtime_remediation,
+    )
+    return {"phase": "analyze-remediation", **rem}
+
+
+def maybe_ai_narrate(
+    metrics: ScoreBundle,
+    results: List[TestResult],
+    guided: str,
+    *,
+    backup_bundle_path: Optional[str] = None,
+    backup_status: Optional[str] = None,
+    action: str = "analyze",
+) -> str:
+    if guided != "ai":
+        return ""
+    lines = [
+        "AgentFence (AI summary — numbers are fixed from summarize_results):",
+        f"- TBE (Trust-boundary): issues={metrics.tbe_issue_count} raw={metrics.tbe_score_raw} norm={metrics.tbe_score_normalized}",
+        f"- ELE (Execution-local): issues={metrics.ele_issue_count} raw={metrics.ele_score_raw} norm={metrics.ele_score_normalized}",
+        f"- Total unsafe: issues={metrics.issue_count} raw={metrics.score_raw}",
+        f"- Headline score_normalized={metrics.score_normalized} (alpha={metrics.headline_alpha})",
+        f"- review-only communication findings={sum(1 for r in results if r.status == 'pass' and is_review_only_probe(r.id))}",
+        f"- skipped={len(metrics.skipped)}",
+    ]
+    if backup_bundle_path:
+        lines.append(
+            f"- Rollback: a namespace backup bundle was written (kubectl apply restore + manifest): {backup_bundle_path}"
+        )
+    elif action in ("remediation", "analyze-remediation") and backup_status == "dry_run_not_created":
+        lines.append(
+            "- Rollback: dry-run mode recorded the enforced pre-run checkpoint gate; no cluster bundle was created."
+        )
+    elif action in ("remediation", "analyze-remediation"):
+        lines.append(
+            f"- Rollback: enforced pre-run checkpoint status={backup_status or 'unknown'}; no bundle path was recorded."
+        )
+    else:
+        lines.append(
+            "- Rollback: no namespace backup bundle for this analyze run (use --create-backup on analyze; remediation / analyze-remediation require an enforced restore checkpoint before probes)."
+        )
+    top = [r for r in results if r.status == "pass" and is_scored_probe(r.id)][:8]
+    if top:
+        lines.append("Top scored unsafe probes:")
+        for r in top:
+            lines.append(f"  - {r.id}: {r.matched_clause or r.evidence[:80]}")
+    review_only = [r for r in results if r.status == "pass" and is_review_only_probe(r.id)]
+    if review_only:
+        lines.append("Review-only communication findings:")
+        for r in review_only:
+            lines.append(f"  - {canonical_probe_id(r.id)}: {r.matched_clause or r.evidence[:80]}")
+    return "\n".join(lines)
+
+
+def redact_for_ai(value: Any) -> Any:
+    sensitive_tokens = ("secret", "token", "password", "credential", "apikey", "api_key", "authorization")
+    if isinstance(value, dict):
+        clean: Dict[str, Any] = {}
+        for key, item in value.items():
+            key_s = str(key)
+            if any(token in key_s.lower() for token in sensitive_tokens):
+                clean[key_s] = "<redacted>"
+            else:
+                clean[key_s] = redact_for_ai(item)
+        return clean
+    if isinstance(value, list):
+        return [redact_for_ai(item) for item in value[:200]]
+    if isinstance(value, str):
+        if len(value) > 4000:
+            return value[:4000] + "...<truncated>"
+        return value
+    return value
+
+
+def compact_ai_context(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return redact_for_ai(
+        {
+            "catalog_version": payload.get("catalog_version"),
+            "phase": payload.get("phase"),
+            "context": payload.get("context"),
+            "metrics_before": payload.get("metrics_before") or payload.get("metrics"),
+            "metrics_after": payload.get("metrics_after"),
+            "enriched_report": payload.get("enriched_report"),
+            "evaluation": payload.get("evaluation"),
+            "remediation": payload.get("remediation"),
+            "remediation_apply": payload.get("remediation_apply"),
+            "backup_checkpoint": payload.get("backup_checkpoint"),
+        }
+    )
+
+
+def load_json_file(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
         return None
-    if not shutil.which('security'):
+
+
+def latest_agentfence_artifact(namespace: str = "", action: str = "") -> Optional[str]:
+    root = pathlib.Path(os.path.dirname(os.path.abspath(__file__))) / "generated_outputs"
+    if not root.exists():
+        return None
+    patterns: List[str] = []
+    if action and namespace:
+        patterns.append(f"agentfence_{action}_{namespace}_*.json")
+    if namespace:
+        patterns.append(f"agentfence_*_{namespace}_*.json")
+    patterns.append("agentfence_*.json")
+    seen: Dict[str, pathlib.Path] = {}
+    for pattern in patterns:
+        for path in root.glob(pattern):
+            if "_f1_f5_" in path.name:
+                continue
+            seen[str(path)] = path
+    if not seen:
+        return None
+    return str(sorted(seen.values(), key=lambda p: p.stat().st_mtime, reverse=True)[0])
+
+
+def read_openai_api_key_from_keychain(
+    service: str = AI_KEYCHAIN_SERVICE,
+    account: str = AI_KEYCHAIN_ACCOUNT,
+) -> Optional[str]:
+    if platform.system() != "Darwin":
+        return None
+    if not shutil.which("security"):
         return None
     try:
         proc = subprocess.run(
-            ['security', 'find-generic-password', '-w', '-s', service, '-a', account],
+            ["security", "find-generic-password", "-w", "-s", service, "-a", account],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -3448,2921 +7186,1626 @@ def read_openai_api_key_from_keychain(service=AI_KEYCHAIN_SERVICE, account=AI_KE
         )
         if proc.returncode != 0:
             return None
-        value = (proc.stdout or '').strip()
+        value = (proc.stdout or "").strip()
         return value or None
     except Exception:
         return None
 
 
-def read_openai_api_key_from_keyring(service=AI_KEYCHAIN_SERVICE, account=AI_KEYCHAIN_ACCOUNT):
+def read_openai_api_key_from_keyring(
+    service: str = AI_KEYCHAIN_SERVICE,
+    account: str = AI_KEYCHAIN_ACCOUNT,
+) -> Optional[str]:
     try:
-        import keyring
+        import keyring  # type: ignore
     except Exception:
         return None
     try:
         value = keyring.get_password(service, account)
-        value = (value or '').strip()
+        value = (value or "").strip()
         return value or None
     except Exception:
         return None
 
 
-def resolve_openai_api_key():
-    env_value = (os.environ.get('OPENAI_API_KEY') or '').strip()
+def resolve_openai_api_key() -> Tuple[str, str]:
+    env_value = (os.environ.get("OPENAI_API_KEY") or os.environ.get("AGENTFENCE_OPENAI_API_KEY") or "").strip()
     if env_value:
-        return env_value, 'environment'
-    if platform.system() == 'Darwin':
-        keychain_value = read_openai_api_key_from_keychain()
-        if keychain_value:
-            return keychain_value, 'macos_keychain'
+        return env_value, "environment"
+    keychain_value = read_openai_api_key_from_keychain()
+    if keychain_value:
+        return keychain_value, "macos_keychain"
     keyring_value = read_openai_api_key_from_keyring()
     if keyring_value:
-        return keyring_value, 'keyring'
-    return None, None
+        return keyring_value, "keyring"
+    return "", ""
 
 
-def ai_issue_brief(item):
-    if not isinstance(item, dict):
-        return {}
-    return {
-        'issue_id': item.get('issue_id'),
-        'title': item.get('title'),
-        'severity': item.get('severity'),
-        'risk_level': item.get('risk_level'),
-        'auto_applicable': item.get('auto_applicable'),
-        'fix_group': item.get('fix_group'),
-        'manual_recommendation': item.get('manual_recommendation'),
-        'risk_note': item.get('risk_note'),
-        'policy_reasoning': item.get('policy_reasoning'),
-        'decision_reasoning': item.get('decision_reasoning'),
-        'why_not_auto_fixed': item.get('why_not_auto_fixed'),
-        'simulation_hint': item.get('simulation_hint'),
-    }
-
-
-def build_ai_advisor_payload(audit_obj, selected=None, workflow_mode=None):
-    meta = audit_obj.get('meta', {}) or {}
-    score = audit_obj.get('risk_score') or compute_risk_score(audit_obj)
-    remediation = (audit_obj.get('remediation') or {}).get('items') or []
-    deps = meta.get('dependencies') or audit_obj.get('dependencies') or {}
-    compatibility = meta.get('compatibility_notes') or []
-    return {
-        'workflow_mode': workflow_mode or 'guided',
-        'target': {
-            'namespace': meta.get('namespace'),
-            'workload_kind': meta.get('workload_kind'),
-            'workload_name': meta.get('workload_name'),
-            'target_selector': meta.get('target_selector'),
-            'target_pod': meta.get('target_pod'),
-        },
-        'selected_resource': {
-            'workload_kind': (selected or {}).get('workload_kind'),
-            'workload_name': (selected or {}).get('workload_name'),
-            'selector': (selected or {}).get('selector'),
-        },
-        'risk_score': score,
-        'security_summary': security_issue_summary(audit_obj),
-        'compatibility_notes': [note.get('message') if isinstance(note, dict) else str(note) for note in compatibility[:6]],
-        'dependencies': deps,
-        'remediation_items': [ai_issue_brief(item) for item in remediation[:12]],
-    }
-
-
-def extract_text_from_response_api(data):
-    if isinstance(data, dict):
-        output_text = data.get('output_text')
-        if isinstance(output_text, str) and output_text.strip():
-            return output_text.strip()
-        output = data.get('output') or []
-        texts = []
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            content = item.get('content') or []
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                if part.get('type') in ('output_text', 'text') and part.get('text'):
-                    texts.append(part.get('text'))
-        if texts:
-            return "\n".join(texts).strip()
-    return ""
-
-
-def coerce_advisor_json(text):
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    match = re.search(r'(\{.*\})', text, re.S)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except Exception:
-            return None
-    return None
-
-
-def advisor_response_format():
-    return {
-        'type': 'json_schema',
-        'name': 'agentfence_ai_advisor',
-        'schema': {
-            'type': 'object',
-            'additionalProperties': False,
-            'properties': {
-                'executive_summary': {'type': 'string'},
-                'remediation_overview': {'type': 'string'},
-                'prioritized_groups': {
-                    'type': 'array',
-                    'items': {
-                        'type': 'object',
-                        'additionalProperties': False,
-                        'properties': {
-                            'title': {'type': 'string'},
-                            'priority': {'type': 'string'},
-                            'issue_ids': {'type': 'array', 'items': {'type': 'string'}},
-                            'rationale': {'type': 'string'},
-                        },
-                        'required': ['title', 'priority', 'issue_ids', 'rationale'],
-                    },
-                },
-                'item_advice': {
-                    'type': 'array',
-                    'items': {
-                        'type': 'object',
-                        'additionalProperties': False,
-                        'properties': {
-                            'issue_id': {'type': 'string'},
-                            'explanation': {'type': 'string'},
-                            'operator_impact': {'type': 'string'},
-                            'validation_advice': {'type': 'string'},
-                            'ordering_reason': {'type': 'string'},
-                        },
-                        'required': ['issue_id', 'explanation', 'operator_impact', 'validation_advice', 'ordering_reason'],
-                    },
-                },
-                'guided_operator_message': {'type': 'string'},
-                'warnings': {'type': 'array', 'items': {'type': 'string'}},
-                'next_steps': {'type': 'array', 'items': {'type': 'string'}},
-            },
-            'required': [
-                'executive_summary',
-                'remediation_overview',
-                'prioritized_groups',
-                'item_advice',
-                'guided_operator_message',
-                'warnings',
-                'next_steps',
-            ],
-        },
-    }
-
-
-def openai_responses_create(instructions, payload, model, timeout=25.0, api_base=None):
-    api_key, key_source = resolve_openai_api_key()
-    if not api_key:
-        raise RuntimeError('OpenAI API key is not configured in environment or macOS Keychain')
-    body = {
-        'model': model,
-        'instructions': instructions,
-        'input': [
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'input_text',
-                        'text': json.dumps(payload, indent=2, sort_keys=True),
-                    }
-                ],
-            }
-        ],
-        'text': {'format': advisor_response_format(), 'verbosity': 'low'},
-        'reasoning': {'effort': 'minimal'},
-        'max_output_tokens': 4000,
-    }
-    req = urllib.request.Request(
-        f"{(api_base or AI_API_BASE_DEFAULT).rstrip('/')}/responses",
-        data=json.dumps(body).encode('utf-8'),
-        headers={
-            'Authorization': f'Bearer {api_key}',
-            'Content-Type': 'application/json',
-        },
-        method='POST',
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
-
-
-def ai_advisor_instructions():
-    return (
-        "You are AgentFence AI, a Kubernetes sandbox security advisor. "
-        "You are advisory only. Do not invent findings. Base everything on the provided JSON. "
-        "Be concise and keep all fields short and practical. "
-        "Return valid JSON only with these keys: "
-        "executive_summary, remediation_overview, prioritized_groups, item_advice, guided_operator_message, warnings, next_steps. "
-        "executive_summary and remediation_overview must be strings. "
-        "prioritized_groups must be a list of objects with keys title, priority, issue_ids, rationale. "
-        "item_advice must be a list of objects with keys issue_id, explanation, operator_impact, validation_advice, ordering_reason. "
-        "guided_operator_message must be a short string written to an operator. "
-        "warnings and next_steps must be lists of short strings. "
-        "Never recommend automatic action beyond the remediation items already provided. "
-        "Keep the tone concise, practical, and safety-aware."
-    )
-
-
-def run_ai_advisor(audit_obj, selected=None, workflow_mode=None, app_mode=None):
-    config = ai_config_from_env(app_mode)
-    base = {
-        'status': 'disabled',
-        'enabled': config['enabled'],
-        'provider': config['provider'],
-        'model': config['model'],
-    }
-    if not config['enabled']:
-        return base
-    if not config['api_key_present']:
-        base.update({'status': 'unavailable', 'reason': 'missing_openai_api_key'})
-        return base
-    payload = build_ai_advisor_payload(audit_obj, selected=selected, workflow_mode=workflow_mode)
-    attempts = 2
-    for attempt in range(1, attempts + 1):
-        try:
-            response = openai_responses_create(
-                instructions=ai_advisor_instructions(),
-                payload=payload,
-                model=config['model'],
-                timeout=config['timeout_seconds'],
-                api_base=config['api_base'],
-            )
-            text = extract_text_from_response_api(response)
-            parsed = coerce_advisor_json(text)
-            if not isinstance(parsed, dict):
-                raise RuntimeError('ai_response_not_json')
-            base.update(parsed)
-            base['status'] = 'ok'
-            if attempt > 1:
-                base['retry_count'] = attempt - 1
-            return base
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode('utf-8', 'replace') if hasattr(e, 'read') else str(e)
-            base.update({'status': 'failed', 'reason': f'http_{e.code}', 'detail': detail[:800]})
-            if attempt > 1:
-                base['retry_count'] = attempt - 1
-            return base
-        except TimeoutError as e:
-            if attempt < attempts:
-                time.sleep(1.5)
-                continue
-            base.update({'status': 'failed', 'reason': type(e).__name__, 'detail': str(e)[:800], 'retry_count': attempt - 1})
-            return base
-        except urllib.error.URLError as e:
-            if 'timed out' in str(e).lower() and attempt < attempts:
-                time.sleep(1.5)
-                continue
-            base.update({'status': 'failed', 'reason': type(e).__name__, 'detail': str(e)[:800]})
-            if attempt > 1:
-                base['retry_count'] = attempt - 1
-            return base
-        except Exception as e:
-            base.update({'status': 'failed', 'reason': type(e).__name__, 'detail': str(e)[:800]})
-            if attempt > 1:
-                base['retry_count'] = attempt - 1
-            return base
-    return base
-
-
-def attach_ai_advisor(audit_obj, selected=None, workflow_mode=None, app_mode=None):
-    if not isinstance(audit_obj, dict):
-        return audit_obj
-    advisor = run_ai_advisor(audit_obj, selected=selected, workflow_mode=workflow_mode, app_mode=app_mode)
-    audit_obj['app_mode'] = normalize_app_mode(app_mode)
-    audit_obj['ai_advisor'] = advisor
-    audit_obj.setdefault('meta', {})['app_mode'] = audit_obj['app_mode']
-    return audit_obj
-
-
-def print_ai_advisor_summary(audit_obj):
-    advisor = (audit_obj or {}).get('ai_advisor') or {}
-    if not advisor:
-        return
-    status = advisor.get('status')
-    if status == 'disabled':
-        return
-    print("\n=== AI advisor ===")
-    if status != 'ok':
-        reason = advisor.get('reason') or 'unavailable'
-        print(f"AI advisor status: {status} ({reason})")
-        return
-    if advisor.get('guided_operator_message'):
-        print(advisor.get('guided_operator_message'))
-    if advisor.get('executive_summary'):
-        print(f"Summary: {advisor.get('executive_summary')}")
-    groups = advisor.get('prioritized_groups') or []
-    if groups:
-        print('Recommended order:')
-        for idx, group in enumerate(groups[:3], start=1):
-            issue_ids = ', '.join(group.get('issue_ids') or [])
-            print(f"{idx}. {group.get('title')} [{group.get('priority')}]")
-            if issue_ids:
-                print(f"   Issues: {issue_ids}")
-            if group.get('rationale'):
-                print(f"   Why now: {group.get('rationale')}")
-    for warning in (advisor.get('warnings') or [])[:3]:
-        print(f"Warning: {warning}")
-
-
-def ai_chat_instructions():
-    return (
-        "You are AgentFence AI in an interactive terminal session. "
-        "Answer as a practical Kubernetes security assistant using only the provided audit context and the user's follow-up question. "
-        "If live cluster, namespace, or workload inventory is present in the provided context, use it directly in your answer. "
-        "Be concise, direct, and actionable. "
-        "Do not invent findings or claim actions were taken when they were not. "
-        "If the user asks whether to apply a fix, explain risks, validation steps, and likely impact."
-    )
-
-
-def openai_text_response(instructions, payload, user_message, model, timeout=60.0, api_base=None):
+def ask_ai_backend(question: str, report_payload: Dict[str, Any], history: List[Dict[str, str]]) -> str:
     api_key, _ = resolve_openai_api_key()
     if not api_key:
-        raise RuntimeError('OpenAI API key is not configured in environment, macOS Keychain, or keyring')
-    body = {
-        'model': model,
-        'instructions': instructions,
-        'input': [
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'input_text',
-                        'text': json.dumps({'context': payload, 'question': user_message}, indent=2, sort_keys=True),
-                    }
-                ],
-            }
-        ],
-        'text': {'format': {'type': 'text'}, 'verbosity': 'low'},
-        'reasoning': {'effort': 'minimal'},
-        'max_output_tokens': 1200,
-    }
-    req = urllib.request.Request(
-        f"{(api_base or AI_API_BASE_DEFAULT).rstrip('/')}/responses",
-        data=json.dumps(body).encode('utf-8'),
-        headers={
-            'Authorization': f'Bearer {api_key}',
-            'Content-Type': 'application/json',
-        },
-        method='POST',
+        return (
+            "AI backend is not configured. AgentFence looked in environment variables, macOS Keychain, "
+            "and Python keyring. The latest AgentFence artifact is loaded and ready for AI analysis."
+        )
+    model = os.environ.get("AGENTFENCE_AI_MODEL") or os.environ.get("AGENTFENCE_OPENAI_MODEL") or "gpt-4.1-mini"
+    context = json.dumps(compact_ai_context(report_payload), indent=2, sort_keys=True)
+    if len(context) > 120000:
+        context = context[:120000] + "\n...<context truncated>"
+    prior = "\n".join(
+        f"{item.get('role', 'user')}: {item.get('content', '')[:1200]}"
+        for item in history[-6:]
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
-
-
-def build_ai_chat_payload(audit_obj, selected=None, workflow_mode='guided', session=None):
-    config = ai_config_from_env('ai')
-    payload = build_ai_advisor_payload(audit_obj, selected=selected, workflow_mode=workflow_mode)
-    advisor = audit_obj.get('ai_advisor') or {}
-    if advisor.get('status') == 'ok':
-        payload['advisor_summary'] = {
-            'executive_summary': advisor.get('executive_summary'),
-            'remediation_overview': advisor.get('remediation_overview'),
-            'prioritized_groups': advisor.get('prioritized_groups'),
-            'warnings': advisor.get('warnings'),
-            'next_steps': advisor.get('next_steps'),
+    prompt_text = (
+        "You are the AgentFence AI analysis backend. Answer the operator's question using only the "
+        "AgentFence report context below. Be concrete about scored findings, review-only findings, "
+        "remediation results, backup/restore state, and evaluation factors when relevant. If the "
+        "report context does not support a claim, say so.\n\n"
+        f"Recent conversation:\n{prior or '<none>'}\n\n"
+        f"AgentFence report context:\n{context}\n\n"
+        f"Operator question: {question}"
+    )
+    body = json.dumps(
+        {
+            "model": model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt_text}],
+                }
+            ],
         }
-    session = session or {}
-    payload['session_state'] = {
-        'phase': session.get('phase'),
-        'cluster': session.get('cluster'),
-        'namespace': session.get('namespace'),
-        'current_action': session.get('action'),
-        'selected_workload': {
-            'workload_kind': (session.get('selected') or {}).get('workload_kind'),
-            'workload_name': (session.get('selected') or {}).get('workload_name'),
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        os.environ.get("AGENTFENCE_OPENAI_BASE_URL", "https://api.openai.com/v1/responses"),
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
         },
-    }
-    payload['available_app_actions'] = [
-        'list_clusters',
-        'use_cluster',
-        'list_namespaces',
-        'use_namespace',
-        'show_workloads',
-        'select_workload',
-        'analyze',
-        'backup',
-        'restore',
-        'fix',
-        'fix_execute',
-        'show_manifest',
-        'status',
-    ]
-    payload['discovered_inventory'] = {
-        'clusters': session.get('available_clusters') or [],
-        'namespaces': session.get('available_namespaces') or [],
-        'workloads': [
-            {
-                'index': idx,
-                'workload_kind': item.get('workload_kind'),
-                'workload_name': item.get('workload_name'),
-                'pod_name': item.get('pod_name'),
-                'selector': item.get('selector') or labels_to_selector(item.get('selector_labels') or {}),
-            }
-            for idx, item in enumerate((session.get('resources') or []), start=1)
-        ],
-    }
-    return config, payload
-
-
-def run_ai_chat_turn(audit_obj, user_message, selected=None, workflow_mode='guided', session=None):
-    config, payload = build_ai_chat_payload(audit_obj, selected=selected, workflow_mode=workflow_mode, session=session)
-    response = openai_text_response(
-        instructions=ai_chat_instructions(),
-        payload=payload,
-        user_message=user_message,
-        model=config['model'],
-        timeout=config['timeout_seconds'],
-        api_base=config['api_base'],
+        method="POST",
     )
-    text = extract_text_from_response_api(response).strip()
-    if text:
-        return text
-    raise RuntimeError('ai_chat_empty_response')
-
-
-def print_ai_chat_help():
-    print("\nAvailable commands:")
-    print("- help")
-    print("- list clusters")
-    print("- use cluster <name>")
-    print("- list namespaces")
-    print("- use namespace <name>")
-    print("- action analyze")
-    print("- action backup-restore")
-    print("- action remediate")
-    print("- action analyze-remediate")
-    print("- select <number>")
-    print("- status")
-    print("- analyze")
-    print("- show manifest")
-    print("- backup")
-    print("- fix")
-    print("- fix --execute")
-    print("- restore")
-    print("- exit")
-
-
-def print_ai_session_status(session):
-    print("\n=== AgentFence AI status ===")
-    print(f"cluster: {session.get('cluster')}")
-    print(f"namespace: {session.get('namespace')}")
-    print(f"phase: {session.get('phase')}")
-    print(f"action: {session.get('action')}")
-    selected = session.get('selected') or {}
-    if selected:
-        print(f"target: {selected.get('workload_kind')}/{selected.get('workload_name')}")
-    if session.get('analyze_result') or session.get('audit_data_collected'):
-        print("analysis: complete")
-    if session.get('backup_result'):
-        print(f"backup: {session['backup_result'].get('status')}")
-    if session.get('fix_result'):
-        print(f"fix: {session['fix_result'].get('status')}")
-    if session.get('manifest_result'):
-        print("manifest: available")
-
-
-def terminal_hyperlink(label, path):
     try:
-        abs_path = os.path.abspath(os.path.expanduser(str(path)))
-        url = Path(abs_path).as_uri()
-        return f"\033]8;;{url}\033\\{label}\033]8;;\033\\ ({abs_path})"
-    except Exception:
-        return f"{label}: {path}"
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:1000]
+        return f"AI backend request failed: HTTP {e.code}: {detail}"
+    except Exception as e:
+        return f"AI backend request failed: {type(e).__name__}: {e}"
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+    parts: List[str] = []
+    for item in data.get("output") or []:
+        for content in item.get("content") or []:
+            text = content.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts).strip() or "AI backend returned no text."
 
 
-def manifest_path_from_result(manifest_result):
-    source_manifest = (manifest_result or {}).get('source_of_truth_manifest')
-    if isinstance(source_manifest, dict):
-        return source_manifest.get('path')
-    if isinstance(source_manifest, str):
-        return source_manifest
-    apply_result = (manifest_result or {}).get('apply_result') or {}
-    source_manifest = apply_result.get('source_of_truth_manifest')
-    if isinstance(source_manifest, dict):
-        return source_manifest.get('path')
-    if isinstance(source_manifest, str):
-        return source_manifest
-    return None
+def prompt(text: str, default: Optional[str] = None) -> str:
+    suffix = f" [{default}]" if default not in (None, "") else ""
+    value = input(f"{text}{suffix}: ").strip()
+    return value or (default or "")
 
 
-def print_manifest_summary(manifest_result):
-    print("\n=== Manifest recommendation ===")
-    if not manifest_result:
-        print("No manifest recommendation is available yet. Run `analyze` first.")
-        return
-    path = manifest_path_from_result(manifest_result)
-    if path:
-        print(f"Source-of-truth manifest: {terminal_hyperlink('Open manifest', path)}")
-    apply_result = manifest_result.get('apply_result') or manifest_result
-    for step in (apply_result.get('executed') or [])[:5]:
-        print(f"- {step.get('step')}: {step.get('command')}")
+class AiPromptExit(SystemExit):
+    pass
 
 
-def print_permanent_fix_explanation(audit_obj, manifest_result):
-    print("\nWhat this permanent fix does:")
-    remediation = ((audit_obj or {}).get('remediation') or {}).get('items') or []
-    issue_ids = [item.get('issue_id') for item in remediation]
-    if not issue_ids:
-        print("- No concrete remediation items were generated for this workload.")
-        return
-    if 'SERVICE_ACCOUNT_TOKEN' in issue_ids:
-        print("- Disables automatic service-account token mounting unless the workload explicitly needs Kubernetes API access.")
-    if 'ROOTFS_RW' in issue_ids:
-        print("- Moves the workload toward a read-only root filesystem, which may require writable paths to be relocated to volumes.")
-    if 'SECCOMP_DISABLED' in issue_ids:
-        print("- Enforces RuntimeDefault seccomp to reduce syscall exposure.")
-    if 'NO_NEW_PRIVS_DISABLED' in issue_ids:
-        print("- Disables privilege escalation in the container security context.")
-    if 'SETID_BINARIES_PRESENT' in issue_ids:
-        print("- Flags that the image should be rebuilt without unnecessary setuid/setgid binaries.")
-    print("- Review the generated manifest in staging, validate app behavior, then promote the same manifest change through your normal deployment workflow.")
+def is_cancel_command(value: str) -> bool:
+    return value.strip().lower() in ("cancel", "back", "main")
 
 
-def print_artifact_summary(analyze_result=None, fix_result=None, manifest_result=None):
-    print("\n=== Downloadable artifacts ===")
-    if analyze_result:
-        outputs = analyze_result.get('outputs') or {}
-        audit_path = outputs.get('audit')
-        if audit_path:
-            print(f"Analyze JSON: {terminal_hyperlink('Open analyze JSON', audit_path)}")
-            print(f"Analyze Markdown: {terminal_hyperlink('Open analyze Markdown', Path(audit_path).with_suffix('.md'))}")
-    if fix_result:
-        fix_outputs = fix_result.get('outputs') or {}
-        fix_path = fix_outputs.get('fix')
-        if fix_path:
-            print(f"Remediation JSON: {terminal_hyperlink('Open remediation JSON', fix_path)}")
-            print(f"Remediation Markdown: {terminal_hyperlink('Open remediation Markdown', Path(fix_path).with_suffix('.md'))}")
-        apply_result = (fix_result.get('fix') or {}).get('apply_result') or fix_result.get('apply_result') or {}
-        backup_bundle = apply_result.get('backup_bundle') or {}
-        backup_manifest = backup_bundle.get('manifest')
-        backup_dir = backup_bundle.get('directory')
-        if backup_manifest:
-            print(f"Rollback bundle manifest: {terminal_hyperlink('Open rollback bundle manifest', backup_manifest)}")
-        if backup_dir:
-            print(f"Rollback bundle directory: {terminal_hyperlink('Open rollback bundle directory', backup_dir)}")
-    if manifest_result:
-        manifest_path = manifest_path_from_result(manifest_result)
-        if manifest_path:
-            print(f"Manifest recommendation: {terminal_hyperlink('Open manifest recommendation', manifest_path)}")
+def is_exit_command(value: str) -> bool:
+    return value.strip().lower() in ("exit", "quit", "q")
 
 
-def print_ai_analyze_completion_summary(audit_obj):
-    print("\n=== Summary ===")
-    meta = (audit_obj or {}).get('meta') or {}
-    remediation = ((audit_obj or {}).get('remediation') or {}).get('items') or []
-    issue_ids = [item.get('issue_id') for item in remediation if item.get('issue_id')]
-    risk = (audit_obj or {}).get('risk_score') or {}
-    print(f"Analyzed {meta.get('workload_kind') or 'workload'}/{meta.get('workload_name') or 'unknown'} in namespace {meta.get('namespace') or 'unknown'}.")
-    print(f"Found {len(remediation)} security issue(s); risk score is {risk.get('total', 0)} ({risk.get('band', 'unknown')}).")
-    if issue_ids:
-        print(f"Important findings: {', '.join(issue_ids)}")
-
-
-def print_ai_remediation_completion_summary(audit_obj, fix_result, analyze_ran=False):
-    print("\n=== Summary ===")
-    meta = (audit_obj or {}).get('meta') or {}
-    status = (fix_result or {}).get('status') or 'unknown'
-    apply_result = ((fix_result or {}).get('apply_result') or {})
-    executed = (apply_result.get('executed') or [])
-    health = ((fix_result or {}).get('post_fix_health') or {}).get('status')
-    revalidated = apply_result.get('post_fix_revalidation') or {}
-    post_risk = revalidated.get('risk_score') or (compute_risk_score(revalidated) if revalidated and not revalidated.get('error') else None)
-    post_risk_suffix = " (partially verified)" if revalidated.get('risk_score_unverified') else ""
-    if not post_risk:
-        post_risk = (audit_obj or {}).get('risk_score') or compute_risk_score(audit_obj or {})
-    action_text = "Analyzed and remediated" if analyze_ran else "Remediated"
-    print(f"{action_text} {meta.get('workload_kind') or 'workload'}/{meta.get('workload_name') or 'unknown'} in namespace {meta.get('namespace') or 'unknown'}.")
-    print(f"Remediation status: {status}.")
-    if executed:
-        print(f"Applied {len(executed)} change step(s).")
-    else:
-        print("No in-cluster changes were applied.")
-    print(f"Recalculated risk score after remediation: {post_risk.get('total', 0)} ({post_risk.get('band', 'unknown')}){post_risk_suffix}.")
-    if health:
-        print(f"Post-fix health: {health}.")
-
-
-def print_ai_intake_intro(session):
-    print("\n=== AgentFence AI chat ===")
-    print("I can help you analyze and remediate a workload.")
-    print("We'll first set the cluster, namespace, and target workload from inside this chat.")
-    detected_cluster = session.get('detected_cluster')
-    detected_namespace = session.get('detected_namespace')
-    if detected_cluster:
-        print(f"Detected current cluster: {detected_cluster}")
-    if detected_namespace:
-        print(f"Detected current namespace: {detected_namespace}")
-    print("Try `list clusters` or `use cluster <name>`, or `help`.")
-
-
-def print_workload_selection_prompt(session):
-    resources = session.get('resources') or []
-    print_resource_list(resources, title='Available workloads')
-    if resources:
-        print("Select a workload with `select 1` or another number from the list above.")
-    else:
-        print("No workloads were discovered. Check the cluster and namespace selection, then try again.")
-
-
-def print_namespaces_prompt(session):
-    namespaces = session.get('available_namespaces') or []
-    print("\nAvailable namespaces:")
-    if namespaces:
-        for idx, name in enumerate(namespaces, start=1):
-            print(f"{idx}. {name}")
-    else:
-        print("No namespaces could be listed automatically. Use `use namespace <name>`.")
-
-
-def print_action_prompt(session):
-    current_action = session.get('action')
-    if current_action:
-        print(f"\nSelected action: {current_action}")
-    else:
-        print("\nAvailable actions:")
-        print("- Analyze")
-        print("- Backup & Restore")
-        print("- Remediate")
-        print("- Analyze & Remediate")
-        return
-    print("Available actions:")
-    print("- Analyze")
-    print("- Backup & Restore")
-    print("- Remediate")
-    print("- Analyze & Remediate")
-
-
-def print_action_and_workloads(session):
-    print_action_prompt(session)
-    resources = discover_ai_workloads(session)
-    if session.get('selected'):
-        return
-    print_workload_selection_prompt(session)
-
-
-def execute_ai_selected_action(session):
-    action = session.get('action') or 'analyze'
-    cluster = session.get('cluster')
-    namespace = session.get('namespace')
-    selected = session.get('selected') or {}
-    timeout = session.get('timeout', 2.0)
-    if action == 'analyze':
-        result = guided_analyze_mode(cluster, namespace, selected, timeout=timeout, allow_prompt_for_attacker=True, app_mode='ai', start_chat=False)
-        session['analyze_result'] = result
-        session['audit'] = result.get('audit')
-        session['audit_data_collected'] = True
-        session['manifest_result'] = result.get('manifest_result')
-        session['phase'] = 'post_analysis'
-        print("\nRecommended next step:")
-        print("Enter `remediate` to fix issues in the cluster. It automatically creates a backup before applying changes.")
-        print("")
-        print("This is a useful way to verify that your agentic AI workload continues to run correctly after remediation.")
-        print("")
-        print("Later, you can use the manifest YAML file to make the changes permanent in your source automation, such as Git.")
-        return True
-    if action == 'backup-restore':
-        result = guided_backup_restore_mode(cluster, namespace, selected, action='backup', bundle_dir=session.get('restore_bundle_dir'))
-        session['backup_result'] = result
-        persisted = (result.get('backup_bundle') or {}).get('directory')
-        if persisted:
-            session['restore_bundle_dir'] = persisted
-        session['phase'] = 'post_backup'
-        print("\nRecommended next step: run `restore` if you need to roll back later, or switch action to `analyze` / `remediate` and continue.")
-        return True
-    if action == 'remediation':
-        result = guided_remediation_mode(cluster, namespace, selected, timeout=timeout, analyze_first=True, app_mode='ai', start_chat=False)
-        session['fix_result'] = result.get('fix')
-        session['audit'] = result.get('audit')
-        session['audit_data_collected'] = True
-        session['phase'] = 'post_remediation'
-        print("\nRecommended next step: review post-fix health above. If the workload regressed, run `restore`.")
-        return True
-    if action == 'analyze-remediation':
-        analyze_result = guided_analyze_mode(cluster, namespace, selected, timeout=timeout, allow_prompt_for_attacker=True, app_mode='ai', start_chat=False)
-        remediation_result = guided_remediation_mode(cluster, namespace, selected, timeout=timeout, analyze_first=False, app_mode='ai', start_chat=False, analyze_bundle_override=analyze_result)
-        session['analyze_result'] = analyze_result
-        session['fix_result'] = remediation_result.get('fix')
-        session['audit'] = remediation_result.get('audit') or analyze_result.get('audit')
-        session['audit_data_collected'] = True
-        session['manifest_result'] = analyze_result.get('manifest_result')
-        session['phase'] = 'post_remediation'
-        print("\nRecommended next step: review post-fix health above. If the workload regressed, run `restore`.")
-        return True
-    print(f"Unsupported action: {action}")
-    return True
-
-
-def discover_ai_workloads(session):
-    resources = [r for r in list_candidate_resources(session['namespace']) if not is_attacker_resource(r)]
-    session['resources'] = resources
-    if len(resources) == 1:
-        session['selected'] = resources[0]
-        session['phase'] = 'ready_for_analysis'
-    else:
-        session['selected'] = None
-        session['phase'] = 'awaiting_workload_selection'
-    return resources
-
-
-def list_clusters():
-    current = current_cluster_name()
-    if has_kubectl():
-        rc, out = shell_rc("kubectl config view -o json", timeout=15)
-        if rc == 0:
-            try:
-                obj = json.loads(out)
-                names = []
-                seen = set()
-                for ctx in (obj.get('contexts') or []):
-                    cluster_name = get_nested(ctx, 'context', 'cluster')
-                    if cluster_name and cluster_name not in seen:
-                        seen.add(cluster_name)
-                        names.append(cluster_name)
-                if names:
-                    if current and current in names:
-                        names = [current] + [name for name in names if name != current]
-                    return names
-            except Exception:
-                pass
-    if current:
-        return [current]
-    return []
-
-
-def resolve_cluster_input(value, session=None):
-    raw = (value or '').strip()
-    if not raw:
+def prompt_interactive(text: str, default: Optional[str] = None, allow_cancel: bool = True) -> Optional[str]:
+    value = prompt(text, default)
+    if is_exit_command(value):
+        raise AiPromptExit(0)
+    if allow_cancel and is_cancel_command(value):
         return None
-    clusters = list((session or {}).get('available_clusters') or [])
-    if not clusters:
-        clusters = list_clusters()
-        if session is not None:
-            session['available_clusters'] = clusters
-    if raw.isdigit():
-        idx = int(raw)
-        if 1 <= idx <= len(clusters):
-            return clusters[idx - 1]
-    raw_lower = raw.lower()
-    exact_matches = []
-    for name in clusters:
-        lowered = (name or '').lower()
-        if lowered == raw_lower:
-            exact_matches.append(name)
-    if exact_matches:
-        return exact_matches[0]
-    partial_matches = [name for name in clusters if raw_lower in (name or '').lower()]
-    if len(partial_matches) == 1:
-        return partial_matches[0]
-    return raw
+    return value
 
 
-def safe_resolve_cluster_or_current(value, session=None):
-    resolved = resolve_cluster_input(value, session=session)
-    try:
-        return ensure_cluster_matches(resolved)
-    except RuntimeError:
-        current = current_cluster_name()
-        if current:
-            lowered = (str(value or '').strip().lower())
-            if lowered and lowered in current.lower():
-                return current
-        raise
+def prompt_yes_no(text: str, default: bool = False, allow_cancel: bool = True) -> Optional[bool]:
+    default_text = "yes" if default else "no"
+    while True:
+        value = prompt_interactive(text, default_text, allow_cancel=allow_cancel)
+        if value is None:
+            return None
+        folded = value.strip().lower()
+        if folded in ("y", "yes"):
+            return True
+        if folded in ("n", "no"):
+            return False
+        print("Please answer yes or no, or type cancel / exit.")
 
 
-def resolve_namespace_input(value, session=None):
-    raw = (value or '').strip()
-    if not raw:
+def print_node_runtime_preflight(audit: Dict[str, Any]) -> None:
+    status = str(audit.get("status") or "unknown")
+    node = str(audit.get("node") or "unknown")
+    runtime = audit.get("runtime") or {}
+    runtime_label = runtime.get("runtime_class") or runtime.get("handler") or runtime.get("family") or "default"
+    if status == "already_hardened":
+        print(f"\nNode runtime hardening preflight: {node} already satisfies the AgentFence baseline for runtime {runtime_label}.")
+        print("No node-level hardening prompt is needed for this run.")
+        return
+    print(f"\nNode runtime hardening preflight: changes may be needed on {node} for runtime {runtime_label}.")
+    reasons = audit.get("change_reasons") or []
+    for reason in reasons[:8]:
+        print(f"- {reason}")
+    if not reasons:
+        print("- AgentFence could not fully verify node hardening state, so operator confirmation is required before node changes.")
+
+
+def prompt_ai_node_runtime_hardening(audit: Optional[Dict[str, Any]] = None) -> bool:
+    if audit:
+        print_node_runtime_preflight(audit)
+        if audit.get("status") == "already_hardened" and not audit.get("changes_needed"):
+            return False
+    print("\nNode runtime hardening options:")
+    print("1. Enable guest seccomp")
+    print("2. Restrict kernel dmesg")
+    print("3. Restrict perf_event_open")
+    print("4. Disable unprivileged BPF")
+    print("5. Restrict unprivileged userfaultfd")
+    print("all. Apply all node runtime hardening")
+    print("0. Skip node runtime hardening")
+    print("")
+    print("These options may change node/runtime settings on the target node. Guest seccomp can restart containerd and recreate the workload pod; sysctl options apply node-wide immediately.")
+    print("This can affect other workloads using the same node/runtime handler.")
+    while True:
+        selected = prompt_interactive("Node runtime hardening option", "0", allow_cancel=True)
+        if selected is None:
+            print("Node runtime hardening cancelled for this run.")
+            return False
+        value = selected.strip().lower()
+        if value in ("0", "skip", "no", "none"):
+            return False
+        if value in ("1", "2", "3", "4", "5", "all", "a", "yes", "y", "enable guest seccomp", "guest seccomp", "seccomp"):
+            confirmed = prompt_yes_no("Apply selected node runtime hardening?", default=False, allow_cancel=True)
+            return bool(confirmed)
+        print("Please choose 1-5, all, 0 to skip, or type cancel / exit.")
+
+
+def prompt_choice(text: str, choices: List[str], default: Optional[str] = None) -> str:
+    folded = {c.lower(): c for c in choices}
+    aliases = {
+        "fix": "remediation",
+        "remediate": "remediation",
+        "analyze and remediate": "analyze-remediation",
+        "analyze-remediate": "analyze-remediation",
+        "analyze remediation": "analyze-remediation",
+        "ar": "analyze-remediation",
+        "backup": "backup-namespace",
+        "restore": "restore-namespace",
+    }
+    while True:
+        raw = prompt(f"{text} ({' | '.join(choices)})", default)
+        key = aliases.get(raw.lower(), raw.lower())
+        if key in folded:
+            return folded[key]
+        print(f"Please choose one of: {', '.join(choices)}")
+
+
+def list_namespaces(kubeconfig: str) -> List[str]:
+    data = kubectl_get_json(kubeconfig, ["get", "namespaces"])
+    names = [
+        str(((item.get("metadata") or {}).get("name")) or "")
+        for item in (data or {}).get("items", [])
+    ]
+    return sorted(n for n in names if n)
+
+
+def resolve_namespace(selection: str, namespaces: List[str]) -> Optional[str]:
+    value = selection.strip()
+    if not value:
         return None
-    namespaces = list((session or {}).get('available_namespaces') or [])
-    if not namespaces and (session or {}).get('cluster'):
-        namespaces = list_namespaces()
-        if session is not None:
-            session['available_namespaces'] = namespaces
-    if raw.isdigit():
-        idx = int(raw)
+    if value.isdigit():
+        idx = int(value)
         if 1 <= idx <= len(namespaces):
             return namespaces[idx - 1]
-    raw_lower = raw.lower()
-    exact_matches = []
-    for name in namespaces:
-        lowered = (name or '').lower()
-        if lowered == raw_lower:
-            exact_matches.append(name)
-    if exact_matches:
-        return exact_matches[0]
-    partial_matches = [name for name in namespaces if raw_lower in (name or '').lower()]
-    if len(partial_matches) == 1:
-        return partial_matches[0]
-    return raw
-
-
-def resolve_workload_input(value, session=None):
-    raw = (value or '').strip()
-    if not raw:
-        return None
-    resources = list((session or {}).get('resources') or [])
-    if raw.isdigit():
-        idx = int(raw)
-        if 1 <= idx <= len(resources):
-            return resources[idx - 1]
-    raw_lower = raw.lower()
-    exact_matches = []
-    for item in resources:
-        workload_name = (item.get('workload_name') or '').lower()
-        pod_name = (item.get('pod_name') or '').lower()
-        if raw_lower in (workload_name, pod_name):
-            exact_matches.append(item)
-    if exact_matches:
-        return exact_matches[0]
-    partial_matches = []
-    for item in resources:
-        workload_name = (item.get('workload_name') or '').lower()
-        pod_name = (item.get('pod_name') or '').lower()
-        if raw_lower and (raw_lower in workload_name or raw_lower in pod_name):
-            partial_matches.append(item)
-    if len(partial_matches) == 1:
-        return partial_matches[0]
-    return None
-
-
-def resolve_namespace_from_free_text(value, session=None):
-    raw = (value or '').strip().lower()
-    if not raw:
-        return None
-    namespaces = list((session or {}).get('available_namespaces') or [])
-    if not namespaces and (session or {}).get('cluster'):
-        namespaces = list_namespaces()
-        if session is not None:
-            session['available_namespaces'] = namespaces
-    tokens = [tok for tok in re.split(r'[^a-z0-9-]+', raw) if tok]
-    matches = []
-    for name in namespaces:
-        lowered = (name or '').lower()
-        if raw in lowered:
-            matches.append(name)
-            continue
-        if any(tok and tok in lowered for tok in tokens):
-            matches.append(name)
-    matches = list(dict.fromkeys(matches))
+    for namespace in namespaces:
+        if namespace == value:
+            return namespace
+    matches = [namespace for namespace in namespaces if value.lower() in namespace.lower()]
     if len(matches) == 1:
         return matches[0]
     return None
 
 
-def resolve_workload_from_free_text(value, session=None):
-    raw = (value or '').strip().lower()
-    if not raw:
-        return None
-    resources = list((session or {}).get('resources') or [])
-    tokens = [tok for tok in re.split(r'[^a-z0-9-]+', raw) if tok]
-    matches = []
-    for item in resources:
-        workload_name = (item.get('workload_name') or '').lower()
-        pod_name = (item.get('pod_name') or '').lower()
-        joined = f"{workload_name} {pod_name}"
-        if raw in joined or any(tok and tok in joined for tok in tokens):
-            matches.append(item)
-    deduped = []
-    seen = set()
-    for item in matches:
-        key = (item.get('workload_name'), item.get('pod_name'))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(item)
-    matches = deduped
-    if len(matches) == 1:
-        return matches[0]
-    return None
+def print_namespaces(kubeconfig: str) -> List[str]:
+    names = list_namespaces(kubeconfig)
+    print("\nAvailable namespaces:")
+    if not names:
+        print("  <none found>")
+        return []
+    for idx, name in enumerate(names, start=1):
+        print(f"{idx}. {name}")
+    return names
 
 
-def ai_command_interpreter_instructions():
-    return (
-        "Map the user's terminal message into an AgentFence command intent. "
-        "Use the provided session inventory and phase. "
-        "Return JSON only. "
-        "Prefer mapping the message to one of the app's available actions whenever reasonably possible. "
-        "If the user is asking to move the workflow forward, choose the most appropriate app action instead of returning chat. "
-        "If the message is a normal security question rather than a workflow command or workflow choice, return intent=chat. "
-        "Prefer deterministic actions when the user appears to be choosing a listed cluster, namespace, or workload by number or by exact name. "
-        "Allowed intents: help, list_clusters, use_cluster, list_namespaces, use_namespace, show_workloads, select_workload, status, analyze, show_manifest, backup, fix, fix_execute, restore, exit, chat."
-    )
+def prompt_namespace_choice(kubeconfig: str, default: str = "", allow_cancel: bool = True) -> Optional[str]:
+    names = print_namespaces(kubeconfig)
+    if not names:
+        return prompt_interactive("Namespace", default, allow_cancel=allow_cancel)
+    while True:
+        selected = prompt_interactive("Namespace name or number", default, allow_cancel=allow_cancel)
+        if selected is None:
+            return None
+        resolved = resolve_namespace(selected, names)
+        if resolved:
+            return resolved
+        print("Please choose a namespace by number or name, or type cancel / exit.")
 
 
-def ai_command_response_format():
-    return {
-        'type': 'json_schema',
-        'name': 'agentfence_ai_command',
-        'schema': {
-            'type': 'object',
-            'additionalProperties': False,
-            'properties': {
-                'intent': {'type': 'string'},
-                'target_type': {'type': 'string'},
-                'target_value': {'type': 'string'},
-            },
-            'required': ['intent', 'target_type', 'target_value'],
-        },
+AI_ACTION_CHOICES = [
+    "Analyze",
+    "Remediation",
+    "Analyze&Remediation",
+    "Backup",
+    "Restore",
+]
+
+
+def resolve_ai_action(selection: str) -> Optional[str]:
+    raw = selection.strip()
+    numeric_map = {
+        "1": "analyze",
+        "2": "remediation",
+        "3": "analyze-remediation",
+        "4": "backup-namespace",
+        "5": "restore-namespace",
     }
-
-
-def interpret_ai_command_with_llm(session, user_message):
-    config, payload = build_ai_chat_payload((session.get('audit') or {}), selected=session.get('selected'), workflow_mode='guided', session=session)
-    payload['command_request'] = user_message
-    body = {
-        'model': config['model'],
-        'instructions': ai_command_interpreter_instructions(),
-        'input': [
-            {
-                'role': 'user',
-                'content': [{'type': 'input_text', 'text': json.dumps(payload, indent=2, sort_keys=True)}],
-            }
-        ],
-        'text': {'format': ai_command_response_format(), 'verbosity': 'low'},
-        'reasoning': {'effort': 'minimal'},
-        'max_output_tokens': 300,
+    if raw in numeric_map:
+        return numeric_map[raw]
+    norm = re.sub(r"[^a-z]+", "", selection.lower())
+    action_map = {
+        "analyze": "analyze",
+        "analysis": "analyze",
+        "remediation": "remediation",
+        "remediate": "remediation",
+        "fix": "remediation",
+        "analyzeremediation": "analyze-remediation",
+        "analyzeremediate": "analyze-remediation",
+        "analyzeandremediation": "analyze-remediation",
+        "analyzeandremediate": "analyze-remediation",
+        "ar": "analyze-remediation",
+        "backup": "backup-namespace",
+        "backupnamespace": "backup-namespace",
+        "restore": "restore-namespace",
+        "restorenamespace": "restore-namespace",
     }
-    api_key, _ = resolve_openai_api_key()
-    req = urllib.request.Request(
-        f"{AI_API_BASE_DEFAULT.rstrip('/')}/responses",
-        data=json.dumps(body).encode('utf-8'),
-        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-        method='POST',
-    )
-    with urllib.request.urlopen(req, timeout=config['timeout_seconds']) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-    text = extract_text_from_response_api(data).strip()
-    if not text:
-        return None
+    return action_map.get(norm)
+
+
+def print_ai_action_choices() -> None:
+    print("\nWhat would you like AgentFence to run?")
+    for idx, label in enumerate(AI_ACTION_CHOICES, start=1):
+        print(f"{idx}. {label}")
+
+
+def prompt_ai_action_choice(allow_cancel: bool = True) -> Optional[str]:
+    while True:
+        print_ai_action_choices()
+        selected = prompt_interactive("Action name or number", allow_cancel=allow_cancel)
+        if selected is None:
+            return None
+        action = resolve_ai_action(selected)
+        if action:
+            return action
+        print("Please choose Analyze, Remediation, Analyze&Remediation, Backup, or Restore; or type cancel / exit.")
+
+
+def run_kubectl_config(kubeconfig: str, args: List[str], timeout: int = 15) -> Tuple[int, str, str]:
+    """Read kubectl-visible context metadata without changing current-context or saved state.
+
+    Discovery intentionally ignores --kubeconfig so every AI-mode session sees
+    the operator's current kubectl environment fresh at runtime.
+    """
+    del kubeconfig
+    cmd = kubectl_base("") + ["config"] + args
     try:
-        return json.loads(text)
-    except Exception:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except Exception as e:
+        return 1, "", f"{type(e).__name__}: {e}"
+
+
+def list_kube_contexts(kubeconfig: str) -> List[str]:
+    rc, out, _ = run_kubectl_config(kubeconfig, ["get-contexts", "-o", "name"], timeout=15)
+    if rc != 0:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def saved_current_context(kubeconfig: str) -> str:
+    rc, out, _ = run_kubectl_config(kubeconfig, ["current-context"], timeout=15)
+    return (out or "").strip() if rc == 0 else ""
+
+
+def kubectl_cluster_reachable(kubeconfig: str) -> Tuple[bool, str]:
+    rc, out, err = run_kubectl(kubeconfig, ["cluster-info"], timeout=20)
+    detail = (out or err or f"kubectl exited {rc}").strip()
+    return rc == 0, detail
+
+
+def kubeconfig_status(kubeconfig: str) -> str:
+    if not kubeconfig:
+        return "discovery is using kubectl default runtime configuration"
+    expanded = os.path.expanduser(kubeconfig)
+    if os.path.exists(expanded):
+        return f"run kubeconfig supplied: {expanded}; discovery still uses kubectl default runtime configuration"
+    return f"run kubeconfig file not found: {expanded}; discovery still uses kubectl default runtime configuration"
+
+
+def resolve_kube_context(selection: str, contexts: List[str]) -> Optional[str]:
+    value = selection.strip()
+    if not value:
         return None
+    if value.isdigit():
+        idx = int(value)
+        if 1 <= idx <= len(contexts):
+            return contexts[idx - 1]
+    for ctx in contexts:
+        if ctx == value:
+            return ctx
+    matches = [ctx for ctx in contexts if value.lower() in ctx.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
-def run_ai_session_command(session, user_message):
-    command = user_message.strip()
-    command_lower = command.lower()
-    selected = session.get('selected') or {}
-    cluster = session.get('cluster')
-    namespace = session.get('namespace')
-    timeout = session.get('timeout', 2.0)
-    bundle_dir = session.get('restore_bundle_dir')
-    if (
-        session.get('namespace')
-        and not session.get('selected')
-        and session.get('resources')
-        and len(session.get('resources') or []) == 1
-        and any(token in command_lower for token in ('inspect', 'analy', 'analyze', 'review the target', 'inspect the target', 'go ahead'))
-    ):
-        session['selected'] = (session.get('resources') or [None])[0]
-        session['phase'] = 'ready_for_analysis'
-        session['action'] = 'analyze'
-        selected_obj = session['selected']
-        print(f"\nSelected workload: {selected_obj.get('workload_kind')}/{selected_obj.get('workload_name')}")
-        return execute_ai_selected_action(session)
-    if command.isdigit():
-        return run_ai_session_command(session, f'choose {command}')
-    if command == 'help':
-        print_ai_chat_help()
-        return True
-    if command_lower in ('list clusters', 'list cluster', 'show clusters', 'show cluster'):
-        clusters = list_clusters()
-        session['available_clusters'] = clusters
-        print("\nAvailable clusters:")
-        if clusters:
-            for idx, name in enumerate(clusters, start=1):
-                print(f"{idx}. {name}")
+def print_kube_contexts(kubeconfig: str) -> List[str]:
+    contexts = list_kube_contexts(kubeconfig)
+    current = saved_current_context(kubeconfig)
+    print("\nAvailable Kubernetes clusters/contexts:")
+    print(f"  {kubeconfig_status(kubeconfig)}")
+    if not contexts:
+        reachable, detail = kubectl_cluster_reachable(kubeconfig)
+        print("  <no named contexts found>")
+        if reachable:
+            print("  kubectl can still reach a cluster without a named context.")
         else:
-            print("No clusters could be discovered automatically. Use `use cluster <name>`.")
-        return True
-    if command_lower.startswith('use cluster ') or command_lower.startswith('select cluster ') or command_lower.startswith('choose cluster '):
-        if command_lower.startswith('use cluster '):
-            value = command[len('use cluster '):].strip()
-        elif command_lower.startswith('select cluster '):
-            value = command[len('select cluster '):].strip()
-        else:
-            value = command[len('choose cluster '):].strip()
-        if not value:
-            print("Provide a cluster name, for example `use cluster kubernetes`.")
-            return True
-        try:
-            resolved = safe_resolve_cluster_or_current(value, session=session)
-        except RuntimeError as e:
-            print(f"{e}")
-            print("Try `list clusters` and choose one of the discovered options.")
-            return True
-        session['cluster'] = resolved
-        if session.get('phase') == 'awaiting_cluster':
-            session['phase'] = 'awaiting_namespace'
-        print(f"\nUsing cluster: {resolved}")
-        session['available_namespaces'] = list_namespaces()
-        print_namespaces_prompt(session)
-        return True
-    if command_lower.startswith('choose '):
-        choice = command[len('choose '):].strip()
-        if not session.get('cluster'):
-            if choice:
-                try:
-                    resolved = safe_resolve_cluster_or_current(choice, session=session)
-                except RuntimeError as e:
-                    print(f"{e}")
-                    print("Try `list clusters` and choose one of the discovered options.")
-                    return True
-                session['cluster'] = resolved
-                session['phase'] = 'awaiting_namespace'
-                print(f"\nUsing cluster: {resolved}")
-                session['available_namespaces'] = list_namespaces()
-                print_namespaces_prompt(session)
-                return True
-        namespaces = session.get('available_namespaces') or []
-        if namespaces and session.get('cluster') and (not session.get('namespace') or not (session.get('resources') or [])):
-            selected_namespace = resolve_namespace_input(choice, session=session)
-            if selected_namespace:
-                session['namespace'] = selected_namespace
-                session['phase'] = 'awaiting_action'
-                session['action'] = None
-                print(f"\nUsing namespace: {selected_namespace}")
-                print_action_and_workloads(session)
-                return True
-        resources = session.get('resources') or []
-        if resources:
-            resolved_workload = resolve_workload_input(choice, session=session)
-            if resolved_workload:
-                session['selected'] = resolved_workload
-                session['phase'] = 'ready_for_analysis'
-                selected_obj = session['selected']
-                print(f"\nSelected workload: {selected_obj.get('workload_kind')}/{selected_obj.get('workload_name')}")
-                if session.get('action'):
-                    return execute_ai_selected_action(session)
-                print_action_prompt(session)
-                return True
-        # Let the GPT-backed command interpreter try to map this ambiguous choice
-        # against the currently available clusters, namespaces, or workloads.
-    if session.get('cluster') and not session.get('namespace'):
-        selected_namespace = resolve_namespace_from_free_text(command, session=session)
-        if selected_namespace:
-            session['namespace'] = selected_namespace
-            session['phase'] = 'awaiting_action'
-            session['action'] = None
-            print(f"\nUsing namespace: {selected_namespace}")
-            print_action_and_workloads(session)
-            return True
-    if session.get('namespace') and not session.get('selected') and (session.get('resources') or []):
-        resolved_workload = resolve_workload_from_free_text(command, session=session)
-        if resolved_workload:
-            session['selected'] = resolved_workload
-            session['phase'] = 'ready_for_analysis'
-            selected_obj = session['selected']
-            print(f"\nSelected workload: {selected_obj.get('workload_kind')}/{selected_obj.get('workload_name')}")
-            if session.get('action'):
-                return execute_ai_selected_action(session)
-            print_action_prompt(session)
-            return True
-    if command_lower in ('list namespaces', 'list namespace', 'show namespaces', 'show namespace'):
-        if not session.get('cluster'):
-            print("Set a cluster first with `use cluster <name>` or `choose <number>` from `list clusters`.")
-            return True
-        namespaces = list_namespaces()
-        session['available_namespaces'] = namespaces
-        print("\nAvailable namespaces:")
-        if namespaces:
-            for idx, name in enumerate(namespaces, start=1):
-                print(f"{idx}. {name}")
-        else:
-            print("No namespaces could be listed automatically. Use `use namespace <name>`.")
-        return True
-    if command_lower.startswith('list namespace for ') or command_lower.startswith('list namespaces for '):
-        if command_lower.startswith('list namespace for '):
-            value = command[len('list namespace for '):].strip()
-        else:
-            value = command[len('list namespaces for '):].strip()
-        try:
-            resolved = safe_resolve_cluster_or_current(value, session=session)
-        except RuntimeError as e:
-            print(f"{e}")
-            print("Try `list clusters` and choose one of the discovered options.")
-            return True
-        session['cluster'] = resolved
-        session['phase'] = 'awaiting_namespace'
-        session['available_namespaces'] = list_namespaces()
-        print(f"\nUsing cluster: {resolved}")
-        print_namespaces_prompt(session)
-        return True
-    if command.startswith('use namespace '):
-        value = command[len('use namespace '):].strip()
-        if not value:
-            print("Provide a namespace name, for example `use namespace sandbox-cua`.")
-            return True
-        if not session.get('cluster'):
-            print("Set a cluster first with `use cluster <name>`.")
-            return True
-        session['namespace'] = value
-        if session.get('phase') in ('awaiting_cluster', 'awaiting_namespace'):
-            session['phase'] = 'awaiting_action'
-        session['action'] = None
-        print(f"\nUsing namespace: {value}")
-        print_action_and_workloads(session)
-        return True
-    if command_lower in ('backup & restore', 'backup and restore', 'backup-restore', 'remediate', 'analyze and remediate', 'analyze-remediate', 'analyze-remediation'):
-        if command_lower in ('backup & restore', 'backup and restore', 'backup-restore'):
-            session['action'] = 'backup-restore'
-        elif command_lower == 'remediate':
-            session['action'] = 'remediation'
-        else:
-            session['action'] = 'analyze-remediation'
-        if session.get('selected'):
-            return execute_ai_selected_action(session)
-        if session.get('namespace'):
-            print_action_and_workloads(session)
-        else:
-            print_action_prompt(session)
-        return True
-    if command_lower.startswith('action '):
-        value = command[len('action '):].strip().lower()
-        if value in ('analyze', 'analysis'):
-            session['action'] = 'analyze'
-        elif value in ('backup-restore', 'backup & restore', 'backup and restore', 'backup', 'backuprestore'):
-            session['action'] = 'backup-restore'
-        elif value in ('remediate', 'remediation'):
-            session['action'] = 'remediation'
-        elif value in ('analyze-remediate', 'analyze and remediate', 'analyze-remediation'):
-            session['action'] = 'analyze-remediation'
-        else:
-            print("Use `action analyze`, `action backup-restore`, `action remediate`, or `action analyze-remediate`.")
-            return True
-        if session.get('selected'):
-            return execute_ai_selected_action(session)
-        if session.get('namespace'):
-            print_action_and_workloads(session)
-        else:
-            print_action_prompt(session)
-        return True
-    if command == 'show workloads':
-        print_workload_selection_prompt(session)
-        return True
-    if command.startswith('select '):
-        raw_idx = command[len('select '):].strip()
-        resources = session.get('resources') or []
-        if resources:
-            resolved_workload = resolve_workload_input(raw_idx, session=session)
-            if resolved_workload:
-                session['selected'] = resolved_workload
-                session['phase'] = 'ready_for_analysis'
-                selected_obj = session['selected']
-                print(f"\nSelected workload: {selected_obj.get('workload_kind')}/{selected_obj.get('workload_name')}")
-                if session.get('action'):
-                    return execute_ai_selected_action(session)
-                print_action_prompt(session)
-                return True
-        namespaces = session.get('available_namespaces') or []
-        if namespaces and session.get('cluster') and (not session.get('namespace') or not resources):
-            selected_namespace = resolve_namespace_input(raw_idx, session=session)
-            if selected_namespace:
-                session['namespace'] = selected_namespace
-                session['phase'] = 'awaiting_action'
-                session['action'] = None
-                print(f"\nUsing namespace: {selected_namespace}")
-                print_action_and_workloads(session)
-                return True
-        if not resources:
-            print("No workloads are loaded yet. Pick a namespace first, or try the selection again.")
-            return True
-        # Fall through so GPT can try to map partial or fuzzy workload choices.
-    if command == 'status':
-        print_ai_session_status(session)
-        return True
-    if command == 'analyze':
-        if not cluster or not namespace:
-            print("Set cluster and namespace first.")
-            return True
-        if not selected:
-            resources = session.get('resources') or discover_ai_workloads(session)
-            if len(resources) == 1:
-                session['selected'] = resources[0]
-                session['phase'] = 'ready_for_analysis'
-                selected = session['selected']
-                print(f"\nSelected workload: {selected.get('workload_kind')}/{selected.get('workload_name')}")
+            print("  kubectl could not reach a cluster yet.")
+            if shutil.which("kubectl"):
+                print(f"  diagnostic: {detail[:500]}")
             else:
-                print_workload_selection_prompt(session)
-                return True
-        session['action'] = 'analyze'
-        return execute_ai_selected_action(session)
-    if command == 'show manifest':
-        print_manifest_summary(session.get('manifest_result'))
-        return True
-    if command == 'backup':
-        result = guided_backup_restore_mode(cluster, namespace, selected, action='backup', bundle_dir=None)
-        session['backup_result'] = result
-        persisted = (result.get('backup_bundle') or {}).get('directory')
-        if persisted:
-            session['restore_bundle_dir'] = persisted
-        print("\nRecommended next step: run `fix --execute` to apply supported fixes with rollback artifacts and post-fix validation.")
-        return True
-    if command == 'fix':
-        print("\nUse `fix --execute` to apply supported fixes. Review the manifest recommendation first with `show manifest` and create a backup with `backup`.")
-        return True
-    if command == 'fix --execute':
-        result = guided_remediation_mode(cluster, namespace, selected, timeout=timeout, analyze_first=False, app_mode='ai', start_chat=False, analyze_bundle_override=session.get('analyze_result'))
-        session['fix_result'] = result.get('fix')
-        if result.get('audit'):
-            session['audit'] = result.get('audit')
-        print("\nRecommended next step: review post-fix health above. If the workload regressed, run `restore`.")
-        return True
-    if command == 'restore':
+                print("  diagnostic: kubectl is not on PATH")
+        return []
+    for idx, ctx in enumerate(contexts, start=1):
+        marker = " (saved current)" if ctx == current else ""
+        print(f"{idx}. {ctx}{marker}")
+    return contexts
+
+
+def current_namespace(kubeconfig: str) -> str:
+    rc, out, _ = run_kubectl(
+        kubeconfig,
+        ["config", "view", "--minify", "-o", "jsonpath={..namespace}"],
+        timeout=15,
+    )
+    return (out or "").strip() if rc == 0 else ""
+
+
+def latest_restore_bundle_for_namespace(base_dir: str, namespace: str) -> Optional[str]:
+    root = pathlib.Path(base_dir)
+    bundles = [
+        p
+        for p in root.glob(f"rollback_bundle_{_safe_backup_filename(namespace)}_*")
+        if p.is_dir() and (p / "backup_manifest.json").exists()
+    ]
+    if not bundles:
+        return None
+    return str(sorted(bundles, key=lambda p: p.stat().st_mtime, reverse=True)[0])
+
+
+def restore_bundles_for_namespace(base_dir: str, namespace: str) -> List[pathlib.Path]:
+    root = pathlib.Path(base_dir)
+    if not root.exists():
+        return []
+    bundles = [
+        p
+        for p in root.glob(f"rollback_bundle_{_safe_backup_filename(namespace)}_*")
+        if p.is_dir() and (p / "backup_manifest.json").exists()
+    ]
+    return sorted(bundles, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def restore_bundle_summary(bundle: pathlib.Path) -> Dict[str, Any]:
+    manifest = load_json_file(str(bundle / "backup_manifest.json")) or {}
+    stat = bundle.stat()
+    created = str(manifest.get("created_at_utc") or "")
+    action = str(manifest.get("action") or "")
+    status = str(manifest.get("status") or "")
+    target = str(manifest.get("target_pod") or "")
+    if not target:
+        target = "namespace"
+    return {
+        "path": str(bundle),
+        "name": bundle.name,
+        "created_at_utc": created,
+        "action": action,
+        "status": status,
+        "target": target,
+        "mtime": stat.st_mtime,
+    }
+
+
+def print_restore_bundles(base_dir: str, namespace: str) -> List[pathlib.Path]:
+    bundles = restore_bundles_for_namespace(base_dir, namespace)
+    print(f"\nAvailable restore backups for namespace {namespace}:")
+    if not bundles:
+        print("  <none found>")
+        return []
+    for idx, bundle in enumerate(bundles, start=1):
+        summary = restore_bundle_summary(bundle)
+        created = summary.get("created_at_utc") or datetime.datetime.fromtimestamp(
+            float(summary.get("mtime") or 0), datetime.timezone.utc
+        ).isoformat()
+        print(
+            f"{idx}. {summary.get('name')} | target={summary.get('target')} "
+            f"| action={summary.get('action') or 'unknown'} | status={summary.get('status') or 'unknown'} "
+            f"| created={created}"
+        )
+    return bundles
+
+
+def prompt_restore_bundle_choice(base_dir: str, namespace: str) -> Optional[str]:
+    bundles = print_restore_bundles(base_dir, namespace)
+    if not bundles:
+        return None
+    while True:
+        selected = prompt_interactive("Restore backup name or number", "1", allow_cancel=True)
+        if selected is None:
+            return None
+        value = selected.strip()
+        if value.isdigit():
+            idx = int(value)
+            if 1 <= idx <= len(bundles):
+                return str(bundles[idx - 1])
+        for bundle in bundles:
+            if bundle.name == value or str(bundle) == value:
+                return str(bundle)
+        matches = [bundle for bundle in bundles if value.lower() in bundle.name.lower()]
+        if len(matches) == 1:
+            return str(matches[0])
+        print("Please choose a restore backup by number or name, or type cancel / exit.")
+
+
+def parse_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text or ""):
+        if char != "{":
+            continue
         try:
-            result = guided_backup_restore_mode(cluster, namespace, selected, action='restore', bundle_dir=bundle_dir)
-            session['restore_result'] = result
-        except RuntimeError as e:
-            print(f"\nRestore is not available yet: {e}")
-            print("Create a backup first with `backup`, or run the `Backup & Restore` action before trying `restore`.")
-        return True
-    interpreted = interpret_ai_command_with_llm(session, user_message)
-    if interpreted:
-        intent = (interpreted.get('intent') or '').strip().lower()
-        target_value = (interpreted.get('target_value') or '').strip()
-        target_type = (interpreted.get('target_type') or '').strip().lower()
-        if intent in ('exit', 'chat'):
-            return False
-        if intent == 'list_clusters':
-            return run_ai_session_command(session, 'list clusters')
-        if intent == 'use_cluster':
-            value = target_value or ('1' if target_type == 'number' else '')
-            if value:
-                return run_ai_session_command(session, f'use cluster {value}')
-        if intent == 'list_namespaces':
-            if target_value:
-                return run_ai_session_command(session, f'list namespaces for {target_value}')
-            return run_ai_session_command(session, 'list namespaces')
-        if intent == 'use_namespace' and target_value:
-            return run_ai_session_command(session, f'use namespace {target_value}')
-        if intent == 'show_workloads':
-            return run_ai_session_command(session, 'show workloads')
-        if intent == 'select_workload' and target_value:
-            return run_ai_session_command(session, f'select {target_value}')
-        if intent == 'status':
-            return run_ai_session_command(session, 'status')
-        if intent == 'analyze':
-            return run_ai_session_command(session, 'analyze')
-        if intent == 'show_manifest':
-            return run_ai_session_command(session, 'show manifest')
-        if intent == 'backup':
-            return run_ai_session_command(session, 'backup')
-        if intent == 'fix':
-            return run_ai_session_command(session, 'fix')
-        if intent == 'fix_execute':
-            return run_ai_session_command(session, 'fix --execute')
-        if intent == 'restore':
-            return run_ai_session_command(session, 'restore')
-        if intent == 'help':
-            return run_ai_session_command(session, 'help')
-    return False
+            obj, _ = decoder.raw_decode(text[idx:])
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
 
 
-def start_ai_chat_session(audit_obj, selected=None, workflow_mode='guided', session=None):
-    active_mode = normalize_app_mode(((audit_obj or {}).get('app_mode')) or (session or {}).get('app_mode'))
-    if active_mode != 'ai':
-        return
-    print_ai_intake_intro(session or {})
-    print("Type `exit`, `quit`, or `q` to leave the chat.")
-    print("Type `help` to see available workflow commands.")
+def print_restore_result_summary(status: int, stdout: str, stderr: str, bundle_dir: Optional[str]) -> None:
+    result = parse_first_json_object(stdout) or {}
+    restore_status = str(result.get("status") or ("failed" if status else "complete"))
+    applied = result.get("applied") or []
+    skipped = result.get("skipped_empty") or []
+    fallback = result.get("fallback_applied") or []
+    failures = result.get("failures") or []
+    reconciled = result.get("reconciled") or []
+    print("\nRestore summary:")
+    print(f"- status: {restore_status}")
+    print(f"- exit_code: {status}")
+    if bundle_dir:
+        print(f"- backup: {os.path.basename(bundle_dir)}")
+    print(f"- applied_resources: {len(applied)}")
+    print(f"- fallback_applied: {len(fallback)}")
+    print(f"- reconciled_items: {len(reconciled)}")
+    print(f"- skipped_empty: {len(skipped)}")
+    print(f"- failures: {len(failures)}")
+    if failures:
+        print("- failed_items:")
+        for item in failures[:5]:
+            if isinstance(item, dict):
+                label = item.get("file") or item.get("resource") or item.get("kind") or "unknown"
+                message = item.get("message") or item.get("error") or item.get("reason") or ""
+                print(f"  - {label}: {str(message)[:240]}")
+            else:
+                print(f"  - {str(item)[:240]}")
+    elif status == 0 and restore_status == "complete":
+        print("- result: restore completed successfully")
+    if status != 0 and stderr:
+        print(f"- error: {stderr.strip()[:500]}")
+
+
+def print_ai_interactive_intro(kubeconfig: str) -> None:
+    print("\n=== AgentFence AI interactive CLI ===")
+    print("I can help you restore, analyze, remediate, or analyze-remediate a Kubernetes sandbox.")
+    print("First I will look for Kubernetes clusters/contexts through kubectl runtime discovery.")
+    print("Commands: list clusters, use cluster <name-or-number>, list namespaces, use namespace <name>, analyze, remediate, analyze-remediation, backup, restore, status, help, exit")
+    print_kube_contexts(kubeconfig)
+
+
+def run_agentfence_child(
+    *,
+    app_mode: str,
+    namespace: str,
+    action: str,
+    kubeconfig: str,
+    cluster: Optional[str],
+    timeout: int,
+    headline_alpha: float,
+    backup_parent: str,
+    include_secrets_backup: bool,
+    velero_backup: bool,
+    bundle_dir: Optional[str] = None,
+    allow_node_runtime_remediation: bool = False,
+) -> Tuple[int, Optional[str]]:
+    script = os.path.abspath(__file__)
+    mapped_action = action
+    cmd = [
+        sys.executable,
+        script,
+        "--app-mode",
+        app_mode,
+        "--namespace",
+        namespace,
+        "--action",
+        mapped_action,
+        "--timeout",
+        str(timeout),
+        "--headline-alpha",
+        str(headline_alpha),
+        "--backup-parent-dir",
+        backup_parent,
+    ]
+    if kubeconfig:
+        cmd.extend(["--kubeconfig", kubeconfig])
+    if cluster:
+        cmd.extend(["--cluster", cluster])
+    if not include_secrets_backup:
+        cmd.append("--omit-secrets-backup")
+    if velero_backup:
+        cmd.append("--velero-backup")
+    if bundle_dir:
+        cmd.extend(["--bundle-dir", bundle_dir])
+    if allow_node_runtime_remediation:
+        cmd.append("--allow-node-runtime-remediation")
+    proc = subprocess.run(cmd, text=True, capture_output=True)
+    if action == "restore-namespace":
+        print_restore_result_summary(proc.returncode, proc.stdout or "", proc.stderr or "", bundle_dir)
+    else:
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.stderr:
+            print(proc.stderr, end="", file=sys.stderr)
+    artifact_path = None
+    try:
+        match = re.search(r'\{\s*"out"\s*:\s*"([^"]+)"', proc.stdout or "", re.S)
+        if match:
+            artifact_path = match.group(1)
+    except Exception:
+        artifact_path = None
+    return proc.returncode, artifact_path
+
+
+def run_ai_selected_action(
+    *,
+    action: str,
+    namespace: str,
+    cluster: Optional[str],
+    kubeconfig: str,
+    args: argparse.Namespace,
+    backup_parent: str,
+    include_secrets_backup: bool,
+) -> Tuple[int, Optional[str]]:
+    bundle_dir = None
+    allow_node_runtime_remediation = bool(args.allow_node_runtime_remediation)
+    if action == "restore-namespace":
+        bundle_dir = args.bundle_dir or prompt_restore_bundle_choice(backup_parent, namespace)
+        if not bundle_dir:
+            print(f"No rollback bundle found for {namespace} under {backup_parent}.")
+            return 2, None
+    elif action in ("remediation", "analyze-remediation") and not allow_node_runtime_remediation:
+        preflight: Optional[Dict[str, Any]] = None
+        try:
+            preflight_ctx = build_context(
+                namespace,
+                kubeconfig,
+                args.target_pod,
+                False,
+                args.timeout,
+                allow_node_runtime_remediation=False,
+            )
+            preflight = audit_node_runtime_hardening(preflight_ctx)
+        except Exception as e:
+            preflight = {
+                "kind": "node_runtime_hardening_preflight",
+                "status": "unknown",
+                "changes_needed": True,
+                "change_reasons": [f"preflight audit failed: {type(e).__name__}: {e}"],
+            }
+        allow_node_runtime_remediation = prompt_ai_node_runtime_hardening(preflight)
+        if not allow_node_runtime_remediation:
+            if preflight and preflight.get("status") == "already_hardened":
+                print("Node/runtime remediation not enabled because the preflight found no node-level changes to apply.")
+            else:
+                print("Node/runtime remediation disabled for this run; AgentFence will report runtime changes as manual if needed.")
+    print(f"\nRunning AgentFence {action} on {namespace}...")
+    status, artifact_path = run_agentfence_child(
+        app_mode="ai",
+        namespace=namespace,
+        action=action,
+        kubeconfig=kubeconfig,
+        cluster=cluster,
+        timeout=args.timeout,
+        headline_alpha=args.headline_alpha,
+        backup_parent=backup_parent,
+        include_secrets_backup=include_secrets_backup,
+        velero_backup=args.velero_backup,
+        bundle_dir=bundle_dir,
+        allow_node_runtime_remediation=allow_node_runtime_remediation,
+    )
+    print(f"\nAgentFence command finished with exit code {status}.")
+    return status, artifact_path
+
+
+def run_ai_interactive_cli(args: argparse.Namespace, kubeconfig: str, backup_parent: str, include_secrets_backup: bool) -> int:
+    global ACTIVE_KUBE_CONTEXT
+    discovery_kubeconfig = ""
+    cluster = args.cluster or None
+    ACTIVE_KUBE_CONTEXT = cluster
+    cluster_ready = bool(cluster)
+    namespace = args.namespace or ""
+    print_ai_interactive_intro(discovery_kubeconfig)
+    if cluster:
+        print(f"\nUsing Kubernetes context for this run only: {cluster}")
+        if not args.namespace:
+            namespace = prompt_namespace_choice(discovery_kubeconfig, current_namespace(discovery_kubeconfig)) or ""
+    else:
+        contexts = list_kube_contexts(discovery_kubeconfig)
+        if contexts:
+            selected = prompt_interactive("Cluster/context name or number", allow_cancel=True)
+            if selected is None:
+                selected = ""
+            resolved = resolve_kube_context(selected, contexts)
+            if resolved:
+                cluster = resolved
+                cluster_ready = True
+                ACTIVE_KUBE_CONTEXT = cluster
+                print(f"\nUsing Kubernetes context for this run only: {cluster}")
+                namespace = args.namespace or (prompt_namespace_choice(discovery_kubeconfig, current_namespace(discovery_kubeconfig)) or "")
+            else:
+                print("No cluster context selected yet. Use `list clusters` and `use cluster <name-or-number>` before running an action.")
+        else:
+            reachable, _ = kubectl_cluster_reachable(discovery_kubeconfig)
+            cluster_ready = reachable
+            if reachable:
+                print("\nNo named context was found, but kubectl can reach a cluster. AgentFence will use that live kubectl access for this run only.")
+                namespace = args.namespace or (prompt_namespace_choice(discovery_kubeconfig, current_namespace(discovery_kubeconfig)) or "")
+            else:
+                print("\nNo kubeconfig context or live kubectl cluster access was found yet.")
+                print("AgentFence will keep retrying discovery when you use `list clusters`; it will not create or save cluster configuration.")
+    if namespace:
+        print(f"\nUsing namespace: {namespace}")
+    last_status = 0
+    last_artifact_path: Optional[str] = None
+    last_report_payload: Optional[Dict[str, Any]] = None
+    ai_history: List[Dict[str, str]] = []
+    pending_choice: Optional[Dict[str, Any]] = None
+
+    def remember_run(status_and_artifact: Tuple[int, Optional[str]], action_name: str) -> None:
+        nonlocal last_status, last_artifact_path, last_report_payload
+        last_status, artifact_path = status_and_artifact
+        if not artifact_path:
+            artifact_path = latest_agentfence_artifact(namespace, action_name)
+        if artifact_path:
+            loaded = load_json_file(artifact_path)
+            if loaded:
+                last_artifact_path = artifact_path
+                last_report_payload = loaded
+                print(f"AI context loaded from: {artifact_path}")
+
+    def select_namespace_and_run(requested: str) -> None:
+        nonlocal namespace, pending_choice
+        names = pending_choice.get("items") if pending_choice and pending_choice.get("type") == "namespace" else list_namespaces(discovery_kubeconfig)
+        namespace = resolve_namespace(requested, names or []) or requested
+        pending_choice = None
+        print(f"\nUsing namespace: {namespace}")
+        action = prompt_ai_action_choice()
+        if action is None:
+            print("Cancelled. Returning to main prompt.")
+            return
+        remember_run(
+            run_ai_selected_action(
+                action=action,
+                namespace=namespace,
+                cluster=cluster,
+                kubeconfig=discovery_kubeconfig,
+                args=args,
+                backup_parent=backup_parent,
+                include_secrets_backup=include_secrets_backup,
+            ),
+            action,
+        )
+
+    def select_cluster_then_namespace(requested: str) -> None:
+        global ACTIVE_KUBE_CONTEXT
+        nonlocal cluster, cluster_ready, namespace, pending_choice
+        contexts = pending_choice.get("items") if pending_choice and pending_choice.get("type") == "cluster" else list_kube_contexts(discovery_kubeconfig)
+        resolved = resolve_kube_context(requested, contexts or [])
+        if not resolved:
+            print(f"Could not resolve cluster/context {requested!r}. Use `list clusters` to see available contexts.")
+            return
+        cluster = resolved
+        cluster_ready = True
+        ACTIVE_KUBE_CONTEXT = cluster
+        pending_choice = None
+        print(f"\nUsing Kubernetes context for this run only: {cluster}")
+        selected_namespace = prompt_namespace_choice(discovery_kubeconfig, current_namespace(discovery_kubeconfig))
+        if selected_namespace is None:
+            print("Cancelled. Returning to main prompt.")
+            return
+        select_namespace_and_run(selected_namespace)
+
+    if cluster_ready and namespace:
+        action = prompt_ai_action_choice()
+        if action is None:
+            print("Cancelled. Returning to main prompt.")
+        else:
+            remember_run(
+                run_ai_selected_action(
+                    action=action,
+                    namespace=namespace,
+                    cluster=cluster,
+                    kubeconfig=discovery_kubeconfig,
+                    args=args,
+                    backup_parent=backup_parent,
+                    include_secrets_backup=include_secrets_backup,
+                ),
+                action,
+            )
     while True:
         try:
-            raw = input("agentfence-ai> ")
+            raw = input("agentfence-ai> ").strip()
         except EOFError:
-            print("\nExiting AgentFence AI chat.")
-            return
-        user_message = (raw or '').strip()
-        if not user_message:
-            print("Type a question, or `exit` to leave the chat.")
+            print("\nExiting AgentFence AI interactive CLI.")
+            return last_status
+        if not raw:
+            print("Type `help` for commands, or `exit` to leave.")
             continue
-        if user_message.lower() in ('exit', 'quit', 'q'):
-            print("Exiting AgentFence AI chat.")
-            return
-        current_audit = (session or {}).get('audit') or audit_obj
-        current_selected = (session or {}).get('selected') or selected
-        if session and run_ai_session_command(session, user_message):
-            if session.get('audit'):
-                audit_obj = session['audit']
-            if session.get('selected'):
-                selected = session['selected']
+        command = raw.lower()
+        if command in ("exit", "quit", "q"):
+            print("Exiting AgentFence AI interactive CLI.")
+            return last_status
+        if pending_choice and is_cancel_command(raw):
+            pending_choice = None
+            print("Cancelled. Returning to main prompt.")
             continue
-        try:
-            print("\n" + "=" * 72)
-            print("User")
-            print("-" * 72)
-            print(user_message)
-            answer = run_ai_chat_turn(current_audit, user_message, selected=current_selected, workflow_mode=workflow_mode, session=session)
-            print("\n" + "-" * 72)
-            print("AgentFence AI")
-            print("-" * 72)
-            print(answer)
-            print("=" * 72)
-        except Exception as e:
-            print("\n" + "-" * 72)
-            print("AgentFence AI")
-            print("-" * 72)
-            print(f"{type(e).__name__}: {e}")
-            print("=" * 72)
-
-
-def load_history(path=SMART_HISTORY_PATH):
-    try:
-        if os.path.exists(path):
-            with open(path, 'r') as f:
-                obj = json.load(f)
-                if isinstance(obj, dict):
-                    obj.setdefault('runs', [])
-                    return obj
-    except Exception:
-        pass
-    return {'runs': []}
-
-
-def save_history(history, path=SMART_HISTORY_PATH):
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-    except Exception:
-        pass
-    try:
-        with open(path, 'w') as f:
-            json.dump(history, f, indent=2)
-    except Exception:
-        pass
-
-
-def infer_workload_intent(audit_obj):
-    res = (audit_obj.get('results') or {})
-    deps = (audit_obj.get('dependencies') or {})
-    meta = (audit_obj.get('meta') or {})
-    listener_entries = extract_listener_ports(audit_obj)
-    listener_ports = sorted({entry.get('port') for entry in listener_entries if isinstance(entry, dict) and isinstance(entry.get('port'), int)})
-    services = deps.get('services') or []
-    intent = []
-    explanation = []
-    if any(p in listener_ports for p in [5901, 6901]):
-        intent.append('desktop-sandbox')
-        explanation.append('Detected VNC/noVNC listener patterns associated with GUI sandbox workloads.')
-    if 8000 in listener_ports or services:
-        intent.append('service-endpoint')
-        explanation.append('Detected service-like port exposure or Kubernetes Service objects selecting the workload.')
-    if meta.get('workload_kind') in ('Job', 'CronJob'):
-        intent.append('batch-job')
-        explanation.append('Owner kind indicates a batch-oriented workload.')
-    if not intent:
-        intent.append('generic-sandbox')
-        explanation.append('No strong service or desktop indicators were detected; treating as generic sandbox workload.')
-    if deps.get('runtime_class'):
-        explanation.append(f"RuntimeClass {deps.get('runtime_class')} contributes to runtime-specific remediation choices.")
-    needs = {
-        'network_egress': bool((audit_obj.get('remote') or {}).get('kubernetes_api_https') or deps.get('services')),
-        'service_account': bool(get_nested(audit_obj, 'kubernetes', 'service_account_token_mounted', 'ok') is False or get_nested(audit_obj, 'results', 'service_account_token_present', 'ok') is False),
-        'writable_workspace': bool(get_nested(audit_obj, 'results', 'rootfs_readonly', 'ok') is False or get_nested(audit_obj, 'kubernetes', 'rootfs_readonly', 'ok') is False),
-    }
-    return {
-        'intent': sorted(set(intent)),
-        'listener_ports': listener_ports,
-        'services': services,
-        'needs': needs,
-        'explanation': explanation,
-    }
-
-
-def detect_environment_profile(audit_obj):
-    meta = audit_obj.get('meta', {}) or {}
-    ns = (meta.get('namespace') or '').lower()
-    if ns in ('prod', 'production'):
-        return 'production'
-    if ns in ('stage', 'staging', 'preprod'):
-        return 'staging'
-    if ns in ('dev', 'development'):
-        return 'dev'
-    if 'desktop' in json.dumps(infer_workload_intent(audit_obj)).lower():
-        return 'sandbox-desktop'
-    return 'lab'
-
-
-def build_dependency_graph(audit_obj):
-    meta = audit_obj.get('meta', {}) or {}
-    deps = audit_obj.get('dependencies', {}) or {}
-    pod = meta.get('target_pod') or meta.get('pod_name') or 'unknown-pod'
-    workload = meta.get('workload_name') or 'unknown-workload'
-    graph = {
-        'nodes': [
-            {'id': pod, 'type': 'Pod'},
-            {'id': workload, 'type': meta.get('workload_kind') or 'Workload'},
-        ],
-        'edges': [
-            {'from': pod, 'to': workload, 'relationship': 'owned_by'},
-        ],
-    }
-    for key, typ in [('services', 'Service'), ('ingresses', 'Ingress'), ('network_policies', 'NetworkPolicy'), ('hpas', 'HPA'), ('pdbs', 'PDB'), ('configmaps', 'ConfigMap'), ('secrets', 'Secret')]:
-        for item in deps.get(key, []) or []:
-            graph['nodes'].append({'id': item, 'type': typ})
-            rel = 'selects' if typ in ('Service', 'NetworkPolicy') else 'depends_on'
-            graph['edges'].append({'from': workload, 'to': item, 'relationship': rel})
-    return graph
-
-
-def confidence_from_item(item, audit_obj):
-    base = 0.55
-    reasons = []
-    evidence = (item.get('evidence') or '') + ' ' + (item.get('summary') or '')
-    if evidence.strip():
-        base += 0.15
-        reasons.append('Finding has direct evidence from audit probes.')
-    if item.get('issue_id') in ('NOVNC_LISTENER', 'REMOTE_REACHABILITY', 'IMDS_REACHABLE'):
-        base += 0.10
-        reasons.append('Finding is backed by active network reachability evidence.')
-    if item.get('risk_level') in ('high', 'critical'):
-        base += 0.05
-        reasons.append('Higher-severity items are prioritized with additional confidence weighting.')
-    if item.get('issue_id') in ('RUN_AS_ROOT', 'ROOTFS_RW'):
-        base -= 0.10
-        reasons.append('Remediation safety depends heavily on workload behavior and image design.')
-    fconf = min(0.98, max(0.20, base))
-    sconf = min(0.98, max(0.10, fconf - (0.18 if item.get('risk_level') in ('high', 'critical') else 0.05)))
-    return {
-        'finding_confidence': round(fconf, 2),
-        'fix_confidence': round(min(0.98, fconf - 0.03), 2),
-        'safety_confidence': round(sconf, 2),
-        'reasons': reasons,
-    }
-
-
-def pre_fix_validation_model(audit_obj, item):
-    issue = item.get('issue_id')
-    intent = infer_workload_intent(audit_obj)
-    deps = audit_obj.get('dependencies', {}) or {}
-    risks = []
-    safe = True
-    if issue == 'ROOTFS_RW':
-        risks.append('Application may write under root-owned paths; verify /tmp, /var/tmp, and workspace mounts before enabling read-only root filesystem.')
-        safe = False
-    elif issue == 'RUN_AS_ROOT':
-        risks.append('Non-root enforcement may fail if entrypoint scripts, permissions, or package-manager expectations require UID 0.')
-        safe = False
-    elif issue == 'REMOTE_REACHABILITY':
-        if deps.get('services') or 'service-endpoint' in intent.get('intent', []):
-            risks.append('NetworkPolicy tightening may interrupt legitimate east-west traffic that currently reaches this workload.')
-            safe = False
-    elif issue == 'SERVICE_ACCOUNT_TOKEN':
-        if intent.get('needs', {}).get('service_account'):
-            risks.append('ServiceAccount token appears present and may be used for Kubernetes API access; confirm before disabling automount.')
-            safe = False
-    elif issue == 'NOVNC_LISTENER':
-        if 'desktop-sandbox' in intent.get('intent', []):
-            risks.append('Desktop sandbox mode inferred; removing or isolating noVNC/VNC endpoints may be preferable to outright disablement.')
-            safe = False
-    elif issue == 'LINUX_CAPS':
-        risks.append('Capability minimization is generally safe, but verify whether raw sockets are intentionally needed for diagnostics.')
-    return {
-        'safe_to_autofix': safe and item.get('risk_level') not in ('high', 'critical'),
-        'predicted_risks': risks,
-        'predicted_breakage': bool(risks and not safe),
-    }
-
-
-def explain_fix_decision(item, audit_obj):
-    model = pre_fix_validation_model(audit_obj, item)
-    reason = []
-    if item.get('auto_applicable') and model.get('safe_to_autofix'):
-        decision = 'auto-apply-safe'
-        reason.append('Fix is represented as a bounded Kubernetes patch or policy artifact with low predicted blast radius.')
-    elif item.get('auto_applicable'):
-        decision = 'conditional-approval'
-        reason.append('Fix can be generated automatically, but workload compatibility is uncertain and operator approval is recommended.')
-    else:
-        decision = 'manual-only'
-        reason.append('Fix requires workload redesign, image changes, or environment-specific validation beyond safe automatic patching.')
-    if model.get('predicted_risks'):
-        reason.extend(model.get('predicted_risks'))
-    return {'decision': decision, 'reasoning': reason}
-
-
-def knowledge_base_patterns(audit_obj):
-    patterns = []
-    res = audit_obj.get('results', {}) or {}
-    k8s = audit_obj.get('kubernetes', {}) or {}
-    rem = ((audit_obj.get('remediation') or {}).get('items') or [])
-    ids = {x.get('issue_id') for x in rem}
-    if 'RUN_AS_ROOT' in ids and 'ROOTFS_RW' in ids and 'SECCOMP_DISABLED' in ids:
-        patterns.append({
-            'pattern': 'container-hardening-bundle',
-            'recommendation': 'Apply a bundled pod securityContext hardening set: non-root, RuntimeDefault seccomp, no privilege escalation, drop capabilities, and evaluate read-only rootfs with writable scratch volumes.',
-        })
-    if 'NOVNC_LISTENER' in ids and 'REMOTE_REACHABILITY' in ids:
-        patterns.append({
-            'pattern': 'desktop-exposure-containment',
-            'recommendation': 'Retain GUI endpoints only if required, then contain them with NetworkPolicy, auth, and exposure scoping rather than unrestricted pod-to-pod reachability.',
-        })
-    if 'SERVICE_ACCOUNT_TOKEN' in ids and not k8s.get('kubernetes_api_https', {}).get('ok'):
-        patterns.append({
-            'pattern': 'service-account-token-minimization',
-            'recommendation': 'Disable automountServiceAccountToken when token presence is not matched by observed Kubernetes API usage.',
-        })
-    return patterns
-
-
-def comparative_runtime_intelligence(audit_obj):
-    meta = audit_obj.get('meta', {}) or {}
-    text = json.dumps(meta).lower() + ' ' + json.dumps(audit_obj.get('dependencies', {})).lower()
-    runtime_key = None
-    for k in RUNTIME_INTELLIGENCE:
-        if k in text:
-            runtime_key = k
-            break
-    if not runtime_key:
-        return {'runtime': 'unknown', 'notes': []}
-    info = RUNTIME_INTELLIGENCE[runtime_key]
-    notes = [info['summary']]
-    listener_ports = infer_workload_intent(audit_obj).get('listener_ports', [])
-    unexpected = [p for p in listener_ports if p not in info['expected_services']]
-    if unexpected:
-        notes.append(f'Ports {unexpected} are not typical for the inferred {runtime_key} profile and should be reviewed as possible posture deviations.')
-    else:
-        notes.append(f'Observed listener profile is consistent with the inferred {runtime_key} runtime expectations.')
-    notes.append(f"Recommended fix profiles: {', '.join(info.get('recommended_profiles', []))}.")
-    return {'runtime': runtime_key, 'notes': notes}
-
-
-def history_insights(audit_obj, history):
-    runs = history.get('runs', [])[-25:]
-    current_ids = [x.get('issue_id') for x in ((audit_obj.get('remediation') or {}).get('items') or [])]
-    repeats = {}
-    learned = []
-    for run in runs:
-        for iid in run.get('issue_ids', []):
-            repeats[iid] = repeats.get(iid, 0) + 1
-    for iid in current_ids:
-        if repeats.get(iid, 0) >= 2:
-            learned.append(f'{iid} has appeared in {repeats[iid]} recent runs; consider promoting this into a default policy or baseline control.')
-    recent_failures = [r for r in runs if r.get('fix_status') == 'partial_failure']
-    if recent_failures:
-        learned.append('Recent runs include partial fix failures; review manual approval thresholds before aggressive automatic remediation.')
-    return {'repeated_findings': repeats, 'notes': learned}
-
-
-def manual_runbook_for_item(item, audit_obj):
-    ns = ((audit_obj.get('meta') or {}).get('namespace')) or 'default'
-    wl = ((audit_obj.get('meta') or {}).get('workload_name')) or '<workload>'
-    iid = item.get('issue_id')
-    steps = []
-    rollback = []
-    if iid == 'RUN_AS_ROOT':
-        steps = [
-            'Inspect the image entrypoint and file ownership requirements.',
-            'Add a dedicated non-root UID/GID and update writable paths.',
-            'Set runAsNonRoot: true and explicit runAsUser/runAsGroup in the pod securityContext.',
-            'Redeploy and verify readiness and core application workflows.',
-        ]
-        rollback = ['Revert the workload manifest or apply the rollback patch snapshot generated by the tool if the container fails to start.']
-    elif iid == 'ROOTFS_RW':
-        steps = [
-            'Identify write paths from logs, entrypoint scripts, and runtime behavior.',
-            'Move mutable paths to emptyDir or persistent volumes.',
-            'Enable readOnlyRootFilesystem and redeploy.',
-            'Validate application startup, temp-file creation, and user workflow paths.',
-        ]
-        rollback = ['Restore the previous writable filesystem setting and mounted scratch volumes if the application becomes unstable.']
-    elif iid == 'REMOTE_REACHABILITY':
-        steps = [
-            'Review Services, Ingresses, and expected peer workloads that communicate with the target.',
-            'Generate or refine a least-privilege NetworkPolicy that preserves only required ports and peers.',
-            'Apply the policy in a dry-run or staging environment first.',
-            'Re-run the remote audit to confirm intended paths still work and unintended paths are blocked.',
-        ]
-        rollback = ['Delete or roll back the generated NetworkPolicy if legitimate traffic is interrupted.']
-    else:
-        steps = ['Review the generated remediation recommendation and compatibility notes.', 'Apply the fix in a staging-safe manner and re-run the audit.']
-        rollback = ['Use the generated rollback artifacts or restore the prior manifest revision.']
-    commands = [f'kubectl -n {ns} get all', f'kubectl -n {ns} describe deploy/{wl}']
-    return {'issue_id': iid, 'title': item.get('title'), 'steps': steps, 'rollback': rollback, 'validation_commands': commands}
-
-
-def policy_reasoning(audit_obj, item):
-    dep = audit_obj.get('dependency_graph') or {}
-    service_count = len((audit_obj.get('dependencies') or {}).get('services') or [])
-    reasons = []
-    if item.get('issue_id') == 'REMOTE_REACHABILITY':
-        reasons.append(f'NetworkPolicy generation preserved known Service-linked or inferred listener ports and blocks unmodeled paths by omission.')
-        if service_count:
-            reasons.append(f'{service_count} Service object(s) were discovered, so ingress policy should preserve only those expected service ports.')
-    elif item.get('issue_id') == 'SERVICE_ACCOUNT_TOKEN':
-        reasons.append('ServiceAccount remediation is governed by observed token presence plus whether Kubernetes API access appears necessary.')
-    elif item.get('issue_id') == 'NOVNC_LISTENER':
-        reasons.append('Desktop-oriented listener exposure is treated differently when workload intent suggests a GUI sandbox use case.')
-    if dep.get('edges'):
-        reasons.append('Dependency graph was used to avoid patching the pod in isolation when workload-scoped resources depend on it.')
-    return reasons
-
-
-def apply_smart_enrichment(audit_obj, history=None):
-    audit_obj = dict(audit_obj)
-    audit_obj.setdefault('meta', {})
-    audit_obj['intent_inference'] = infer_workload_intent(audit_obj)
-    audit_obj['environment_profile'] = detect_environment_profile(audit_obj)
-    audit_obj['dependency_graph'] = build_dependency_graph(audit_obj)
-    audit_obj['runtime_intelligence'] = comparative_runtime_intelligence(audit_obj)
-    audit_obj['remediation'] = enrich_remediation(audit_obj.get('remediation') or remediation_from_audit(audit_obj))
-    items = []
-    for item in (audit_obj.get('remediation', {}).get('items') or []):
-        item = dict(item)
-        item['base_auto_applicable'] = item.get('auto_applicable', False)
-        item['confidence'] = confidence_from_item(item, audit_obj)
-        item['pre_fix_model'] = pre_fix_validation_model(audit_obj, item)
-        decision = explain_fix_decision(item, audit_obj)
-        item['automation_decision'] = decision['decision']
-        item['decision_reasoning'] = decision['reasoning']
-        item['priority_score'] = round((SEVERITY_TO_NUM.get(item.get('severity', 'low'), 1) * 10) + (item['confidence']['finding_confidence'] * 5) + (5 if item['automation_decision']=='auto-apply-safe' else 0), 2)
-        item['policy_reasoning'] = policy_reasoning(audit_obj, item)
-        item['why_not_auto_fixed'] = []
-        if item['automation_decision'] != 'auto-apply-safe':
-            item['why_not_auto_fixed'].extend(item['decision_reasoning'])
-        item['manual_runbook'] = manual_runbook_for_item(item, audit_obj)
-        item['auto_applicable'] = item.get('auto_applicable', False) and item['automation_decision'] == 'auto-apply-safe'
-        items.append(item)
-    items.sort(key=lambda x: x.get('priority_score', 0), reverse=True)
-    audit_obj['remediation']['items'] = items
-    audit_obj['knowledge_base_patterns'] = knowledge_base_patterns(audit_obj)
-    audit_obj['history_insights'] = history_insights(audit_obj, history or load_history())
-    audit_obj['risk_score'] = compute_risk_score(audit_obj)
-    audit_obj['explainable_prioritization'] = [
-        {
-            'issue_id': i.get('issue_id'),
-            'title': i.get('title'),
-            'priority_score': i.get('priority_score'),
-            'why_ranked_here': [
-                f"Severity={i.get('severity')}, risk={i.get('risk_level')}",
-                f"Finding confidence={i.get('confidence', {}).get('finding_confidence')}",
-                f"Decision={i.get('automation_decision')}",
-            ] + i.get('policy_reasoning', []),
-        }
-        for i in items
-    ]
-    return audit_obj
-
-
-def record_run_history(audit_obj, fix_result=None, path=SMART_HISTORY_PATH):
-    history = load_history(path)
-    run = {
-        'timestamp_utc': now_utc_iso(),
-        'namespace': get_nested(audit_obj, 'meta', 'namespace'),
-        'workload_name': get_nested(audit_obj, 'meta', 'workload_name'),
-        'environment_profile': audit_obj.get('environment_profile'),
-        'issue_ids': [x.get('issue_id') for x in ((audit_obj.get('remediation') or {}).get('items') or [])],
-        'risk_score': (audit_obj.get('risk_score') or {}).get('total'),
-        'fix_status': (fix_result or {}).get('status'),
-    }
-    history.setdefault('runs', []).append(run)
-    history['runs'] = history['runs'][-100:]
-    save_history(history, path)
-    return history
-
-
-def post_fix_health_validation(audit_obj, fix_result):
-    health = {'checks': [], 'status': 'unknown'}
-    apply_result = (fix_result or {}).get('apply_result') or {}
-    if not apply_result or not apply_result.get('executed'):
-        health['status'] = 'not_run'
-        return health
-    ns = get_nested(audit_obj, 'meta', 'namespace') or 'default'
-    wl = get_nested(audit_obj, 'meta', 'workload_name')
-    if has_kubectl() and wl:
-        for kind in ['deployment', 'statefulset', 'daemonset']:
-            rc, out = shell_rc(f"kubectl -n {shlex.quote(ns)} rollout status {kind}/{shlex.quote(wl)} --timeout=30s", timeout=40)
-            if rc == 0:
-                health['checks'].append({'name': f'rollout_status_{kind}', 'ok': True, 'output': out.strip()})
-                health['status'] = 'healthy'
-                break
-        if not health['checks']:
-            health['checks'].append({'name': 'rollout_status', 'ok': False, 'output': 'Unable to confirm rollout status for supported workload kinds.'})
-            health['status'] = 'degraded'
-    return health
-
-
-def safe_autonomous_selection(items, aggressive=False):
-    selected = []
-    manual = []
-    approval = []
-    for item in items:
-        decision = item.get('automation_decision')
-        if aggressive and item.get('base_auto_applicable'):
-            selected.append(item)
-        elif decision == 'auto-apply-safe':
-            selected.append(item)
-        elif decision == 'conditional-approval':
-            approval.append(item)
-        else:
-            manual.append(item)
-    return {'selected': selected, 'approval_required': approval, 'manual_only': manual}
-
-
-def print_smart_summary(audit_obj):
-    print('\nSmart analysis:')
-    print(f"Environment profile: {audit_obj.get('environment_profile')}")
-    print(f"Intent: {', '.join((audit_obj.get('intent_inference') or {}).get('intent', []))}")
-    rt = audit_obj.get('runtime_intelligence') or {}
-    if rt.get('notes'):
-        print('Runtime intelligence:')
-        for n in rt.get('notes', []):
-            print(f'  - {n}')
-    hist = audit_obj.get('history_insights') or {}
-    if hist.get('notes'):
-        print('Learning from previous runs:')
-        for n in hist.get('notes', []):
-            print(f'  - {n}')
-    kb = audit_obj.get('knowledge_base_patterns') or []
-    if kb:
-        print('Recognized fix patterns:')
-        for p in kb:
-            print(f"  - {p.get('pattern')}: {p.get('recommendation')}")
-
-
-def smart_write_json_file(path, obj, msg=None, announce=True):
-    _base_write_json_file(path, obj, msg if announce else None)
-    try:
-        md_path = os.path.splitext(path)[0] + '.md'
-        report_audit = obj
-        report_fix = obj if obj.get('per_issue') else None
-        if not obj.get('results'):
-            report_audit = (
-                ((obj.get('apply_result') or {}).get('post_fix_revalidation'))
-                or obj.get('audit')
-                or {'meta': obj.get('meta', {}), 'remediation': obj.get('remediation', {}), 'risk_score': obj.get('risk_score', {})}
+        if pending_choice and pending_choice.get("type") == "namespace":
+            select_namespace_and_run(raw)
+            continue
+        if pending_choice and pending_choice.get("type") == "cluster":
+            select_cluster_then_namespace(raw)
+            continue
+        if command == "help":
+            print("Commands: list clusters, use cluster <name-or-number>, list namespaces, use namespace <name>, analyze, remediate, analyze-remediation, backup, restore, status, help, exit")
+            print("The run commands use the same AgentFence app and write normal generated_outputs artifacts.")
+            print("After a run, type a normal question and AgentFence will forward it to the AI backend with the latest report context.")
+            print_ai_action_choices()
+            continue
+        if command in ("status", "show status"):
+            print(f"cluster_context={cluster or ('<kubectl-default>' if cluster_ready else '<unset>')} namespace={namespace or '<unset>'} timeout={args.timeout} alpha={args.headline_alpha}")
+            continue
+        if command in ("list clusters", "list contexts", "clusters", "contexts"):
+            contexts = print_kube_contexts(discovery_kubeconfig)
+            if contexts:
+                pending_choice = {"type": "cluster", "items": contexts}
+                print("Cluster/context name or number:")
+            if not cluster:
+                reachable, _ = kubectl_cluster_reachable(discovery_kubeconfig)
+                cluster_ready = reachable
+            continue
+        if command.startswith("use cluster ") or command.startswith("use context "):
+            prefix = "use cluster " if command.startswith("use cluster ") else "use context "
+            requested = raw[len(prefix):].strip()
+            contexts = list_kube_contexts(discovery_kubeconfig)
+            resolved = resolve_kube_context(requested, contexts)
+            if not resolved:
+                print(f"Could not resolve cluster/context {requested!r}. Use `list clusters` to see available contexts.")
+                continue
+            cluster = resolved
+            cluster_ready = True
+            ACTIVE_KUBE_CONTEXT = cluster
+            print(f"\nUsing Kubernetes context for this run only: {cluster}")
+            namespace = args.namespace or prompt_namespace_choice(discovery_kubeconfig, current_namespace(discovery_kubeconfig))
+            if namespace is None:
+                print("Cancelled. Returning to main prompt.")
+                continue
+            if namespace:
+                print(f"\nUsing namespace: {namespace}")
+                action = prompt_ai_action_choice()
+                if action is None:
+                    print("Cancelled. Returning to main prompt.")
+                    continue
+                remember_run(
+                    run_ai_selected_action(
+                        action=action,
+                        namespace=namespace,
+                        cluster=cluster,
+                        kubeconfig=discovery_kubeconfig,
+                        args=args,
+                        backup_parent=backup_parent,
+                        include_secrets_backup=include_secrets_backup,
+                    ),
+                    action,
+                )
+            continue
+        namespace_command = re.sub(r"[^a-z]+", "", command)
+        if command in ("list namespaces", "list namespace", "namespaces") or namespace_command in (
+            "listnamespaces",
+            "listnamespace",
+            "listnamaspces",
+            "listnamesapces",
+            "listnamespces",
+        ):
+            if not cluster_ready:
+                print("Select a cluster/context first with `use cluster <name-or-number>`, or provide kubectl access and run `list clusters` again.")
+                continue
+            names = print_namespaces(discovery_kubeconfig)
+            if names:
+                pending_choice = {"type": "namespace", "items": names}
+                print("Namespace name or number:")
+            continue
+        if command.startswith("use namespace "):
+            requested = raw[len("use namespace "):].strip()
+            names = list_namespaces(discovery_kubeconfig)
+            namespace = resolve_namespace(requested, names) or requested
+            print(f"\nUsing namespace: {namespace}")
+            action = prompt_ai_action_choice()
+            if action is None:
+                print("Cancelled. Returning to main prompt.")
+                continue
+            remember_run(
+                run_ai_selected_action(
+                    action=action,
+                    namespace=namespace,
+                    cluster=cluster,
+                    kubeconfig=discovery_kubeconfig,
+                    args=args,
+                    backup_parent=backup_parent,
+                    include_secrets_backup=include_secrets_backup,
+                ),
+                action,
             )
-        with open(md_path, 'w') as f:
-            f.write(markdown_report(report_audit, report_fix))
-        if announce:
-            print(f'Markdown report written: {md_path}')
-    except Exception:
-        pass
+            continue
+        if command.startswith("namespace "):
+            requested = raw[len("namespace "):].strip()
+            names = list_namespaces(discovery_kubeconfig)
+            namespace = resolve_namespace(requested, names) or requested
+            print(f"\nUsing namespace: {namespace}")
+            action = prompt_ai_action_choice()
+            if action is None:
+                print("Cancelled. Returning to main prompt.")
+                continue
+            remember_run(
+                run_ai_selected_action(
+                    action=action,
+                    namespace=namespace,
+                    cluster=cluster,
+                    kubeconfig=discovery_kubeconfig,
+                    args=args,
+                    backup_parent=backup_parent,
+                    include_secrets_backup=include_secrets_backup,
+                ),
+                action,
+            )
+            continue
 
-
-_original_interactive_wizard = interactive_wizard
-
-def interactive_wizard():
-    mode = prompt_choice('Run inside pod, from adjacent pod, or both', ['inside', 'adjacent', 'both'], default='both')
-    action = prompt_choice('Do you want to analyze, fix, or analyze+fix', ['analyze', 'fix', 'analyze+fix'], default='analyze+fix')
-    ns = autodetect_namespace('default') if has_kubectl() else None
-    resources = list_candidate_resources(ns) if ns else []
-    print_resource_list(resources)
-    selected = prompt_resource_selection(resources) if resources else None
-    timeout = 2.0
-    audit_out = default_json_path('audit')
-    fix_out = default_json_path('fixes')
-    selector = None
-    if selected:
-        selector = selected.get('selector') or labels_to_selector(selected.get('labels') or selected.get('selector_labels') or {})
-    if mode == 'inside' and is_inside_kubernetes():
-        audit_obj = collect_internal(timeout=timeout)
-    elif mode == 'adjacent':
-        audit_obj = collect_remote(ns, selector, timeout=timeout, include_introspection=True, include_internal_audit=False)
-    else:
-        audit_obj = collect_remote(ns, selector, timeout=timeout, include_introspection=True, include_internal_audit=True)
-    audit_obj['dependencies'] = summarize_dependencies(ns, workload_name=get_nested(audit_obj, 'meta', 'workload_name'), pod_name=get_nested(audit_obj, 'meta', 'target_pod'), labels=(selected or {}).get('labels') or (selected or {}).get('selector_labels') or {}) if ns else {}
-    audit_obj = apply_smart_enrichment(audit_obj, load_history())
-    print_audit_summary(audit_obj)
-    print_smart_summary(audit_obj)
-    print_remediation_summary(audit_obj.get('remediation', {}))
-    smart_write_json_file(audit_out, audit_obj, 'Audit JSON written')
-    if action == 'analyze':
-        record_run_history(audit_obj, {'status': 'analysis_only'})
-        return
-    groups = safe_autonomous_selection((audit_obj.get('remediation') or {}).get('items') or [])
-    if action == 'fix':
-        print('\nConditional approval items:')
-        for item in groups['approval_required']:
-            print(f"- {item.get('issue_id')}: {item.get('title')}")
-            for line in item.get('why_not_auto_fixed', []):
-                print(f'  {line}')
-        selection_mode = prompt_choice('Apply fixes all at once, separately, or none', ['all', 'separate', 'none'], default='separate')
-        execute = prompt_yes_no('Execute selected fixes now', default='n')
-        chosen = []
-        candidate_items = groups['selected'] + groups['approval_required']
-        if selection_mode == 'all':
-            chosen = candidate_items
-        elif selection_mode == 'separate':
-            for item in candidate_items:
-                default = 'y' if item in groups['selected'] else 'n'
-                if prompt_yes_no(f"Apply {item.get('issue_id')} - {item.get('title')}?", default=default):
-                    chosen.append(item)
-        fix_result = run_selected_fix_groups(audit_obj, chosen, namespace=ns, workload=(selected or {}).get('workload_name') or get_nested(audit_obj, 'meta', 'workload_name'), kind=((selected or {}).get('workload_kind') or get_nested(audit_obj, 'meta', 'workload_kind') or 'deployment').lower(), execute=execute)
-        fix_result['approval_required'] = groups['approval_required']
-        fix_result['manual_only'] = groups['manual_only']
-        fix_result['post_fix_health'] = post_fix_health_validation(audit_obj, fix_result)
-        print_fix_result(fix_result)
-        smart_write_json_file(fix_out, fix_result, 'Fix JSON written')
-        record_run_history(audit_obj, fix_result)
-
-
-_original_auto_run = auto_run
-
-def auto_run(timeout=2.0, apply_safe_fixes=True, execute=False, audit_out=None, fix_out=None):
-    mode = autodetect_mode()
-    audit_out = audit_out or default_json_path('audit')
-    fix_out = fix_out or default_json_path('fixes')
-    namespace = autodetect_namespace('default') if has_kubectl() else None
-    selected = None
-    if namespace:
-        resources = list_candidate_resources(namespace)
-        print_resource_list(resources)
-        selected = prompt_resource_selection(resources) if resources else None
-    selector = None
-    if selected:
-        selector = selected.get('selector') or labels_to_selector(selected.get('labels') or selected.get('selector_labels') or {})
-    elif namespace and mode in ('remote', 'both'):
-        discovered = autodiscover_remote_target(namespace)
-        selector = discovered.get('selector') or labels_to_selector(discovered.get('selector_labels') or {})
-    if mode == 'internal':
-        audit_obj = collect_internal(timeout=timeout)
-    elif mode == 'remote':
-        audit_obj = collect_remote(namespace, selector, timeout=timeout, include_introspection=True, include_internal_audit=False)
-    else:
-        audit_obj = collect_remote(namespace, selector, timeout=timeout, include_introspection=True, include_internal_audit=True)
-    audit_obj['dependencies'] = summarize_dependencies(namespace, workload_name=(selected or {}).get('workload_name') or get_nested(audit_obj, 'meta', 'workload_name'), pod_name=(selected or {}).get('pod_name') or get_nested(audit_obj, 'meta', 'target_pod'), labels=(selected or {}).get('labels') or (selected or {}).get('selector_labels') or {}) if namespace else {}
-    audit_obj = apply_smart_enrichment(audit_obj, load_history())
-    print_audit_summary(audit_obj)
-    print_smart_summary(audit_obj)
-    print_remediation_summary(audit_obj.get('remediation', {}))
-    smart_write_json_file(audit_out, audit_obj, 'Audit JSON written')
-    items = (audit_obj.get('remediation') or {}).get('items') or []
-    grouping = safe_autonomous_selection(items, aggressive=aggressive_execute)
-    chosen = grouping['selected'] if apply_safe_fixes else []
-    fix_result = {
-        'status': 'no_change',
-        'per_issue': [],
-        'approval_required': grouping['approval_required'],
-        'manual_only': grouping['manual_only'],
-    }
-    if mode != 'internal' and chosen:
-        fix_result = run_selected_fix_groups(audit_obj, chosen, namespace=namespace, workload=(selected or {}).get('workload_name') or get_nested(audit_obj, 'meta', 'workload_name'), kind=((selected or {}).get('workload_kind') or get_nested(audit_obj, 'meta', 'workload_kind') or 'deployment').lower(), execute=execute)
-        fix_result['approval_required'] = grouping['approval_required']
-        fix_result['manual_only'] = grouping['manual_only']
-        if aggressive_execute:
-            fix_result['aggressive_execute'] = True
-    elif mode == 'internal':
-        fix_result = {
-            'status': 'no_change',
-            'reason': 'internal_mode_manual_recommendation_only',
-            'per_issue': [{'issue_id': i.get('issue_id'), 'status': 'manual_only', 'risk_level': i.get('risk_level'), 'note': '; '.join(i.get('why_not_auto_fixed', [])[:2])} for i in items],
-            'approval_required': grouping['approval_required'],
-            'manual_only': grouping['manual_only'],
-        }
-    fix_result['post_fix_health'] = post_fix_health_validation(audit_obj, fix_result)
-    print_fix_result(fix_result)
-    smart_write_json_file(fix_out, fix_result, 'Fix JSON written')
-    record_run_history(audit_obj, fix_result)
-    return {'audit': audit_obj, 'fix': fix_result, 'reports': {'markdown': markdown_report(audit_obj, fix_result)}}
-
-
-_original_write_json_file = write_json_file
-
-# ---------------- laptop-first controller mode ----------------
-
-def kubectl_auth_can(verb, resource, namespace=None):
-    if not has_kubectl():
-        return False, 'kubectl_not_found'
-    ns = f" -n {shlex.quote(namespace)}" if namespace else ""
-    rc, out = shell_rc(f"kubectl auth can-i {shlex.quote(verb)} {shlex.quote(resource)}{ns}", timeout=20)
-    txt = (out or '').strip().lower()
-    return (rc == 0 and txt.startswith('yes')), txt or f'rc={rc}'
-
-
-def detect_laptop_cluster_capabilities(namespace=None):
-    caps = {
-        'has_kubectl': has_kubectl(),
-        'namespace': namespace,
-        'operations': {},
-        'level': 'manual_in_cluster_required',
-    }
-    if not caps['has_kubectl']:
-        return caps
-    checks = [
-        ('get_pods', 'get', 'pods'), ('list_pods', 'list', 'pods'), ('exec_pods', 'create', 'pods/exec'),
-        ('get_services', 'get', 'services'), ('get_ingresses', 'get', 'ingresses'),
-        ('get_networkpolicies', 'get', 'networkpolicies'), ('get_serviceaccounts', 'get', 'serviceaccounts'),
-        ('patch_deployments', 'patch', 'deployments'), ('patch_statefulsets', 'patch', 'statefulsets'),
-        ('patch_daemonsets', 'patch', 'daemonsets'), ('apply_networkpolicies', 'create', 'networkpolicies'),
-        ('create_pods', 'create', 'pods')
-    ]
-    for key, verb, res in checks:
-        ok, detail = kubectl_auth_can(verb, res, namespace=namespace)
-        caps['operations'][key] = {'allowed': ok, 'detail': detail}
-    ops = caps['operations']
-    if ops.get('get_pods', {}).get('allowed') and ops.get('list_pods', {}).get('allowed') and ops.get('exec_pods', {}).get('allowed'):
-        caps['level'] = 'full_control'
-    elif ops.get('get_pods', {}).get('allowed') and ops.get('list_pods', {}).get('allowed'):
-        caps['level'] = 'audit_only'
-    elif ops.get('get_pods', {}).get('allowed'):
-        caps['level'] = 'remote_only'
-    return caps
-
-
-def print_capabilities_summary(caps):
-    print('\nDetected cluster management capabilities')
-    print('=' * 72)
-    print(f"Level: {caps.get('level')}")
-    for key, v in (caps.get('operations') or {}).items():
-        print(f"- {key}: {'allowed' if v.get('allowed') else 'blocked'} ({v.get('detail')})")
-
-
-def detect_pod_exec_runtime(namespace, pod, container=None):
-    candidates = [
-        ('python3', 'python3 --version'), ('python', 'python --version'), ('sh', 'sh -lc "echo ok"'), ('bash', 'bash -lc "echo ok"')
-    ]
-    out = {'pod': pod, 'container': container, 'python': None, 'shell': None, 'writable_tmp': None}
-    cflag = f" -c {shlex.quote(container)}" if container else ""
-    for name, probe in candidates:
-        rc, txt = shell_rc(f"kubectl -n {shlex.quote(namespace)} exec {shlex.quote(pod)}{cflag} -- {probe}", timeout=25)
-        if rc == 0:
-            if name.startswith('python') and not out['python']:
-                out['python'] = name
-            if name in ('sh', 'bash') and not out['shell']:
-                out['shell'] = name
-    if out['shell']:
-        rc, txt = shell_rc(f"kubectl -n {shlex.quote(namespace)} exec {shlex.quote(pod)}{cflag} -- {out['shell']} -lc 'test -w /tmp && echo yes || echo no'", timeout=20)
-        out['writable_tmp'] = 'yes' in (txt or '').lower()
-    return out
-
-
-def get_pod_containers(namespace, pod):
-    try:
-        obj = kubectl_get_json(namespace, 'pod', name=pod)
-        return [c.get('name') for c in (((obj.get('spec') or {}).get('containers') or [])) if c.get('name')]
-    except Exception:
-        return []
-
-
-def stream_internal_audit_from_laptop(namespace, pod, container=None, timeout=2.0):
-    script_text = read_text(os.path.abspath(__file__), max_bytes=6_000_000)
-    runtime = detect_pod_exec_runtime(namespace, pod, container=container)
-    py = runtime.get('python')
-    sh_name = runtime.get('shell') or 'sh'
-    if not py:
-        return {'ok': False, 'method': 'exec_stream', 'error': 'no_python_in_target_pod', 'runtime': runtime}
-    argv = json.dumps(["combined_audit_with_remediation.py", "internal", "--timeout", str(float(timeout)), "--stdout-json"])
-    remote_cmd = (
-        f"{py} -c "
-        + shlex.quote(
-            "import sys; "
-            f"sys.argv={argv}; "
-            "src=sys.stdin.read(); "
-            "ns={'__name__':'__main__','__file__':'combined_audit_with_remediation.py'}; "
-            "exec(compile(src, 'combined_audit_with_remediation.py', 'exec'), ns, ns)"
+        action = resolve_ai_action(raw)
+        if not action:
+            if not last_report_payload:
+                artifact_path = latest_agentfence_artifact(namespace)
+                if artifact_path:
+                    last_report_payload = load_json_file(artifact_path)
+                    last_artifact_path = artifact_path if last_report_payload else last_artifact_path
+            if last_report_payload:
+                print("\nAgentFence AI is analyzing the latest report...")
+                answer = ask_ai_backend(raw, last_report_payload, ai_history)
+                print(answer)
+                ai_history.append({"role": "user", "content": raw})
+                ai_history.append({"role": "assistant", "content": answer})
+            else:
+                print("Run Analyze, Remediation, Analyze&Remediation, Backup, or Restore first; then ask a question about the results.")
+            continue
+        if not cluster_ready:
+            print("Cluster access is required before running an action. Use `list clusters` to retry discovery or `use cluster <name-or-number>` if contexts appear.")
+            continue
+        if not namespace:
+            namespace = prompt_namespace_choice(discovery_kubeconfig)
+            if not namespace:
+                print("Cancelled. Returning to main prompt.")
+                continue
+        remember_run(
+            run_ai_selected_action(
+                action=action,
+                namespace=namespace,
+                cluster=cluster,
+                kubeconfig=discovery_kubeconfig,
+                args=args,
+                backup_parent=backup_parent,
+                include_secrets_backup=include_secrets_backup,
+            ),
+            action,
         )
-    )
-    cmd = ["kubectl", "-n", namespace, "exec", "-i", pod]
-    if container:
-        cmd.extend(["-c", container])
-    cmd.extend(["--", sh_name, "-lc", remote_cmd])
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=script_text.encode("utf-8"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=600,
-            check=False,
-        )
-        out = proc.stdout.decode("utf-8", "replace")
-        parsed = parse_json_from_mixed_output(out)
-        if parsed is not None:
-            return {'ok': proc.returncode == 0, 'method': 'exec_stream', 'runtime': runtime, 'result': parsed}
-        return {'ok': False, 'method': 'exec_stream', 'runtime': runtime, 'error': 'internal_exec_parse_failed', 'raw': out}
-    except Exception as e:
-        return {'ok': False, 'method': 'exec_stream', 'runtime': runtime, 'error': f'exec_stream_failed: {type(e).__name__}: {e}'}
-def manual_in_cluster_commands(namespace, pod, container=None, timeout=2.0):
-    cflag = f" -c {container}" if container else ""
-    return {
-        'copy_and_run': [
-            f"kubectl cp combined_audit_with_remediation.py {namespace}/{pod}:/tmp/combined_audit.py",
-            f"kubectl exec -n {namespace} {pod}{cflag} -- python3 /tmp/combined_audit.py internal --timeout {timeout} --out /tmp/audit.json",
-            f"kubectl cp {namespace}/{pod}:/tmp/audit.json ./audit.json",
-        ],
-        'stream_and_run': [
-            f"cat combined_audit_with_remediation.py | kubectl exec -i -n {namespace} {pod}{cflag} -- sh -lc {shlex.quote(internal_python_stdin_launcher(timeout).replace('--stdout-json', '--out /dev/stdout'))}",
+
+
+def self_test_sample_results(unsafe: int = 2) -> List[TestResult]:
+    rows = []
+    for idx, probe in enumerate(CATALOG):
+        status: Status = "pass" if idx < unsafe else "fail"
+        rows.append(TestResult(id=probe.id, severity=probe.severity, status=status))
+    return rows
+
+
+def run_self_test() -> int:
+    checks: List[str] = []
+
+    ids = [p.id for p in CATALOG]
+    assert len(ids) == 39
+    assert len(set(ids)) == 39
+    assert set(ids) == set(PROBE_RUNNERS.keys())
+    assert set(REMEDIATION_RECIPES.keys()) == set(ids)
+    checks.append("catalog, runner, and remediation coverage")
+
+    mixed = [
+        TestResult(id="AgentFence.REMOTE.UNAUTH_SERVICE_REACHABLE", severity="high", status="pass"),
+        TestResult(id="AgentFence.ID.RUN_AS_UID_ZERO", severity="high", status="pass"),
+    ]
+    metrics = summarize_results(mixed)
+    assert metrics.issue_count == 1
+    assert metrics.score_raw == 3.0
+    assert math.isclose(metrics.score_raw, metrics.tbe_score_raw + metrics.ele_score_raw)
+    assert math.isclose(catalog_max_tbe() + catalog_max_ele(), catalog_max())
+    legacy_metrics = summarize_results(
+        [
+            TestResult(id=LEGACY_PROBE_PREFIX + "REMOTE.UNAUTH_SERVICE_REACHABLE", severity="high", status="pass"),
+            TestResult(id=LEGACY_PROBE_PREFIX + "ID.RUN_AS_UID_ZERO", severity="high", status="pass"),
         ]
-    }
-
-
-def controller_run(timeout=2.0, execute=False, aggressive_execute=False, audit_out=None, fix_out=None, app_mode='default'):
-    namespace = autodetect_namespace('default') if has_kubectl() else None
-    caps = detect_laptop_cluster_capabilities(namespace)
-    print_capabilities_summary(caps)
-    if not caps.get('has_kubectl'):
-        print("\nThis laptop does not have kubectl available. Run the script inside the cluster or install kubectl and kubeconfig access.")
-        return {'status': 'manual_in_cluster_required', 'capabilities': caps}
-
-    resources = list_candidate_resources(namespace) if namespace else []
-    print_resource_list(resources)
-    selected = prompt_resource_selection(resources) if resources else None
-    if not selected:
-        print('No resource selected. Nothing was analyzed.')
-        return {'status': 'no_change', 'capabilities': caps}
-
-    selector = selected.get('selector') or labels_to_selector(selected.get('labels') or selected.get('selector_labels') or {})
-    pod = selected.get('pod_name') or selected.get('name')
-    containers = get_pod_containers(namespace, pod)
-    container = containers[0] if containers else None
-    selected_kind = selected.get('kind') or selected.get('workload_kind') or 'Pod'
-    selected_name = selected.get('name') or selected.get('workload_name') or pod
-    print(f"\nSelected resource: {selected_kind} {selected_name} in namespace {namespace}")
-    if containers:
-        print(f"Containers: {', '.join(containers)}")
-
-    remote_obj = collect_remote(namespace, selector, timeout=timeout, include_introspection=True, include_internal_audit=False)
-    if not isinstance(remote_obj, dict):
-        remote_obj = {'meta': {'namespace': namespace, 'target_pod': pod}, 'results': {}, 'remediation': {'items': []}}
-
-    if caps.get('operations', {}).get('exec_pods', {}).get('allowed'):
-        internal_exec = stream_internal_audit_from_laptop(namespace, pod, container=container, timeout=timeout)
-        if internal_exec.get('ok') and internal_exec.get('result'):
-            remote_obj.setdefault('results', {})['internal_audit'] = internal_exec['result']
-            internal_state = {'status': 'collected_from_laptop', 'method': internal_exec.get('method'), 'runtime': internal_exec.get('runtime')}
-        else:
-            internal_state = {
-                'status': 'manual_in_cluster_required',
-                'reason': internal_exec.get('error') or 'exec_failed',
-                'runtime': internal_exec.get('runtime'),
-                'manual_commands': manual_in_cluster_commands(namespace, pod, container=container, timeout=timeout),
-            }
-    else:
-        internal_state = {
-            'status': 'manual_in_cluster_required',
-            'reason': 'pods_exec_not_allowed',
-            'manual_commands': manual_in_cluster_commands(namespace, pod, container=container, timeout=timeout),
-        }
-
-    remote_obj['controller'] = {'capabilities': caps, 'selected_resource': selected, 'internal_execution': internal_state}
-    remote_obj['dependencies'] = summarize_dependencies(
-        namespace,
-        workload_name=selected.get('workload_name') or get_nested(remote_obj, 'meta', 'workload_name'),
-        pod_name=pod,
-        labels=selected.get('labels') or selected.get('selector_labels') or {},
     )
-    remote_obj = promote_internal_audit_findings(remote_obj)
-    remote_obj = apply_smart_enrichment(remote_obj, load_history())
-    remote_obj = attach_ai_advisor(remote_obj, selected=selected, workflow_mode='controller', app_mode=app_mode)
-    print_audit_summary(remote_obj)
-    print_smart_summary(remote_obj)
-    print_ai_advisor_summary(remote_obj)
-    print_remediation_summary(remote_obj.get('remediation', {}))
+    assert legacy_metrics.issue_count == metrics.issue_count
+    assert legacy_metrics.score_raw == metrics.score_raw
+    checks.append("disjoint TBE/ELE scoring and review-only alias handling")
 
-    audit_out = audit_out or resource_json_path('controller_audit', namespace=namespace, workload_name=selected_name)
-    fix_out = fix_out or resource_json_path('controller_fixes', namespace=namespace, workload_name=selected_name)
-    smart_write_json_file(audit_out, remote_obj, 'Audit JSON written')
+    results = self_test_sample_results(unsafe=3)
+    plan = build_remediation_plan(results, {"namespace": "ns", "target_pod": "pod"})
+    assert plan["coverage"]["complete"] is True
+    assert plan["actionable_count"] == 3
+    assert all(i.get("recommendation") for i in plan["items"])
+    checks.append("39-probe remediation plan coverage")
 
-    items = (remote_obj.get('remediation') or {}).get('items') or []
-    grouping = safe_autonomous_selection(items, aggressive=aggressive_execute)
-    if execute and caps.get('level') == 'full_control':
-        fix_result = run_selected_fix_groups(
-            remote_obj,
-            grouping['selected'],
-            namespace=namespace,
-            workload=selected.get('workload_name') or get_nested(remote_obj, 'meta', 'workload_name'),
-            kind=((selected.get('workload_kind') or get_nested(remote_obj, 'meta', 'workload_kind') or 'deployment')).lower(),
-            execute=True,
-        )
-        fix_result['approval_required'] = grouping['approval_required']
-        fix_result['manual_only'] = grouping['manual_only']
-        if aggressive_execute:
-            fix_result['aggressive_execute'] = True
-    else:
-        fix_result = {
-            'status': 'planned' if grouping['selected'] else 'no_change',
-            'reason': 'execute_not_requested' if not execute else 'insufficient_apply_permissions',
-            'per_issue': [{'issue_id': i.get('issue_id'), 'status': 'planned'} for i in grouping['selected']],
-            'approval_required': grouping['approval_required'],
-            'manual_only': grouping['manual_only'],
-        }
-        if aggressive_execute:
-            fix_result['aggressive_execute'] = True
-
-    fix_result['post_fix_health'] = post_fix_health_validation(remote_obj, fix_result)
-    print_fix_result(fix_result)
-    smart_write_json_file(fix_out, fix_result, 'Fix JSON written')
-
-    if internal_state.get('status') == 'manual_in_cluster_required':
-        print("\nInternal audit could not be executed automatically from this laptop.")
-        print('Run one of the following inside the cluster management context:')
-        for block, cmds in (internal_state.get('manual_commands') or {}).items():
-            print(f"\n{block}:")
-            for cmd in cmds:
-                print(cmd)
-
-    if normalize_app_mode(app_mode) == 'ai':
-        start_ai_chat_session(remote_obj, selected=selected, workflow_mode='controller')
-
-    record_run_history(remote_obj, fix_result)
-    return {'audit': remote_obj, 'fix': fix_result}
-
-
-def current_cluster_name():
-    if not has_kubectl():
-        return None
-    return shell("kubectl config view --minify -o jsonpath='{.contexts[0].context.cluster}'", timeout=10).strip() or None
-
-
-def is_attacker_resource(resource):
-    labels = resource.get('labels') or resource.get('selector_labels') or {}
-    workload_name = (resource.get('workload_name') or '').lower()
-    selector = (resource.get('selector') or '').lower()
-    return (
-        labels.get('role') == 'attacker'
-        or labels.get('app') == 'attacker'
-        or 'role=attacker' in selector
-        or 'app=attacker' in selector
-        or 'attacker' in workload_name
+    evaluation = build_f1_f5_evaluation(
+        action="remediation",
+        namespace="ns",
+        context={"namespace": "ns", "target_pod": "pod", "target_container": "c"},
+        artifacts={"main_json": "/tmp/agentfence-self-test.json"},
+        metrics_before=summarize_results(self_test_sample_results(unsafe=3)),
+        results_before=self_test_sample_results(unsafe=3),
+        metrics_after=summarize_results(self_test_sample_results(unsafe=1)),
+        results_after=self_test_sample_results(unsafe=1),
+        remediation_plan=plan,
+        health={"status": "healthy"},
     )
+    assert evaluation["schema"] == "agentfence-f1-f5-v2"
+    assert evaluation["F3_remediation_effectiveness"]["status"] == "improved"
+    checks.append("F1-F5 evaluation")
 
-
-def discover_primary_target_resource(namespace, resources=None):
-    resources = resources if resources is not None else list_candidate_resources(namespace)
-    if not resources:
-        return None, resources
-    candidates = [r for r in resources if not is_attacker_resource(r)]
-    if len(candidates) == 1:
-        return candidates[0], resources
-    if len(candidates) > 1:
-        return prompt_resource_selection(candidates), resources
-    return prompt_resource_selection(resources), resources
-
-
-def ensure_cluster_matches(cluster_name):
-    current = current_cluster_name()
-    if cluster_name and current and cluster_name != current:
-        raise RuntimeError(f"requested cluster '{cluster_name}' does not match current kubectl cluster '{current}'")
-    return current or cluster_name
-
-
-def guided_output_paths(prefix, namespace, workload_name):
-    return {
-        'audit': resource_json_path(f'{prefix}_audit', namespace=namespace, workload_name=workload_name),
-        'fix': resource_json_path(f'{prefix}_fixes', namespace=namespace, workload_name=workload_name),
-    }
-
-
-def persist_attacker_lifecycle_backup(namespace, workload_name, target_selector, attacker_name=None, existed_before=False):
-    path = output_path(
-        f"attacker_lifecycle_{safe_slug(namespace, 'namespace')}_{safe_slug(workload_name, 'workload')}_"
-        f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
-    )
-    payload = {
-        'created_at': now_utc_iso(),
-        'namespace': namespace,
-        'workload_name': workload_name,
-        'target_selector': target_selector,
-        'attacker_pod': attacker_name,
-        'attacker_existed_before': existed_before,
-    }
-    _base_write_json_file(path, payload)
-    return path
-
-
-def verify_attacker_cleanup(namespace, attacker_name, existed_before=False):
-    if not attacker_name or existed_before:
-        return {'ok': True, 'reason': 'preexisting_or_not_created'}
-    exists = pod_exists(namespace, attacker_name)
-    return {'ok': not exists, 'reason': 'deleted' if not exists else 'attacker_pod_still_exists', 'attacker_pod': attacker_name}
-
-
-def collect_remote_with_attacker_policy(ns, selector, timeout=2.0, include_introspection=True, include_internal_audit=False, create_if_missing=False, cleanup_temporary_attacker=False):
-    ts = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    meta = {
-        "ts_utc": ts,
-        "namespace": ns,
-        "target_selector": selector,
-        "tool": "combined_sandbox_audit",
-        "host": os.uname().sysname + " " + os.uname().release,
-    }
-
-    target_pod = first_running_pod_by_selector(ns, selector)
-    if not target_pod:
-        raise RuntimeError(f"No running target pod found with selector: {selector}")
-
-    target_ip = kubectl_jsonpath(ns, target_pod, "{.status.podIP}") or ""
-    img = kubectl_jsonpath(ns, target_pod, "{.spec.containers[0].image}") or ""
-    image_id = kubectl_jsonpath(ns, target_pod, "{.status.containerStatuses[0].imageID}") or ""
-    node = kubectl_jsonpath(ns, target_pod, "{.spec.nodeName}") or ""
-    meta.update({
-        "target_pod": target_pod,
-        "target_ip": target_ip,
-        "node": node,
-        "image": img,
-        "imageID": image_id,
-    })
-    try:
-        discovered = discover_workload_from_pod(ns, target_pod)
-        meta.update({
-            "workload_name": discovered.get("workload_name"),
-            "workload_kind": (discovered.get("workload_kind") or "").lower(),
-            "container_names": discovered.get("container_names", []),
-            "service_account_name": discovered.get("service_account_name"),
-            "selector_labels": discovered.get("selector_labels", {}),
-        })
-        if discovered.get("selector"):
-            meta["target_selector"] = discovered.get("selector")
-    except Exception as e:
-        meta["discovery_error"] = str(e)
-
-    attacker_name = None
-    created_tmp = False
-    attacker_error = None
-    try:
-        attacker_name, created_tmp = ensure_attacker_pod(ns, prefer_name="attacker", create_if_missing=create_if_missing)
-        meta["attacker_pod"] = attacker_name
-        meta["attacker_created_tmp"] = created_tmp
-    except Exception as e:
-        attacker_error = f"{type(e).__name__}: {e}"
-        meta["attacker_pod"] = None
-        meta["attacker_created_tmp"] = False
-        meta["attacker_setup_error"] = attacker_error
-
-    results = {
-        "scanned_ports": [],
-        "novnc_http_6901": {},
-        "novnc_ws_6901": {},
-        "vnc_rfb_5901": {},
-        "internal_introspection": {},
-        "internal_audit": {},
-        "classification": "unknown",
-    }
-
-    if attacker_name:
-        for p in DEFAULT_PORTS:
-            if not target_ip:
-                results["scanned_ports"].append({"port": p, "reachable": False, "nc_output": "no target_ip"})
-                continue
-            results["scanned_ports"].append(probe_nc(ns, attacker_name, target_ip, p))
-        if target_ip:
-            results["novnc_http_6901"] = probe_http_head(ns, attacker_name, target_ip, 6901, path="/")
-            results["novnc_ws_6901"] = probe_ws_upgrade(ns, attacker_name, target_ip, 6901, path="/websockify")
-            results["vnc_rfb_5901"] = rfb_probe(ns, attacker_name, target_ip, port=5901, timeout=timeout, proofsafe=True)
-    else:
-        for p in DEFAULT_PORTS:
-            results["scanned_ports"].append({"port": p, "reachable": False, "nc_output": f"skipped: {attacker_error or 'no attacker pod available'}"})
-        results["novnc_http_6901"] = degraded_remote_result("attacker_unavailable", attacker_error)
-        results["novnc_ws_6901"] = degraded_remote_result("attacker_unavailable", attacker_error)
-        results["vnc_rfb_5901"] = {"classification": "skipped_attacker_unavailable", "error": attacker_error or "no attacker pod available"}
-
-    if include_introspection:
-        try:
-            results["internal_introspection"] = optional_internal_introspection(ns, target_pod)
-        except Exception as e:
-            results["internal_introspection"] = {"ok": False, "error": str(e)}
-
-    if include_internal_audit:
-        try:
-            results["internal_audit"] = run_internal_via_kubectl(ns, target_pod, timeout=timeout)
-        except Exception as e:
-            results["internal_audit"] = {"error": str(e)}
-
-    rfb_class = (results.get("vnc_rfb_5901") or {}).get("classification", "")
-    reachable_6901 = bool(results.get("novnc_http_6901", {}).get("ok")) and "200" in (results.get("novnc_http_6901", {}).get("status_line", ""))
-    ws_ok = bool(results.get("novnc_ws_6901", {}).get("switching_protocols_101"))
-    vnc5901_open = any(x for x in results["scanned_ports"] if x["port"] == 5901 and x["reachable"])
-    if not attacker_name:
-        results["classification"] = "remote_probe_skipped_attacker_unavailable"
-    elif rfb_class in ("proofsafe_serverinit_ok", "unauthenticated_vnc"):
-        results["classification"] = "remotely_reachable_from_pod_and_unauthenticated_vnc"
-    elif rfb_class == "password_required":
-        results["classification"] = "remotely_reachable_from_pod_but_password_required"
-    elif reachable_6901 and ws_ok and vnc5901_open:
-        results["classification"] = "remotely_reachable_from_pod_partial_signals"
-    else:
-        results["classification"] = "not_reachable_or_insufficient_signals"
-
-    cleanup = {'ok': True, 'reason': 'not_requested'}
-    if created_tmp and cleanup_temporary_attacker:
-        try:
-            shell(f"kubectl -n {shlex.quote(ns)} delete pod {shlex.quote(attacker_name)} --grace-period=0 --force", check=False, timeout=60)
-        finally:
-            cleanup = verify_attacker_cleanup(ns, attacker_name, existed_before=False)
-
-    obj = {"meta": meta, "results": results}
-    obj["remediation"] = remediation_from_audit(obj)
-    obj.setdefault('meta', {})['dependencies'] = summarize_dependencies(ns, obj.get('meta', {}).get('workload_name'), obj.get('meta', {}).get('target_pod'), obj.get('meta', {}).get('selector_labels') or {})
-    obj['evidence'] = collect_evidence('results', obj.get('results', {}))
-    obj = promote_internal_audit_findings(obj)
-    obj['risk_score'] = compute_risk_score(obj)
-    obj.setdefault('meta', {})['compatibility_notes'] = compatibility_assessment(obj)
-    obj['reports'] = {'markdown': markdown_report(obj)}
-    obj['attacker_cleanup'] = cleanup
-    return obj
-
-
-def run_internal_audit_for_target(namespace, pod, container=None, timeout=2.0):
-    internal_exec = stream_internal_audit_from_laptop(namespace, pod, container=container, timeout=timeout)
-    if internal_exec.get('ok') and internal_exec.get('result'):
-        return internal_exec['result'], {'status': 'collected_from_laptop', 'method': internal_exec.get('method'), 'runtime': internal_exec.get('runtime')}
-    return (
-        {'error': internal_exec.get('error') or 'internal_exec_failed', 'runtime': internal_exec.get('runtime')},
-        {
-            'status': 'manual_in_cluster_required',
-            'reason': internal_exec.get('error') or 'exec_failed',
-            'runtime': internal_exec.get('runtime'),
-            'manual_commands': manual_in_cluster_commands(namespace, pod, container=container, timeout=timeout),
-        },
-    )
-
-
-def build_base_analysis(namespace, selected, timeout=2.0, app_mode='default'):
-    selector = selected.get('selector') or labels_to_selector(selected.get('labels') or selected.get('selector_labels') or {})
-    pod = selected.get('pod_name') or selected.get('name')
-    containers = get_pod_containers(namespace, pod)
-    container = containers[0] if containers else None
-    remote_obj = collect_remote_with_attacker_policy(namespace, selector, timeout=timeout, include_introspection=True, include_internal_audit=False, create_if_missing=False, cleanup_temporary_attacker=False)
-    internal_audit, internal_state = run_internal_audit_for_target(namespace, pod, container=container, timeout=timeout)
-    remote_obj.setdefault('results', {})['internal_audit'] = internal_audit
-    remote_obj.setdefault('controller', {})['internal_execution'] = internal_state
-    remote_obj.setdefault('controller', {})['selected_resource'] = selected
-    remote_obj['dependencies'] = summarize_dependencies(
-        namespace,
-        workload_name=selected.get('workload_name') or get_nested(remote_obj, 'meta', 'workload_name'),
-        pod_name=pod,
-        labels=selected.get('labels') or selected.get('selector_labels') or {},
-    )
-    remote_obj = promote_internal_audit_findings(remote_obj)
-    remote_obj = apply_spec_fallback_if_needed(remote_obj)
-    remote_obj = reconcile_spec_backed_findings(remote_obj)
-    remote_obj = apply_smart_enrichment(remote_obj, load_history())
-    remote_obj = attach_ai_advisor(remote_obj, selected=selected, workflow_mode='analyze', app_mode=app_mode)
-    return remote_obj, selector, pod, container
-
-
-def run_remote_probe_phase(namespace, selector, timeout=2.0, create_if_missing=False, cleanup_temporary_attacker=False):
-    remote_obj = collect_remote_with_attacker_policy(
-        namespace,
-        selector,
-        timeout=timeout,
-        include_introspection=True,
-        include_internal_audit=False,
-        create_if_missing=create_if_missing,
-        cleanup_temporary_attacker=cleanup_temporary_attacker,
-    )
-    return apply_smart_enrichment(remote_obj, load_history())
-
-
-def check_agentic_workload_health_guided(audit_obj, fix_result, timeout=2.0):
-    health = post_fix_health_validation(audit_obj, fix_result)
-    apply_result = (fix_result or {}).get('apply_result') or {}
-    if not apply_result or not apply_result.get('executed'):
-        return health
-    revalidated = apply_result.get('post_fix_revalidation') or {}
-    target_pod = get_nested(revalidated, 'meta', 'target_pod')
-    namespace = get_nested(revalidated, 'meta', 'namespace')
-    if namespace and target_pod:
-        containers = get_pod_containers(namespace, target_pod)
-        container = containers[0] if containers else None
-        internal_audit, internal_state = run_internal_audit_for_target(namespace, target_pod, container=container, timeout=timeout)
-        health['agentic_validation'] = {
-            'internal_state': internal_state,
-            'internal_summary': (internal_audit.get('summary') if isinstance(internal_audit, dict) else None),
-            'internal_error': (internal_audit.get('error') if isinstance(internal_audit, dict) else 'unknown'),
-        }
-        if internal_state.get('status') == 'collected_from_laptop' and not internal_audit.get('error'):
-            if health.get('status') in ('unknown', 'healthy'):
-                health['status'] = 'healthy'
-        else:
-            if health.get('status') == 'healthy':
-                health['status'] = 'validation_incomplete'
-            else:
-                health['status'] = 'degraded'
-    return health
-
-
-def print_guided_context(cluster, namespace, selected):
-    print("\nGuided execution context")
-    print("=" * 72)
-    print(f"cluster: {cluster}")
-    print(f"namespace: {namespace}")
-    print(f"target: {selected.get('workload_kind')}/{selected.get('workload_name')}")
-    print(f"selector: {selected.get('selector') or labels_to_selector(selected.get('selector_labels') or {})}")
-
-
-def find_latest_rollback_bundle(namespace, workload_name, base_dir=None):
-    root = base_dir or ensure_output_root()
-    prefix = f"rollback_bundle_{slugify_name(namespace)}_{slugify_name(workload_name)}_"
-    try:
-        entries = []
-        for name in os.listdir(root):
-            full = os.path.join(root, name)
-            if name.startswith(prefix) and os.path.isdir(full):
-                manifest = os.path.join(full, 'backup_manifest.json')
-                if os.path.exists(manifest):
-                    entries.append(full)
-        if not entries:
-            return None
-        return sorted(entries)[-1]
-    except Exception:
-        return None
-
-
-def find_preferred_rollback_bundle(namespace, workload_name, base_dir=None):
-    root = base_dir or ensure_output_root()
-    backup_prefix = f"guided_backup_restore_{safe_slug(namespace, 'namespace')}_{safe_slug(workload_name, 'workload')}_"
-    remediation_prefix = f"guided_remediation_fixes_{safe_slug(namespace, 'namespace')}_{safe_slug(workload_name, 'workload')}_"
-    backup_candidates = []
-    remediation_candidates = []
-    try:
-        for name in os.listdir(root):
-            full = os.path.join(root, name)
-            if not os.path.isfile(full) or not name.endswith('.json'):
-                continue
-            try:
-                with open(full, 'r') as fh:
-                    obj = json.load(fh)
-            except Exception:
-                continue
-            if name.startswith(backup_prefix) and obj.get('status') == 'backup_created':
-                bundle_dir = get_nested(obj, 'backup_bundle', 'directory')
-                if bundle_dir and os.path.isdir(bundle_dir) and os.path.exists(os.path.join(bundle_dir, 'backup_manifest.json')):
-                    backup_candidates.append(bundle_dir)
-            elif name.startswith(remediation_prefix) and obj.get('status') == 'applied':
-                bundle_dir = get_nested(obj, 'apply_result', 'backup_bundle', 'directory')
-                if bundle_dir and os.path.isdir(bundle_dir) and os.path.exists(os.path.join(bundle_dir, 'backup_manifest.json')):
-                    remediation_candidates.append(bundle_dir)
-    except Exception:
-        pass
-    if backup_candidates:
-        return sorted(backup_candidates)[-1], 'latest explicit backup'
-    if remediation_candidates:
-        return sorted(remediation_candidates)[-1], 'latest remediation backup'
-    latest = find_latest_rollback_bundle(namespace, workload_name, base_dir=root)
-    if latest:
-        return latest, 'latest matching rollback bundle'
-    return None, None
-
-
-def list_rollback_bundle_options(namespace, workload_name, base_dir=None):
-    root = base_dir or ensure_output_root()
-    options = []
-    seen = set()
-    backup_prefix = f"guided_backup_restore_{safe_slug(namespace, 'namespace')}_{safe_slug(workload_name, 'workload')}_"
-    remediation_prefix = f"guided_remediation_fixes_{safe_slug(namespace, 'namespace')}_{safe_slug(workload_name, 'workload')}_"
-    try:
-        for name in sorted(os.listdir(root)):
-            full = os.path.join(root, name)
-            if not os.path.isfile(full) or not name.endswith('.json'):
-                continue
-            try:
-                with open(full, 'r') as fh:
-                    obj = json.load(fh)
-            except Exception:
-                continue
-            bundle_dir = None
-            label = None
-            if name.startswith(backup_prefix) and obj.get('status') == 'backup_created':
-                bundle_dir = get_nested(obj, 'backup_bundle', 'directory')
-                label = 'backup before remediation'
-            elif name.startswith(remediation_prefix) and obj.get('status') == 'applied':
-                bundle_dir = get_nested(obj, 'apply_result', 'backup_bundle', 'directory')
-                label = 'backup created by remediation'
-            if not bundle_dir or bundle_dir in seen:
-                continue
-            manifest = os.path.join(bundle_dir, 'backup_manifest.json')
-            if not (os.path.isdir(bundle_dir) and os.path.exists(manifest)):
-                continue
-            seen.add(bundle_dir)
-            options.append({
-                'bundle_dir': bundle_dir,
-                'label': label,
-                'source_file': name,
-                'basename': os.path.basename(bundle_dir),
-            })
-    except Exception:
-        pass
-    options.sort(key=lambda x: x['bundle_dir'], reverse=True)
-    return options
-
-
-def resolve_rollback_bundle_dir(bundle_dir, namespace, workload_name):
-    if bundle_dir:
-        candidate = os.path.expanduser(bundle_dir)
-        if os.path.isdir(candidate):
-            return candidate, 'user supplied'
-        output_candidate = os.path.join(ensure_output_root(), os.path.basename(candidate))
-        if os.path.isdir(output_candidate):
-            return output_candidate, 'user supplied'
-        raise RuntimeError(f"Rollback bundle not found: {bundle_dir}")
-    latest, reason = find_preferred_rollback_bundle(namespace, workload_name)
-    if latest:
-        return latest, reason
-    raise RuntimeError(f"No rollback bundle found for {namespace}/{workload_name} in {ensure_output_root()}")
-
-
-def choose_rollback_bundle(namespace, workload_name, bundle_dir=None):
-    if bundle_dir:
-        resolved, reason = resolve_rollback_bundle_dir(bundle_dir, namespace, workload_name)
-        return resolved, reason
-    options = list_rollback_bundle_options(namespace, workload_name)
-    preferred, preferred_reason = find_preferred_rollback_bundle(namespace, workload_name)
-    if not options:
-        return resolve_rollback_bundle_dir(None, namespace, workload_name)
-    if len(options) == 1:
-        return options[0]['bundle_dir'], preferred_reason or options[0]['label']
-    default_idx = 1
-    for idx, opt in enumerate(options, start=1):
-        if opt['bundle_dir'] == preferred:
-            default_idx = idx
-            break
-    print("\nAvailable rollback bundles")
-    print("-" * 72)
-    for idx, opt in enumerate(options, start=1):
-        default_note = " [default]" if idx == default_idx else ""
-        print(f"{idx}. {opt['basename']} - {opt['label']}{default_note}")
-    raw = prompt('Select rollback bundle number', str(default_idx))
-    try:
-        choice = int((raw or str(default_idx)).strip())
-    except Exception:
-        choice = default_idx
-    if choice < 1 or choice > len(options):
-        choice = default_idx
-    selected = options[choice - 1]
-    return selected['bundle_dir'], selected['label']
-
-
-def print_backup_restore_summary(result):
-    print("\n=== Backup / Restore ===")
-    status = (result or {}).get('status') or 'unknown'
-    if status == 'backup_created':
-        bundle_dir = get_nested(result, 'backup_bundle', 'directory')
-        print(f"Status: backup created")
-        if bundle_dir:
-            print(f"Bundle: {bundle_dir}")
-        return
-    if status in ('restored', 'drift_remaining'):
-        print(f"Status: {status}")
-        print(f"Bundle: {result.get('bundle_dir')}")
-        if result.get('bundle_selection_reason'):
-            print(f"Bundle selection: {result.get('bundle_selection_reason')}")
-        for item in (result.get('results') or []):
-            label = f"{item.get('kind')}/{item.get('name')}"
-            if item.get('skipped'):
-                print(f"- {label}: skipped ({item.get('reason')})")
-            elif item.get('normalized_equal'):
-                print(f"- {label}: restored cleanly")
-            else:
-                print(f"- {label}: restored with drift remaining")
-        return
-    print(f"Status: {status}")
-
-
-def guided_backup_restore_mode(cluster, namespace, selected, action='backup', bundle_dir=None):
-    selector = selected.get('selector') or labels_to_selector(selected.get('selector_labels') or {})
-    workload_name = selected.get('workload_name')
-    kind = (selected.get('workload_kind') or 'deployment').lower()
-    if action == 'backup':
-        base_obj = {'meta': {'namespace': namespace, 'workload_name': workload_name, 'workload_kind': kind, 'target_selector': selector}}
-        bundle = ensure_mandatory_backup_bundle(base_obj, namespace=namespace, workload=workload_name, kind=kind, include_serviceaccount=True)
-        result = {'status': 'backup_created', 'cluster': cluster, 'namespace': namespace, 'workload_name': workload_name, 'backup_bundle': bundle.get('persisted', {}), 'rollback': bundle.get('rollback', {})}
-        out_path = resource_json_path('guided_backup_restore', namespace=namespace, workload_name=workload_name)
-        smart_write_json_file(out_path, result, 'Backup/restore JSON written')
-        print_backup_restore_summary(result)
-        return result
-    bundle_dir, selection_reason = choose_rollback_bundle(namespace, workload_name, bundle_dir=bundle_dir)
-    result = strict_rollback_bundle(bundle_dir)
-    result['cluster'] = cluster
-    result['bundle_selection_reason'] = selection_reason
-    out_path = resource_json_path('guided_backup_restore', namespace=namespace, workload_name=workload_name)
-    smart_write_json_file(out_path, result, 'Backup/restore JSON written')
-    print_backup_restore_summary(result)
-    return result
-
-
-def guided_analyze_mode(cluster, namespace, selected, timeout=2.0, allow_prompt_for_attacker=True, app_mode='default', start_chat=True, display_output=True):
-    audit_obj, selector, pod, container = build_base_analysis(namespace, selected, timeout=timeout, app_mode=app_mode)
-    prompt_answer = 'n'
-    attacker_bundle = None
-    remote_probe = None
-    attacker_present = not bool(get_nested(audit_obj, 'meta', 'attacker_setup_error'))
-    if not attacker_present and allow_prompt_for_attacker:
-        print("\nInternal audit completed without an attacker pod.")
-        prompt_answer = 'y' if prompt_yes_no('Create a temporary attacker pod backup record and run remote probes now', default='y') else 'n'
-        if prompt_answer == 'y':
-            attacker_bundle = persist_attacker_lifecycle_backup(namespace, selected.get('workload_name'), selector, attacker_name=None, existed_before=False)
-            remote_probe = run_remote_probe_phase(namespace, selector, timeout=timeout, create_if_missing=True, cleanup_temporary_attacker=True)
-            audit_obj['results']['remote_probe_after_internal'] = remote_probe.get('results', {})
-            audit_obj['meta']['attacker_backup_record'] = attacker_bundle
-            audit_obj['meta']['attacker_cleanup'] = remote_probe.get('attacker_cleanup', {})
-            audit_obj = promote_internal_audit_findings(audit_obj)
-            audit_obj = apply_spec_fallback_if_needed(audit_obj)
-            audit_obj = apply_smart_enrichment(audit_obj, load_history())
-            audit_obj = attach_ai_advisor(audit_obj, selected=selected, workflow_mode='analyze', app_mode=app_mode)
-    outputs = guided_output_paths('guided_analyze', namespace, selected.get('workload_name'))
-    ai_mode = normalize_app_mode(app_mode) == 'ai'
-    smart_write_json_file(outputs['audit'], audit_obj, 'Audit JSON written', announce=not ai_mode)
-    manifest_result = apply_fixes(
-        audit_obj,
-        namespace=namespace,
-        workload=selected.get('workload_name'),
-        kind=(selected.get('workload_kind') or 'deployment').lower(),
-        patch_service_account=True,
+    dry_ctx = RunContext(
+        namespace="dryrun",
+        kubeconfig="",
+        target_pod="dry-run-target",
+        target_container="dry-run-container",
+        attacker_pod="dry-run-attacker",
+        attacker_container="dry-run-container",
+        target_ip="0.0.0.0",
         dry_run=True,
     )
-    result = {
-        'status': 'analyzed',
-        'cluster': cluster,
-        'namespace': namespace,
-        'audit': audit_obj,
-        'selector': selector,
-        'pod': pod,
-        'container': container,
-        'prompted_for_attacker': allow_prompt_for_attacker and not attacker_present,
-        'attacker_prompt_answer': prompt_answer,
-        'attacker_backup_record': attacker_bundle,
-        'remote_probe': remote_probe,
-        'manifest_result': manifest_result,
-        'outputs': outputs,
+    dry_checkpoint = build_restore_checkpoint(dry_ctx, "remediation", plan)
+    assert dry_checkpoint["status"] == "dry_run_not_created"
+    assert dry_checkpoint["mutation_gate"]["status"] == "open"
+    checks.append("dry-run enforced backup gate")
+
+    original_run = run_kubectl
+    original_get_json = kubectl_get_json
+
+    pod_json = {
+        "metadata": {
+            "name": "target-pod",
+            "uid": "pod-uid-1",
+            "labels": {"app": "target", "role": "target"},
+            "ownerReferences": [{"kind": "Deployment", "name": "target"}],
+        },
+        "spec": {
+            "serviceAccountName": "default",
+            "nodeName": "node-a",
+            "runtimeClassName": "gvisor",
+            "nodeSelector": {"runtime": "gvisor"},
+            "containers": [{"name": "app"}],
+        },
+        "status": {
+            "phase": "Running",
+            "podIP": "10.0.0.5",
+            "containerStatuses": [{"name": "app", "ready": True}],
+        },
     }
-    if display_output:
-        if ai_mode:
-            print_ai_analyze_completion_summary(audit_obj)
-            print_artifact_summary(analyze_result=result, manifest_result=manifest_result)
-        else:
-            print_audit_summary(audit_obj)
-            print_smart_summary(audit_obj)
-            print_ai_advisor_summary(audit_obj)
-            print_remediation_summary(audit_obj.get('remediation', {}))
-            print_fix_result({'status': 'planned', 'apply_result': manifest_result, 'per_issue': []})
-            print_artifact_summary(analyze_result=result, manifest_result=manifest_result)
-            print_permanent_fix_explanation(audit_obj, manifest_result)
-    if normalize_app_mode(app_mode) == 'ai' and start_chat:
-        start_ai_chat_session(audit_obj, selected=selected, workflow_mode='guided-analyze')
-    return result
+    deployment_json = {
+        "metadata": {"name": "target"},
+        "spec": {
+            "selector": {"matchLabels": {"app": "target", "role": "target"}},
+            "template": {
+                "metadata": {"labels": {"app": "target", "role": "target"}},
+                "spec": {
+                    "containers": [{"name": "app"}],
+                }
+            }
+        },
+    }
 
+    def fake_run_kubectl(kubeconfig: str, args: List[str], timeout: int = 60) -> Tuple[int, str, str]:
+        if args[:1] == ["api-resources"] and "--namespaced=true" in args:
+            return 0, "deployments.apps\nservices\nconfigmaps\nsecrets\npersistentvolumeclaims\n", ""
+        if args[:1] == ["api-resources"]:
+            return 0, "volumesnapshots.snapshot.storage.k8s.io\n", ""
+        if args[:3] == ["apply", "--dry-run=server", "-f"]:
+            return 0, "ok", ""
+        if args[:1] == ["patch"]:
+            return 0, "deployment.apps/target unchanged", ""
+        if args[:2] == ["get", "namespace"]:
+            return 0, "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: ns\n", ""
+        if args[:2] == ["get", "pod"]:
+            return 0, "apiVersion: v1\nkind: Pod\nmetadata:\n  name: target-pod\n", ""
+        if args[:2] == ["get", "deployment"]:
+            return 0, "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: target\n", ""
+        return 0, "apiVersion: v1\nkind: List\nitems: []\n", ""
 
-def guided_remediation_mode(cluster, namespace, selected, timeout=2.0, analyze_first=True, app_mode='default', start_chat=True, analyze_bundle_override=None):
-    analyze_bundle = analyze_bundle_override or (guided_analyze_mode(cluster, namespace, selected, timeout=timeout, allow_prompt_for_attacker=False, app_mode=app_mode, start_chat=False, display_output=False) if analyze_first else None)
-    audit_obj = (analyze_bundle or {}).get('audit')
-    if not audit_obj:
-        audit_obj, _, _, _ = build_base_analysis(namespace, selected, timeout=timeout, app_mode=app_mode)
-    outputs = guided_output_paths('guided_remediation', namespace, selected.get('workload_name'))
-    ai_mode = normalize_app_mode(app_mode) == 'ai'
-    smart_write_json_file(outputs['audit'], audit_obj, 'Audit JSON written', announce=not ai_mode)
-    items = (audit_obj.get('remediation') or {}).get('items') or []
-    actionable_items = [item for item in items if (item.get('issue_id') or '') != 'NO_ACTIONABLE_FAILURES']
-    if not actionable_items:
-        fix_result = {
-            'status': 'no_change',
-            'meta': {
-                'namespace': namespace,
-                'workload': selected.get('workload_name'),
-                'kind': (selected.get('workload_kind') or 'deployment').lower(),
-                'executed_at': now_utc_iso(),
-            },
-            'selected_issue_ids': [item.get('issue_id') for item in items],
-            'per_issue': [{
-                'issue_id': item.get('issue_id'),
-                'title': item.get('title'),
-                'status': 'manual_only',
-                'risk_level': item.get('risk_level'),
-                'note': item.get('manual_recommendation') or item.get('risk_note') or 'No actionable remediation rule was confirmed for this audit.',
-            } for item in items],
-            'apply_result': None,
-            'approval_required': [],
-            'manual_only': items,
-            'aggressive_execute': True,
-            'post_fix_health': {'status': 'not_run', 'checks': [], 'reason': 'no_actionable_remediation_items'},
-        }
-        smart_write_json_file(outputs['fix'], fix_result, 'Fix JSON written', announce=not ai_mode)
-        remediation_bundle = {'outputs': outputs, 'fix': fix_result}
-        if ai_mode:
-            print_ai_remediation_completion_summary(audit_obj, fix_result, analyze_ran=bool(analyze_bundle))
-            print_artifact_summary(analyze_result=analyze_bundle, fix_result=remediation_bundle, manifest_result=(analyze_bundle or {}).get('manifest_result'))
-        else:
-            print_fix_result(fix_result)
-            print_artifact_summary(analyze_result=analyze_bundle, fix_result=remediation_bundle, manifest_result=(analyze_bundle or {}).get('manifest_result'))
-        if normalize_app_mode(app_mode) == 'ai' and start_chat:
-            start_ai_chat_session(audit_obj, selected=selected, workflow_mode='guided-remediation')
-        return {'status': 'remediated', 'cluster': cluster, 'namespace': namespace, 'audit': audit_obj, 'fix': fix_result, 'outputs': outputs, 'analyze_bundle': analyze_bundle}
-    grouping = safe_autonomous_selection(items, aggressive=True)
-    fix_result = run_selected_fix_groups(
-        audit_obj,
-        grouping['selected'] + grouping['approval_required'],
-        namespace=namespace,
-        workload=selected.get('workload_name'),
-        kind=(selected.get('workload_kind') or 'deployment').lower(),
-        execute=True,
-    )
-    fix_result['approval_required'] = grouping['approval_required']
-    fix_result['manual_only'] = grouping['manual_only']
-    fix_result['aggressive_execute'] = True
-    fix_result['post_fix_health'] = check_agentic_workload_health_guided(audit_obj, fix_result, timeout=timeout)
-    smart_write_json_file(outputs['fix'], fix_result, 'Fix JSON written', announce=not ai_mode)
-    remediation_bundle = {'outputs': outputs, 'fix': fix_result}
-    if ai_mode:
-        print_ai_remediation_completion_summary(audit_obj, fix_result, analyze_ran=bool(analyze_bundle))
-        print_artifact_summary(analyze_result=analyze_bundle, fix_result=remediation_bundle, manifest_result=(analyze_bundle or {}).get('manifest_result'))
-    else:
-        print_ai_advisor_summary(audit_obj)
-        print_fix_result(fix_result)
-        print_artifact_summary(analyze_result=analyze_bundle, fix_result=remediation_bundle, manifest_result=(analyze_bundle or {}).get('manifest_result'))
-        if analyze_bundle and analyze_bundle.get('manifest_result'):
-            print_permanent_fix_explanation(audit_obj, analyze_bundle.get('manifest_result'))
-    if normalize_app_mode(app_mode) == 'ai' and start_chat:
-        start_ai_chat_session(audit_obj, selected=selected, workflow_mode='guided-remediation')
-    return {'status': 'remediated', 'cluster': cluster, 'namespace': namespace, 'audit': audit_obj, 'fix': fix_result, 'outputs': outputs, 'analyze_bundle': analyze_bundle}
+    def fake_get_json(kubeconfig: str, args: List[str]) -> Optional[Any]:
+        if args[:2] == ["get", "pod"]:
+            return pod_json
+        if args[:2] == ["get", "deployment"]:
+            return deployment_json
+        if args[:2] == ["get", "pods"]:
+            return {"items": [pod_json]}
+        if "persistentvolumeclaims" in args:
+            return {"items": []}
+        if "rolebindings.rbac.authorization.k8s.io" in args:
+            return {"items": []}
+        if "clusterrolebindings.rbac.authorization.k8s.io" in args:
+            return {"items": []}
+        return {"items": []}
 
-
-def guided_mode_run(cluster=None, namespace=None, mode=None, timeout=2.0, restore_bundle_dir=None, app_mode='default'):
-    resolved_cluster = ensure_cluster_matches(cluster)
-    namespace = namespace or autodetect_namespace('default')
-    app_mode = normalize_app_mode(app_mode)
-    mode = mode or prompt_choice('Mode', ['backup-restore', 'analyze', 'remediation', 'analyze-remediation'], default='analyze')
-    resources = list_candidate_resources(namespace) if namespace else []
-    selected, resources = discover_primary_target_resource(namespace, resources=resources)
-    if not selected:
-        raise RuntimeError(f'No target workload discovered in namespace {namespace}')
-    print_guided_context(resolved_cluster, namespace, selected)
-    print(f"app_mode: {app_mode}")
-    if mode == 'backup-restore':
-        action = prompt_choice('Backup or restore', ['backup', 'restore'], default='backup')
-        bundle_dir = restore_bundle_dir
-        result = guided_backup_restore_mode(resolved_cluster, namespace, selected, action=action, bundle_dir=bundle_dir)
-    elif mode == 'analyze':
-        result = guided_analyze_mode(resolved_cluster, namespace, selected, timeout=timeout, allow_prompt_for_attacker=True, app_mode=app_mode)
-    elif mode == 'remediation':
-        result = guided_remediation_mode(resolved_cluster, namespace, selected, timeout=timeout, analyze_first=True, app_mode=app_mode)
-    elif mode == 'analyze-remediation':
-        analyze_result = guided_analyze_mode(resolved_cluster, namespace, selected, timeout=timeout, allow_prompt_for_attacker=True, app_mode=app_mode)
-        remediation_result = guided_remediation_mode(resolved_cluster, namespace, selected, timeout=timeout, analyze_first=False, app_mode=app_mode)
-        result = {'status': 'analyze_and_remediate_complete', 'cluster': resolved_cluster, 'namespace': namespace, 'analyze': analyze_result, 'remediation': remediation_result}
-    else:
-        raise RuntimeError(f'unsupported guided mode: {mode}')
-    record_run_history((result.get('audit') if isinstance(result, dict) else {}) or {}, (result.get('fix') if isinstance(result, dict) else None) or {'status': result.get('status') if isinstance(result, dict) else 'unknown'})
-    return result
-
-
-def list_namespaces(timeout=30):
-    if not has_kubectl():
-        return []
+    globals()["run_kubectl"] = fake_run_kubectl
+    globals()["kubectl_get_json"] = fake_get_json
     try:
-        obj = kubectl_get_json('', 'namespaces', timeout=timeout)
-        names = [get_nested(item, 'metadata', 'name') for item in (obj.get('items') or [])]
-        return [name for name in names if name]
-    except Exception:
-        return []
+        with tempfile.TemporaryDirectory() as td:
+            ctx = RunContext(
+                namespace="ns",
+                kubeconfig="",
+                target_pod="target-pod",
+                target_container="app",
+                attacker_pod="attacker",
+                attacker_container="app",
+                target_ip="10.0.0.5",
+            )
+            checkpoint = build_restore_checkpoint(ctx, "remediation", plan, base_dir=td)
+            assert checkpoint["schema"] == COMPREHENSIVE_BACKUP_SCHEMA
+            assert checkpoint["status"] == "verified"
+            assert checkpoint["mutation_gate"]["status"] == "open"
+            assert checkpoint["restore_order"]
+            assert os.path.exists(checkpoint["restore_script"])
+            apply_summary = apply_remediation_actions(ctx, plan, checkpoint)
+            assert apply_summary["status"] == "applied"
+            assert apply_summary["applied_count"] >= 1
+        checks.append("comprehensive checkpoint capture")
+        checks.append("automatic remediation apply path")
+    finally:
+        globals()["run_kubectl"] = original_run
+        globals()["kubectl_get_json"] = original_get_json
+
+    print(json.dumps({"status": "passed", "checks": checks}, indent=2))
+    return 0
 
 
-def prompt_for_cluster(initial=None):
-    detected = initial or current_cluster_name() or ''
-    while True:
-        value = prompt('Cluster to analyze', detected or None).strip()
-        if value:
-            return value
-        if detected:
-            return detected
-        print('Enter a cluster name.')
+def main() -> int:
+    global ACTIVE_KUBE_CONTEXT
+    default_gen = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated_outputs")
+    ap = argparse.ArgumentParser(description="AgentFence — 39 unified probes, one scorer")
+    ap.add_argument("--app-mode", choices=["default", "ai"], default="default")
+    ap.add_argument("--cluster", help="Kubernetes context to use for this run only; AgentFence never saves it to kubeconfig")
+    ap.add_argument("--namespace", "-n", required=False)
+    ap.add_argument(
+        "--kubeconfig",
+        default=os.environ.get("KUBECONFIG", "").split(os.pathsep)[0] if os.environ.get("KUBECONFIG") else "",
+        help="kubeconfig path (or set KUBECONFIG)",
+    )
+    ap.add_argument(
+        "--action",
+        choices=[
+            "analyze",
+            "remediation",
+            "analyze-remediation",
+            "backup-namespace",
+            "restore-namespace",
+            "self-test",
+        ],
+        default=None,
+    )
+    ap.add_argument("--target-pod", help="Override auto-selected target pod")
+    ap.add_argument("--timeout", type=int, default=25, help="per-probe kubectl exec timeout")
+    ap.add_argument("--out", help="JSON output path")
+    ap.add_argument("--md-out", help="Markdown output path")
+    ap.add_argument("--dry-run", action="store_true", help="Skip probes; validate catalog and target selection")
+    ap.add_argument(
+        "--headline-alpha",
+        type=float,
+        default=DEFAULT_HEADLINE_ALPHA,
+        help=f"Headline = α·TBE_norm + (1−α)·ELE_norm (default {DEFAULT_HEADLINE_ALPHA}); layers are disjoint",
+    )
+    ap.add_argument(
+        "--bundle-dir",
+        help="Rollback bundle directory (contains backup_manifest.json); used with restore-namespace",
+    )
+    ap.add_argument(
+        "--backup-parent-dir",
+        default=None,
+        help="Directory under which rollback_bundle_* folders are created (default: generated_outputs beside this script)",
+    )
+    ap.add_argument(
+        "--create-backup",
+        action="store_true",
+        help="Snapshot namespace into a rollback bundle before reports (on by default for remediation and analyze-remediation; use with analyze to opt in)",
+    )
+    ap.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="Analyze-only compatibility flag; rejected for remediation and analyze-remediation",
+    )
+    ap.add_argument(
+        "--include-secrets-backup",
+        action="store_true",
+        help="Compatibility flag; comprehensive checkpoints include Secret objects unless --omit-secrets-backup is used",
+    )
+    ap.add_argument(
+        "--omit-secrets-backup",
+        action="store_true",
+        help="Omit Secret objects from the restore checkpoint (less comprehensive, less sensitive)",
+    )
+    ap.add_argument(
+        "--velero-backup",
+        action="store_true",
+        help="If velero is on PATH, also run velero backup create for the namespace",
+    )
+    ap.add_argument(
+        "--allow-node-runtime-remediation",
+        action="store_true",
+        help=(
+            "Allow operator-approved node/runtime changes when required for verification, "
+            "currently Kata guest seccomp on the target node. This can affect other Kata "
+            "workloads on that node/runtime handler."
+        ),
+    )
+    args = ap.parse_args()
 
+    kc = args.kubeconfig or os.path.expanduser("~/.kube/config")
+    ACTIVE_KUBE_CONTEXT = args.cluster or None
+    backup_parent = args.backup_parent_dir or default_gen
+    include_secrets_backup = not args.omit_secrets_backup
 
-def prompt_for_namespace(initial=None):
-    detected = initial or autodetect_namespace('default')
-    while True:
-        value = prompt('Namespace to analyze (or type `list`)', detected or None).strip()
-        if value.lower() == 'list':
-            namespaces = list_namespaces()
-            print('\nAvailable namespaces:')
-            if namespaces:
-                for idx, ns in enumerate(namespaces, start=1):
-                    print(f"{idx}. {ns}")
-            else:
-                print('No namespaces could be listed.')
-            continue
-        if value:
-            return value
-        if detected:
-            return detected
-        print('Enter a namespace.')
+    if args.app_mode == "ai" and sys.stdin.isatty() and args.action is None:
+        return run_ai_interactive_cli(args, kc, backup_parent, include_secrets_backup)
 
+    if args.action is None:
+        args.action = "analyze"
 
-def select_resource_for_default(namespace, workload_name=None):
-    resources = list_candidate_resources(namespace)
-    candidates = [r for r in resources if not is_attacker_resource(r)]
-    if workload_name:
-        matches = [r for r in candidates if (r.get('workload_name') or '').lower() == workload_name.lower()]
-        if not matches:
-            raise RuntimeError(f"No workload named '{workload_name}' discovered in namespace {namespace}")
-        return matches[0]
-    if len(candidates) == 1:
-        return candidates[0]
-    if not candidates:
-        raise RuntimeError(f'No target workload discovered in namespace {namespace}')
-    print_resource_list(candidates, title='Discovered target resources')
-    names = ', '.join(sorted({r.get('workload_name') for r in candidates if r.get('workload_name')}))
-    raise RuntimeError(f"Multiple workloads discovered in namespace {namespace}; rerun with --workload-name. Available: {names}")
+    if args.action == "self-test":
+        return run_self_test()
 
+    if args.action == "backup-namespace":
+        if not args.namespace:
+            print("Error: --namespace is required for backup-namespace", file=sys.stderr)
+            return 2
+        os.makedirs(backup_parent, exist_ok=True)
+        info = create_comprehensive_namespace_backup_bundle(
+            kc,
+            args.namespace,
+            backup_parent,
+            include_secrets=include_secrets_backup,
+            run_velero=args.velero_backup,
+        )
+        print(json.dumps(info, indent=2))
+        return 2 if info.get("status") == "failed" else 0
 
-def run_default_app_mode(cluster=None, namespace=None, action=None, timeout=2.0, restore_bundle_dir=None, workload_name=None):
-    if not cluster or not namespace or not action:
-        raise RuntimeError('default mode requires --cluster, --namespace, and --action')
-    resolved_cluster = ensure_cluster_matches(cluster)
-    selected = select_resource_for_default(namespace, workload_name=workload_name)
-    print_guided_context(resolved_cluster, namespace, selected)
-    print("app_mode: default")
-    if action == 'backup-restore':
-        result = guided_backup_restore_mode(resolved_cluster, namespace, selected, action='backup', bundle_dir=restore_bundle_dir)
-    elif action == 'analyze':
-        result = guided_analyze_mode(resolved_cluster, namespace, selected, timeout=timeout, allow_prompt_for_attacker=True, app_mode='default', start_chat=False)
-    elif action == 'remediation':
-        result = guided_remediation_mode(resolved_cluster, namespace, selected, timeout=timeout, analyze_first=True, app_mode='default', start_chat=False)
-    elif action == 'analyze-remediation':
-        analyze_result = guided_analyze_mode(resolved_cluster, namespace, selected, timeout=timeout, allow_prompt_for_attacker=True, app_mode='default', start_chat=False)
-        remediation_result = guided_remediation_mode(resolved_cluster, namespace, selected, timeout=timeout, analyze_first=False, app_mode='default', start_chat=False)
-        result = {'status': 'analyze_and_remediate_complete', 'cluster': resolved_cluster, 'namespace': namespace, 'analyze': analyze_result, 'remediation': remediation_result}
-    else:
-        raise RuntimeError(f'unsupported action: {action}')
-    return result
+    if args.action == "restore-namespace":
+        if not args.bundle_dir:
+            print("Error: --bundle-dir is required for restore-namespace", file=sys.stderr)
+            return 2
+        bd = os.path.abspath(args.bundle_dir)
+        res = restore_namespace_bundle(kc, bd, dry_run=args.dry_run)
+        print(json.dumps(res, indent=2))
+        if res.get("status") == "failed":
+            return 2
+        if res.get("status") == "partial":
+            print("Warning: restore completed with some failures", file=sys.stderr)
+            return 1
+        return 0
 
+    if not args.namespace:
+        if args.app_mode == "ai" and sys.stdin.isatty():
+            args.namespace = input("Namespace: ").strip()
+        if not args.namespace:
+            print("Error: --namespace is required (or provide when prompted in ai mode)", file=sys.stderr)
+            return 2
 
-def run_ai_app_mode(cluster=None, namespace=None, timeout=2.0, restore_bundle_dir=None):
-    session = {
-        'app_mode': 'ai',
-        'cluster': None,
-        'namespace': None,
-        'selected': None,
-        'resources': [],
-        'timeout': timeout,
-        'restore_bundle_dir': restore_bundle_dir,
-        'analyze_result': None,
-        'audit': {'app_mode': 'ai'},
-        'audit_data_collected': False,
-        'manifest_result': None,
-        'detected_cluster': current_cluster_name() if has_kubectl() else None,
-        'detected_namespace': autodetect_namespace('default') if has_kubectl() else None,
-        'phase': 'awaiting_cluster',
-    }
-    if cluster:
-        resolved_cluster = ensure_cluster_matches(cluster)
-        session['cluster'] = resolved_cluster
-        session['phase'] = 'awaiting_namespace'
-    if namespace:
-        session['namespace'] = namespace
-        if session.get('cluster'):
-            session['phase'] = 'awaiting_workload_discovery'
-    start_ai_chat_session(session.get('audit') or {}, selected=session.get('selected'), workflow_mode='guided-ai', session=session)
-    return session.get('analyze_result') or {'status': 'ai_session_closed', 'cluster': session.get('cluster'), 'namespace': session.get('namespace')}
+    if args.app_mode == "ai" and sys.stdin.isatty() and "--action" not in sys.argv:
+        raw_action = input(
+            "Action [analyze | remediation | analyze-remediation] (default: analyze): "
+        ).strip()
+        norm = re.sub(r"[^a-z]+", "", raw_action.lower())
+        if norm in ("analyzeremediation", "analyzeandremediation", "ar"):
+            args.action = "analyze-remediation"
+        elif norm in ("remediation", "r"):
+            args.action = "remediation"
+        elif raw_action and norm not in ("analyze", "a", ""):
+            print(f"Warning: unrecognized action {raw_action!r}; using analyze", file=sys.stderr)
 
+    enforced_pre_run_actions = frozenset({"remediation", "analyze-remediation"})
+    pre_run_ctx: Optional[RunContext] = None
+    pre_run_backup_checkpoint: Optional[Dict[str, Any]] = None
+    if args.no_backup and args.action in enforced_pre_run_actions:
+        print(
+            "Error: --no-backup is not allowed for remediation or analyze-remediation. "
+            "A restore checkpoint must be created before those actions run.",
+            file=sys.stderr,
+        )
+        return 2
 
-def run_hidden_internal_cli(argv):
-    ap = argparse.ArgumentParser(description='AgentFence internal compatibility mode')
-    ap.add_argument('--timeout', type=float, default=2.0)
-    ap.add_argument('--stdout-json', action='store_true')
-    ap.add_argument('--out')
-    args = ap.parse_args(argv)
-    obj = collect_internal(timeout=args.timeout)
-    if args.out:
-        with open(args.out, 'w') as fh:
-            json.dump(obj, fh, indent=2)
-    if args.stdout_json or not args.out:
-        print(json.dumps(obj, indent=2))
-    return obj
-
-
-_original_main = main
-
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] == 'internal':
+    if args.action in enforced_pre_run_actions:
         try:
-            return run_hidden_internal_cli(sys.argv[2:])
+            pre_run_ctx = build_context(
+                args.namespace,
+                kc,
+                args.target_pod,
+                args.dry_run,
+                args.timeout,
+                allow_node_runtime_remediation=args.allow_node_runtime_remediation,
+            )
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 2
-    ap = argparse.ArgumentParser(description='AgentFence AI')
-    ap.add_argument('--app-mode', choices=['default', 'ai'], default=APP_MODE_DEFAULT)
-    ap.add_argument('--cluster')
-    ap.add_argument('--namespace')
-    ap.add_argument('--action', choices=['backup-restore', 'analyze', 'remediation', 'analyze-remediation'])
-    ap.add_argument('--workload-name')
-    ap.add_argument('--timeout', type=float, default=2.0)
-    ap.add_argument('--restore-bundle-dir')
-    args = ap.parse_args()
-    try:
-        if args.app_mode == 'ai':
-            return run_ai_app_mode(cluster=args.cluster, namespace=args.namespace, timeout=args.timeout, restore_bundle_dir=args.restore_bundle_dir)
-        return run_default_app_mode(
-            cluster=args.cluster,
-            namespace=args.namespace,
-            action=args.action,
-            timeout=args.timeout,
-            restore_bundle_dir=args.restore_bundle_dir,
-            workload_name=args.workload_name,
+        pre_run_backup_checkpoint = build_restore_checkpoint(
+            pre_run_ctx,
+            args.action,
+            remediation_plan=None,
+            base_dir=backup_parent,
+            include_secrets=include_secrets_backup,
+            run_velero=args.velero_backup,
         )
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(2)
+        backup_status = pre_run_backup_checkpoint.get("status")
+        allowed = {"verified", "verified_with_warnings", "dry_run_not_created"}
+        if backup_status not in allowed:
+            print(
+                "Error: enforced pre-run restore checkpoint failed. "
+                f"status={backup_status!r} bundle={pre_run_backup_checkpoint.get('bundle_dir')!r}. "
+                "Remediation and analyze-remediation will not run until the checkpoint is restorable.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"Selected target: {pre_run_ctx.target_pod} (container={pre_run_ctx.target_container!r}) "
+            f"attacker={pre_run_ctx.attacker_pod} target_ip={pre_run_ctx.target_ip}",
+            file=sys.stderr,
+        )
+
+    if args.action == "analyze":
+        try:
+            results, metrics, ctx = analyze_pipeline(
+                args.namespace,
+                kc,
+                args.target_pod,
+                args.dry_run,
+            args.timeout,
+            args.headline_alpha,
+            allow_node_runtime_remediation=args.allow_node_runtime_remediation,
+        )
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
+        print(
+            f"Selected target: {ctx.target_pod} (container={ctx.target_container!r}) "
+            f"attacker={ctx.attacker_pod} target_ip={ctx.target_ip}",
+            file=sys.stderr,
+        )
+        print(
+            f"Scores: headline={metrics.score_normalized} "
+            f"(TBE_norm={metrics.tbe_score_normalized}, "
+            f"ELE_norm={metrics.ele_score_normalized}, α={metrics.headline_alpha})",
+            file=sys.stderr,
+        )
+        context = context_from_ctx(ctx)
+        remediation_plan = build_remediation_plan(results, context)
+        payload = {
+            "agentfence": True,
+            "catalog_version": CATALOG_VERSION,
+            "action": "analyze",
+            "namespace": args.namespace,
+            "target_pod": ctx.target_pod,
+            "context": context,
+            "metrics": metrics.__dict__,
+            "results": [r.__dict__ for r in results],
+            "remediation": remediation_plan,
+        }
+        narr_m, narr_r = metrics, results
+        report_results = results
+        report_metrics = metrics
+        report_remediation = remediation_plan
+        report_remediation_apply = None
+        report_results_after = None
+        report_metrics_after = None
+        eval_kwargs = {
+            "metrics": metrics,
+            "results": results,
+            "remediation_plan": remediation_plan,
+        }
+    elif args.action == "remediation":
+        payload = remediation_pipeline(
+            args.namespace,
+            kc,
+            args.target_pod,
+            args.dry_run,
+            args.timeout,
+            args.headline_alpha,
+            backup_parent,
+            include_secrets_backup,
+            args.velero_backup,
+            False,
+            pre_run_backup_checkpoint,
+            pre_run_ctx,
+            args.allow_node_runtime_remediation,
+        )
+        payload["agentfence"] = True
+        payload["catalog_version"] = CATALOG_VERSION
+        mb = payload["metrics_before"]
+        m_narr = score_bundle_from_dict(mb)
+        r_narr = [result_from_dict(d) for d in payload.get("results_before", [])]
+        narr_m, narr_r = m_narr, r_narr
+        context = payload.get("context") or (
+            context_from_ctx(pre_run_ctx) if pre_run_ctx else {}
+        )
+        report_results = r_narr
+        report_metrics = m_narr
+        report_remediation = payload.get("remediation")
+        report_remediation_apply = payload.get("remediation_apply")
+        report_results_after = [result_from_dict(d) for d in payload.get("results_after", [])]
+        report_metrics_after = score_bundle_from_dict(payload.get("metrics_after", {})) if payload.get("metrics_after") else None
+        eval_kwargs = {
+            "metrics_before": payload.get("metrics_before"),
+            "results_before": payload.get("results_before"),
+            "metrics_after": payload.get("metrics_after"),
+            "results_after": payload.get("results_after"),
+            "remediation_plan": report_remediation,
+            "backup_checkpoint": payload.get("backup_checkpoint"),
+            "health": payload.get("remediation_apply") or {},
+        }
+    else:
+        payload = analyze_remediation_pipeline(
+            args.namespace,
+            kc,
+            args.target_pod,
+            args.dry_run,
+            args.timeout,
+            args.headline_alpha,
+            backup_parent,
+            include_secrets_backup,
+            args.velero_backup,
+            False,
+            pre_run_backup_checkpoint,
+            pre_run_ctx,
+            args.allow_node_runtime_remediation,
+        )
+        payload["agentfence"] = True
+        payload["catalog_version"] = CATALOG_VERSION
+        mb = payload["metrics_before"]
+        m_narr = score_bundle_from_dict(mb)
+        r_narr = [result_from_dict(d) for d in payload.get("results_before", [])]
+        narr_m, narr_r = m_narr, r_narr
+        context = payload.get("context") or (
+            context_from_ctx(pre_run_ctx) if pre_run_ctx else {}
+        )
+        report_results = r_narr
+        report_metrics = m_narr
+        report_remediation = payload.get("remediation")
+        report_remediation_apply = payload.get("remediation_apply")
+        report_results_after = [result_from_dict(d) for d in payload.get("results_after", [])]
+        report_metrics_after = score_bundle_from_dict(payload.get("metrics_after", {})) if payload.get("metrics_after") else None
+        eval_kwargs = {
+            "metrics_before": payload.get("metrics_before"),
+            "results_before": payload.get("results_before"),
+            "metrics_after": payload.get("metrics_after"),
+            "results_after": payload.get("results_after"),
+            "remediation_plan": report_remediation,
+            "backup_checkpoint": payload.get("backup_checkpoint"),
+            "health": payload.get("remediation_apply") or {},
+        }
+
+    ts = now_stamp()
+    out_path = args.out or os.path.join(
+        os.path.dirname(__file__),
+        "generated_outputs",
+        f"agentfence_{args.action}_{args.namespace}_{ts}.json",
+    )
+    md_path = args.md_out or os.path.join(
+        os.path.dirname(__file__),
+        "generated_outputs",
+        f"agentfence_{args.action}_{args.namespace}_{ts}.md",
+    )
+    if args.out:
+        eval_json_path = os.path.splitext(out_path)[0] + "_f1_f5.json"
+    else:
+        eval_json_path = os.path.join(
+            os.path.dirname(__file__),
+            "generated_outputs",
+            f"agentfence_f1_f5_{args.action}_{args.namespace}_{ts}.json",
+        )
+    if args.md_out:
+        eval_md_path = os.path.splitext(md_path)[0] + "_f1_f5.md"
+    else:
+        eval_md_path = os.path.join(
+            os.path.dirname(__file__),
+            "generated_outputs",
+            f"agentfence_f1_f5_{args.action}_{args.namespace}_{ts}.md",
+        )
+
+    artifacts = {
+        "main_json": out_path,
+        "main_markdown": md_path,
+        "f1_f5_json": eval_json_path,
+        "f1_f5_markdown": eval_md_path,
+    }
+    backup_checkpoint = eval_kwargs.get("backup_checkpoint")
+    if isinstance(backup_checkpoint, dict) and backup_checkpoint.get("bundle_dir"):
+        artifacts["rollback_bundle"] = backup_checkpoint["bundle_dir"]
+
+    if args.action == "analyze" and args.create_backup and not args.no_backup:
+        os.makedirs(backup_parent, exist_ok=True)
+        backup_checkpoint = build_restore_checkpoint(
+            ctx,
+            args.action,
+            report_remediation,
+            base_dir=backup_parent,
+            include_secrets=include_secrets_backup,
+            run_velero=args.velero_backup,
+        )
+        eval_kwargs["backup_checkpoint"] = backup_checkpoint
+        payload["backup_checkpoint"] = backup_checkpoint
+        if backup_checkpoint.get("bundle_dir"):
+            artifacts["rollback_bundle"] = backup_checkpoint["bundle_dir"]
+
+    if artifacts.get("rollback_bundle"):
+        gate = (
+            " (enforced pre-run checkpoint, before probes)"
+            if pre_run_backup_checkpoint
+            and artifacts["rollback_bundle"] == pre_run_backup_checkpoint.get("bundle_dir")
+            else ""
+        )
+        print(f"Rollback bundle{gate}: {artifacts['rollback_bundle']}", file=sys.stderr)
+
+    narr = maybe_ai_narrate(
+        narr_m,
+        narr_r,
+        args.app_mode,
+        backup_bundle_path=artifacts.get("rollback_bundle"),
+        backup_status=(backup_checkpoint or {}).get("status")
+        if isinstance(backup_checkpoint, dict)
+        else None,
+        action=args.action,
+    )
+    if narr:
+        print(narr)
+
+    evaluation = build_f1_f5_evaluation(
+        action=args.action,
+        namespace=args.namespace,
+        context=context,
+        artifacts=artifacts,
+        **eval_kwargs,
+    )
+    payload["evaluation"] = evaluation
+    payload["enriched_report"] = build_enriched_report(
+        action=args.action,
+        context=context,
+        metrics_before=report_metrics,
+        results_before=report_results,
+        remediation_plan=report_remediation,
+        remediation_apply=report_remediation_apply,
+        metrics_after=report_metrics_after,
+        results_after=report_results_after,
+        evaluation=evaluation,
+    )
+    write_json(out_path, payload)
+    write_json(eval_json_path, evaluation)
+    write_f1_f5_md(eval_md_path, evaluation)
+    write_md(
+        md_path,
+        f"AgentFence {args.action} {args.namespace}",
+        report_results,
+        report_metrics,
+        remediation_plan=report_remediation,
+        remediation_apply=report_remediation_apply,
+        evaluation=evaluation,
+        action=args.action,
+        context=context,
+        results_after=report_results_after,
+        metrics_after=report_metrics_after,
+    )
+
+    reconcile_evaluation_artifact_paths(evaluation)
+    payload["evaluation"] = evaluation
+    payload["enriched_report"] = build_enriched_report(
+        action=args.action,
+        context=context,
+        metrics_before=report_metrics,
+        results_before=report_results,
+        remediation_plan=report_remediation,
+        remediation_apply=report_remediation_apply,
+        metrics_after=report_metrics_after,
+        results_after=report_results_after,
+        evaluation=evaluation,
+    )
+    write_json(out_path, payload)
+    write_json(eval_json_path, evaluation)
+    write_f1_f5_md(eval_md_path, evaluation)
+    write_md(
+        md_path,
+        f"AgentFence {args.action} {args.namespace}",
+        report_results,
+        report_metrics,
+        remediation_plan=report_remediation,
+        remediation_apply=report_remediation_apply,
+        evaluation=evaluation,
+        action=args.action,
+        context=context,
+        results_after=report_results_after,
+        metrics_after=report_metrics_after,
+    )
+
+    print(json.dumps({"out": out_path, "md": md_path, "f1_f5_json": eval_json_path, "f1_f5_md": eval_md_path}, indent=2))
+    return 0
+
+
+# Boot-time catalog integrity
+_ids = [p.id for p in CATALOG]
+assert len(_ids) == 39, len(_ids)
+assert len(set(_ids)) == 39, "duplicate probe id"
+assert set(_ids) == set(PROBE_RUNNERS.keys()), set(_ids) ^ set(PROBE_RUNNERS.keys())
+assert abs(catalog_max() - 74.0) < 0.001, catalog_max()
+assert TBE_PROBE_IDS <= frozenset(p.id for p in CATALOG)
+assert len(TBE_PROBE_IDS) == 3
+assert abs(catalog_max_tbe() - 7.0) < 0.001, catalog_max_tbe()
+assert abs(catalog_max_ele() - 67.0) < 0.001, catalog_max_ele()
+assert math.isclose(catalog_max_tbe() + catalog_max_ele(), catalog_max())
+assert set(REMEDIATION_RECIPES.keys()) == set(_ids), set(_ids) ^ set(REMEDIATION_RECIPES.keys())
+assert all(r.action_type in ("auto_fix", "hybrid", "manual_recommendation") for r in REMEDIATION_RECIPES.values())
+assert all(r.title and r.risk and r.recommendation and r.validation for r in REMEDIATION_RECIPES.values())
+assert all(r.operator_steps for r in REMEDIATION_RECIPES.values())
+assert all(r.dry_run_artifact for r in REMEDIATION_RECIPES.values() if r.action_type in ("auto_fix", "hybrid"))
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

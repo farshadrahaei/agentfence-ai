@@ -1,214 +1,195 @@
 # Sandbox Architecture And Results
 
-This document explains the sandbox architectures used for `CUA`, `gVisor`, and `Kata`, and how `AgentFence AI` produces the result artifacts stored in [generated_outputs/](generated_outputs/).
+This document explains the Kubernetes sandbox architectures used for `CUA`, `gVisor`, and `Kata`, and how `AgentFence AI` produces the result artifacts stored in [generated_outputs/](generated_outputs/).
 
 ## Purpose
 
-`AgentFence AI` is designed to evaluate and harden sandboxed agentic AI workloads that run in Kubernetes. In this project, the key sandbox targets are:
+`AgentFence AI` evaluates and hardens sandboxed agentic AI workloads that run in Kubernetes. The current evaluation uses three sandbox tracks:
 
-- `sandbox-cua`
-- `sandbox-gvisor`
-- `sandbox-kata`
+- `sandbox-cua` / `sandbox-cua-fresh`
+- `sandbox-gvisor` / `sandbox-gvisor-fresh`
+- `sandbox-kata` / `sandbox-kata-fresh`
 
 Each sandbox represents a different runtime or isolation profile, but the analysis workflow is intentionally consistent:
 
 1. discover the target workload
-2. analyze the workload posture
-3. score the security findings
-4. remediate supported issues
-5. revalidate the workload after remediation
-6. preserve rollback and source-of-truth artifacts
+2. analyze workload and sandbox posture
+3. score security findings using disjoint TBE/ELE scoring
+4. create a rollback checkpoint before mutation
+5. remediate supported issues
+6. revalidate the workload after remediation
+7. preserve fixed findings and manual recommendations in generated reports
 
 ## Shared Kubernetes Model
 
 All three sandboxes follow the same broad model:
 
-- one namespace per sandbox
+- one namespace per sandbox track
 - one target workload deployment
-- one attacker workload used for controlled remote probing
-- supporting network policies and service resources
+- one adjacent measurement/attacker workload used for controlled probing
+- supporting service and network policy resources
+- egress path to the LLM gateway where the workload requires it
 
-The target workloads discovered by the app are:
-
-- `sandbox-cua` -> `deployment/target-cua`
-- `sandbox-gvisor` -> `deployment/target-gvisor`
-- `sandbox-kata` -> `deployment/target-kata`
-
-The app excludes attacker resources from the primary target selection flow and focuses on the target deployment.
+The app excludes attacker resources from primary target selection and focuses remediation on the selected target workload.
 
 ## Sandbox-Specific Notes
 
 ### CUA
 
-`CUA` is used as the baseline agentic workload sandbox. It reflects a desktop-style or interactive AI workload that may need writable workspace volumes and service exposure. This makes it useful for showing:
-
-- risky writable-root posture
-- service account token exposure
-- image-level issues such as setuid/setgid binaries
+`CUA` is the compatibility-sensitive baseline track. It can represent an interactive or multi-container agentic workload that may need writable workspace volumes and service exposure. It is useful for showing where automatic hardening must be careful: some controls can be applied and verified, while others remain manual because forcing them could break the workload.
 
 ### gVisor
 
-`gVisor` uses a sandboxed runtime class intended to reduce kernel attack surface. In the source configuration and live manifests, this usually appears through a sandbox-specific runtime setup and associated namespace isolation controls.
-
-This environment is useful for demonstrating:
-
-- how runtime isolation helps but does not eliminate workload-level issues
-- how Kubernetes spec issues can still be remediated even when a sandboxed runtime is used
+`gVisor` uses a sandboxed runtime class intended to reduce kernel attack surface. It demonstrates that runtime isolation can reduce some host-adjacent risk while Kubernetes workload controls such as seccomp, capabilities, service-account exposure, and no-new-privileges still matter.
 
 ### Kata
 
-`Kata` uses VM-like container isolation through a dedicated runtime class. It provides a stronger isolation boundary than a standard OCI container runtime, but the workload spec and image still matter.
-
-This environment is useful for demonstrating:
-
-- separation between runtime isolation and workload hardening
-- cases where some issues are fixable in-cluster
-- cases where image-level issues remain after remediation
+`Kata` uses VM-like container isolation through a dedicated runtime class. It provides a stronger runtime boundary than a standard OCI runtime, but workload configuration, runtime settings, image behavior, and side-channel surfaces still affect the final risk profile.
 
 ## How AgentFence AI Produces Results
 
-The result files in `generated_outputs/` are created by the live workflow used in `default` mode and `ai` mode.
+The result files in `generated_outputs/` are created by the live workflow used in both `default` mode and `ai` mode.
 
 At a high level, the app does the following:
 
-1. identify the cluster, namespace, and workload
-2. collect remote and Kubernetes evidence
-3. try internal validation from the target pod when possible
-4. fall back to spec-based validation when runtime validation is incomplete
-5. generate remediation items and risk scores
-6. optionally execute supported remediations
-7. generate post-fix validation results
-8. write artifacts to `generated_outputs/`
+1. identify the cluster, namespace, target pod, and workload context
+2. collect remote, Kubernetes, and in-workload evidence
+3. run the unified probe catalog
+4. mark reachable service exposure as review-only communication evidence
+5. compute raw, TBE, ELE, and headline scores
+6. generate remediation items for all probes
+7. create a rollback checkpoint before mutation
+8. apply guarded auto-fixes and gated node/runtime hardening only when applicable
+9. revalidate workload health and rerun probes
+10. write JSON, Markdown, evaluation-factor, and rollback metadata artifacts
 
-## Main Artifact Types
+## Current Artifact Types
 
-### Analyze audit
+Current artifact names use the `agentfence_*` prefix. Older `guided_*` artifacts in this repository are legacy examples from earlier application versions.
+
+### Main report
 
 Files named like:
 
 ```text
-guided_analyze_audit_<namespace>_<workload>_<timestamp>.json
-guided_analyze_audit_<namespace>_<workload>_<timestamp>.md
+agentfence_<action>_<namespace>_<timestamp>.json
+agentfence_<action>_<namespace>_<timestamp>.md
 ```
 
 These capture:
 
 - discovered workload metadata
-- findings
-- risk score
-- AI advisor guidance
-- remediation candidates
+- all probe results
+- scored unsafe findings
+- review-only communication exposure
+- skipped findings
+- TBE/ELE/headline scores
+- remediation plan and outcomes
+- before/after comparisons for remediation workflows
+- fixed probes and remaining manual recommendations
 
-### Remediation audit
-
-Files named like:
-
-```text
-guided_remediation_audit_<namespace>_<workload>_<timestamp>.json
-guided_remediation_audit_<namespace>_<workload>_<timestamp>.md
-```
-
-These represent the audit state that directly feeds the remediation decision for that run.
-
-This is especially important because the remediation step should use the same effective findings that justify the fix execution.
-
-### Remediation fixes
+### Evaluation-factor report
 
 Files named like:
 
 ```text
-guided_remediation_fixes_<namespace>_<workload>_<timestamp>.json
-guided_remediation_fixes_<namespace>_<workload>_<timestamp>.md
+agentfence_f1_f5_<action>_<namespace>_<timestamp>.json
+agentfence_f1_f5_<action>_<namespace>_<timestamp>.md
 ```
 
-These record:
+These capture:
 
-- selected issues
-- issue-by-issue fix status
-- executed change steps
-- post-fix validation
-- recalculated risk after remediation
+- F1: workload and context capture
+- F2: analyze probe summary
+- F3: remediation effectiveness
+- F4: artifact consistency
+- F5: recoverability and rollback readiness
 
-### Source-of-truth manifest
-
-Files named like:
-
-```text
-source_of_truth_manifest_<namespace>_<workload>_<timestamp>.yaml
-```
-
-These are the recommended manifest changes to make the fix permanent in source automation such as Git.
-
-## Output Folder
-
-The generated result set referenced throughout this document is stored in the repository under [generated_outputs/](generated_outputs/).
+These factors are review evidence, not a second scoring system.
 
 ### Rollback bundle
 
 Directories named like:
 
 ```text
-rollback_bundle_<namespace>_<workload>_<timestamp>/
+rollback_bundle_<namespace>_<target>_<timestamp>/
 ```
 
-These contain:
+These can contain:
 
-- resource snapshots
-- a backup manifest
-- data needed to restore the workload to its earlier state
+- `backup_manifest.json`
+- namespace snapshots
+- affected resource snapshots
+- cluster dependency metadata
+- checksums
+- validation metadata
+
+Raw rollback bundles are not included in the public repository because they can contain environment-specific and sensitive material, including image pull secrets, registry credentials, service-account metadata, internal node names, pod IPs, network CIDRs, absolute local paths, Kubernetes events, and cluster dependency snapshots.
+
+Operators should generate rollback bundles in their own environment immediately before remediation. A rollback bundle from one cluster should not be treated as portable recovery material for another cluster.
+
+## Current Fresh-Sandbox Results
+
+The latest reported fresh-sandbox analyze-remediation runs are:
+
+| Track | Main report | Evaluation-factor report | Analyze result | Analyze to remediation | Headline score |
+| --- | --- | --- | --- | --- | --- |
+| CUA | `agentfence_analyze-remediation_sandbox-cua-fresh_20260516T144201Z.*` | `agentfence_f1_f5_analyze-remediation_sandbox-cua-fresh_20260516T144201Z.*` | 12 scored unsafe, 27 safe, 0 skipped | 12 issues, raw 16.5 -> 10 issues, raw 14.5 | 4.1748 -> 4.0554 |
+| gVisor | `agentfence_analyze-remediation_sandbox-gvisor-fresh_20260516T154032Z.*` | `agentfence_f1_f5_analyze-remediation_sandbox-gvisor-fresh_20260516T154032Z.*` | 10 scored unsafe, 29 safe, 0 skipped | 10 issues, raw 15.0 -> 8 issues, raw 13.0 | 1.6930 -> 1.5736 |
+| Kata | `agentfence_analyze-remediation_sandbox-kata-fresh_20260516T161818Z.*` | `agentfence_f1_f5_analyze-remediation_sandbox-kata-fresh_20260516T161818Z.*` | 11 scored unsafe, 28 safe, 0 skipped | 11 issues, raw 15.5 -> 6 issues, raw 4.5 | 0.9254 -> 0.2687 |
+
+Verified fixed probes in the latest runs:
+
+- CUA: seccomp filtering; no-new-privileges enforcement.
+- gVisor: seccomp filtering; Linux capability bounding.
+- Kata: seccomp filtering; kernel log restriction; BPF program-load restriction; performance-event restriction; capability bounding.
 
 ## Interpreting Results
 
 The intended interpretation model is:
 
-- analyze shows what is currently wrong
-- remediation fixes supported Kubernetes-spec issues
-- unresolved image-level issues remain visible after remediation
-- the final risk should decrease, but not incorrectly drop to zero if unresolved findings remain
+- analyze shows what unsafe conditions were observed
+- review-only communication exposure remains visible but unscored
+- remediation fixes supported and verified issues
+- unsafe changes are rolled back or left as manual recommendations
+- image-level, runtime-level, workload-design, and side-channel findings may remain after remediation
+- the final risk should decrease, but not incorrectly drop to zero if residual findings remain
 
-For example, a common pattern in these sandboxes is:
-
-- before remediation:
-  - `SERVICE_ACCOUNT_TOKEN`
-  - `ROOTFS_RW`
-  - `SETID_BINARIES_PRESENT`
-- after remediation:
-  - `SERVICE_ACCOUNT_TOKEN` fixed
-  - `ROOTFS_RW` fixed
-  - `SETID_BINARIES_PRESENT` remains
-
-That means the post-remediation score should go down, but still remain nonzero.
+The score is decision support, not a proof of complete security. Read it together with fixed probes, rolled-back attempts, review-only findings, and manual recommendations.
 
 ## Why Results May Differ Across Sandboxes
 
-Even with the same app logic, some differences can come from:
+Even with the same app logic, differences can come from:
 
 - runtime class differences
+- kernel and runtime behavior
 - tool availability inside the target pod
-- whether internal validation can run directly
-- whether fallback validation must be used
-- whether the remaining issue is image-level versus spec-level
+- workload compatibility with non-root, read-only root filesystem, or no-new-privileges settings
+- whether node/runtime hardening is applicable and not already enabled
+- whether a remaining issue requires image rebuild, workload redesign, or operator communication-intent review
 
-This is why `AgentFence AI` now combines:
+This is why `AgentFence AI` combines:
 
 - runtime evidence when available
 - Kubernetes spec reconciliation
-- carry-forward of unresolved non-spec issues such as `SETID_BINARIES_PRESENT`
-
-That combination helps keep the output consistent across CUA, gVisor, and Kata.
+- workload revalidation
+- rollback-aware remediation
+- explicit carry-forward of unresolved manual findings
 
 ## Recommended Reading Order
 
-If you are reviewing a run, the best order is:
+If you are reviewing a current run, read:
 
-1. analyze JSON
-2. remediation fixes JSON
-3. manifest YAML
-4. rollback bundle manifest
+1. main Markdown report
+2. main JSON report
+3. evaluation-factor Markdown report
+4. evaluation-factor JSON report
+5. rollback bundle summary or local backup manifest, if available in your own environment
 
 This gives the clearest picture of:
 
 - what was found
+- what was scored
 - what was fixed
-- what remains
-- how to make the fix permanent
+- what was left for manual review
+- how restore readiness was established before mutation

@@ -1,18 +1,20 @@
 # AgentFence AI
 
-`AgentFence AI` audits Kubernetes sandbox workloads, recommends fixes, applies supported remediations with rollback protection, and generates source-of-truth manifest updates for permanent fixes.
+`AgentFence AI` audits Kubernetes sandbox workloads, recommends fixes, applies supported remediations with rollback protection, validates the result, and writes reviewable evidence artifacts for operator follow-up.
 
 It is an extension of the [Agentic AI Sandbox Security Evaluation](https://github.com/farshadrahaei/agentic-ai-sandbox-security-evaluation) project, with major additions for operational use:
 
 - remediation workflows
-- backup and restore support
-- an interactive AI CLI for guided analysis and remediation
+- enforced backup and restore support
+- review-only communication exposure reporting
+- TBE/ELE risk scoring
+- an interactive AI CLI for guided analysis, remediation, restore, and report Q&A
 
 For a sandbox-by-sandbox explanation of `CUA`, `gVisor`, `Kata`, and how the files in `generated_outputs/` are produced, see [SANDBOX_ARCHITECTURE_AND_RESULTS.md](SANDBOX_ARCHITECTURE_AND_RESULTS.md).
 
 ## Why this app matters
 
-Modern agentic AI workloads often run in Kubernetes sandboxes that are intentionally more dynamic than traditional applications. They may need browsers, writable workspace volumes, temporary artifacts, or interactive runtime components. That makes them useful for research and experimentation, but it also creates a bigger gap between:
+Modern agentic AI workloads often run in Kubernetes sandboxes that are more dynamic than traditional applications. They may need browsers, writable workspace volumes, temporary artifacts, network egress to model gateways, or interactive runtime components. That creates a gap between:
 
 - what the workload needs to function
 - what the workload should be allowed to do from a security perspective
@@ -22,12 +24,41 @@ Modern agentic AI workloads often run in Kubernetes sandboxes that are intention
 Instead of treating remediation as a one-time manifest review, it helps operators:
 
 - inspect the live runtime posture of a workload
-- identify risky configuration and image patterns
+- identify risky configuration, image, runtime, and communication patterns
 - apply safe or bounded remediations with rollback protection
 - verify whether the workload still behaves correctly after remediation
-- export a recommended manifest YAML so the final fix can be made permanent in source automation such as Git
+- preserve manual recommendations for findings that require operator intent
 
 This is especially useful for sandboxed AI environments like CUA, gVisor, and Kata, where the real question is often not only "what is insecure?" but also "can we harden this safely without breaking the workload?"
+
+## Repository contents
+
+The public repository is intended to include:
+
+- `agentfence.py`: the single runtime application file.
+- `README.md`: operator setup, run instructions, scoring notes, and artifact guidance.
+- `SANDBOX_ARCHITECTURE_AND_RESULTS.md`: sandbox architecture, artifact interpretation, and current result summary.
+- `generated_outputs/`: selected sanitized analysis and evaluation artifacts from reported sandbox runs.
+
+The repository should not include raw rollback bundles from a live cluster. Rollback bundles are intentionally generated locally by `AgentFence AI` during backup, remediation, and analyze-remediation workflows because each Kubernetes setup is unique. A valid restore bundle depends on the namespace, workload names, runtime classes, node placement, image pull secrets, network policies, RBAC state, storage resources, and cluster-specific dependencies present when the bundle is created.
+
+Published report artifacts are evidence of what `AgentFence AI` observed and how it scored or remediated a run. Raw rollback bundles are operational recovery material for the specific cluster where they were generated.
+
+## Single runtime file
+
+The runtime application is:
+
+```bash
+agentfence.py
+```
+
+`AgentFence AI` does not require shell runners, helper Python modules, or separate executable scripts to operate. Run every app action through:
+
+```bash
+python3 agentfence.py ...
+```
+
+Files written under `generated_outputs/` are artifacts produced by the app. They are not separate application entry points.
 
 ## Background
 
@@ -38,96 +69,131 @@ This is especially useful for sandboxed AI environments like CUA, gVisor, and Ka
 
 The deterministic layer remains the source of truth for:
 
-- audit logic
+- probe execution
 - risk scoring
-- fix grouping
+- remediation eligibility
 - backup creation
 - rollback handling
-- in-cluster remediation execution
+- Kubernetes mutation
+- post-fix validation
 
-The AI layer adds a friendlier way to drive the workflow, explain findings, and surface the next step without changing the core enforcement logic.
+The AI layer helps drive the workflow, explain findings, and answer questions about the latest report. It does not invent privileged mutations outside the deterministic remediation engine.
 
-It has two app modes:
+## App modes
 
 | App mode | Experience | Best for |
 | --- | --- | --- |
 | `default` | deterministic CLI | scripting, repeatable runs, non-AI operation |
-| `ai` | interactive chat assistant | guided investigation, remediation, and rollback |
+| `ai` | interactive guided CLI | cluster/namespace selection, guided actions, report Q&A |
 
-## What it does
-
-- discovers the target workload inside a namespace
-- analyzes security posture and risk
-- recommends permanent manifest changes
-- creates rollback bundles before live changes
-- applies supported remediations
-- revalidates workload health after remediation
+Both modes use the same probe catalog, scoring formula, backup gate, remediation logic, validation path, and artifact schema.
 
 ## Workflow
 
 ```mermaid
 flowchart LR
-    A["Start AgentFence AI"] --> B["Choose cluster"]
+    A["Start AgentFence AI"] --> B["Choose cluster/context"]
     B --> C["Choose namespace"]
     C --> D["Analyze workload"]
-    D --> E["Review artifacts and manifest YAML"]
-    E --> F["Remediate in cluster"]
-    F --> G["Verify health and recalculated risk"]
-    G --> H["Restore if needed"]
-    E --> I["Promote manifest YAML to Git / source automation"]
+    D --> E["Score findings and generate report"]
+    E --> F["Create rollback checkpoint"]
+    F --> G["Apply guarded remediations"]
+    G --> H["Validate workload and rerun probes"]
+    H --> I["Write reports and residual recommendations"]
+    F --> J["Restore if needed"]
 ```
 
-## Requirements
+## Prerequisites
 
-- `python3`
-- `kubectl`
-- kubeconfig access to the target cluster
+Required:
 
-No third-party Python packages are required for the core script.
+- Python 3.9 or newer.
+- `kubectl` installed and available on `PATH`.
+- A Kubernetes cluster reachable from the machine running `AgentFence AI`.
+- A usable Kubernetes context through the default `kubectl` runtime configuration, `--kubeconfig`, or `KUBECONFIG`.
+- Network access to the cluster, either directly or through VPN.
+- RBAC permissions to read pods, deployments, services, namespaces, runtime classes, network policies, and related namespace resources.
 
-Optional for AI mode:
+For remediation, backup, and restore:
 
-- OpenAI API key
-- `AGENTFENCE_OPENAI_MODEL` if you want to override the default model
-- Python `keyring` on Linux if you want secure local secret storage
+- RBAC permissions to patch or apply affected workload resources.
+- Permission to read and restore namespaced objects captured in rollback bundles.
+- Permission to read Secret objects if comprehensive secret-inclusive checkpoints are used. Use `--omit-secrets-backup` when Secret capture is not desired.
 
-## Create an OpenAI API key
+For optional node/runtime hardening:
 
-1. Sign in to the OpenAI API platform.
-2. Open [OpenAI API keys](https://platform.openai.com/api-keys).
-3. Select `Create new secret key`.
-4. Name the key and save it immediately.
+- Administrative access to the target node/runtime path is required.
+- `AgentFence AI` preflights applicability first and only prompts or applies node/runtime hardening when the control is relevant and not already satisfied.
+- Node/runtime hardening can affect workloads sharing the same node or runtime handler, so use it only in operator-approved environments.
 
-Important:
+For AI explanations and Q&A:
 
-- the key is only shown once when created
-- each user should use their own key
-- never commit the key to source control
+- AI mode can still guide deterministic actions without an AI backend.
+- AI-generated answers require an OpenAI-compatible credential.
+- Credentials are not embedded in reports, source files, or generated artifacts.
 
-## Secure API key setup
+## Configure AI backend credential
 
-### macOS (recommended)
+AI mode can run Kubernetes discovery, action selection, analyze, remediation, backup, and restore without an AI API key. A key is only needed when the operator asks `AgentFence AI` to explain the latest report or answer follow-up questions through the AI backend.
 
-Store the key in Keychain:
+`AgentFence AI` looks for a credential in this order:
+
+1. `OPENAI_API_KEY`
+2. `AGENTFENCE_OPENAI_API_KEY`
+3. macOS Keychain
+4. Python keyring
+
+### Environment variable
 
 ```bash
-security add-generic-password -U -s "AgentFence OpenAI API Key" -a "default" -w "your_api_key_here"
+export OPENAI_API_KEY="YOUR_API_KEY"
+python3 agentfence.py --app-mode ai
 ```
 
-### Linux (optional)
+Or:
 
-Install `keyring` and store the key:
+```bash
+export AGENTFENCE_OPENAI_API_KEY="YOUR_API_KEY"
+python3 agentfence.py --app-mode ai
+```
+
+### macOS Keychain
+
+```bash
+security add-generic-password \
+  -s "AgentFence OpenAI API Key" \
+  -a "default" \
+  -w "YOUR_API_KEY" \
+  -U
+```
+
+Custom Keychain service/account names are supported:
+
+```bash
+export AGENTFENCE_OPENAI_KEYCHAIN_SERVICE="AgentFence OpenAI API Key"
+export AGENTFENCE_OPENAI_KEYCHAIN_ACCOUNT="default"
+python3 agentfence.py --app-mode ai
+```
+
+### Python keyring
 
 ```bash
 python3 -m pip install keyring
-python3 -c "import keyring; keyring.set_password('AgentFence OpenAI API Key', 'default', 'your_api_key_here')"
+python3 - <<'PY'
+import keyring
+keyring.set_password("AgentFence OpenAI API Key", "default", "YOUR_API_KEY")
+PY
+python3 agentfence.py --app-mode ai
 ```
 
-AgentFence AI checks for the key in this order:
+Optional model and endpoint settings:
 
-1. `OPENAI_API_KEY`
-2. macOS Keychain entry `AgentFence OpenAI API Key` / `default`
-3. Python `keyring` entry `AgentFence OpenAI API Key` / `default`
+```bash
+export AGENTFENCE_AI_MODEL="gpt-4.1-mini"
+export AGENTFENCE_OPENAI_BASE_URL="https://api.openai.com/v1/responses"
+```
+
+`AgentFence AI` does not print the credential source during normal report Q&A. It also does not write the key into JSON reports, Markdown reports, rollback bundles, or evaluation-factor artifacts.
 
 ## Quick start
 
@@ -137,22 +203,29 @@ Move into the package folder:
 cd "AgentFence AI"
 ```
 
-Check your current cluster context:
+Check cluster access:
 
 ```bash
-kubectl config current-context
+kubectl config get-contexts
+kubectl get namespaces
 ```
 
-Start default mode:
+Run self-test:
 
 ```bash
-python3 agentfence.py --app-mode default --cluster kubernetes --namespace sandbox-cua --action analyze
+python3 agentfence.py --action self-test
 ```
 
 Start AI mode:
 
 ```bash
 python3 agentfence.py --app-mode ai
+```
+
+Run default-mode analyze:
+
+```bash
+python3 agentfence.py --app-mode default --action analyze --namespace sandbox-kata-fresh
 ```
 
 ## Default mode
@@ -164,88 +237,83 @@ Use it when you want:
 - a repeatable CLI workflow
 - scripting or automation
 - no AI dependency
-- explicit control over cluster, namespace, action, and optional workload selection
+- explicit control over context, namespace, action, and optional target pod
 
 Launch pattern:
 
 ```bash
-python3 agentfence.py --app-mode default --cluster <cluster> --namespace <namespace> --action <action>
+python3 agentfence.py --app-mode default --action <action> --namespace <namespace>
 ```
-
-### Default mode flags
-
-| Flag | Required | Purpose |
-| --- | --- | --- |
-| `--app-mode default` | yes | runs classic deterministic mode |
-| `--cluster` | yes | target Kubernetes cluster/context name |
-| `--namespace` | yes | target namespace |
-| `--action` | yes | workflow action to execute |
-| `--workload-name` | optional | explicit workload name if you want to pin a workload |
-| `--timeout` | optional | probe / collection timeout |
-| `--restore-bundle-dir` | optional | explicit rollback bundle directory for restore flows |
 
 ### Default mode actions
 
 | Action | Behavior |
 | --- | --- |
-| `analyze` | analyze only |
-| `backup-restore` | create or restore rollback bundle |
-| `remediation` | analyze and remediate |
-| `analyze-remediation` | analyze and remediate in one run |
+| `analyze` | run probes and write analysis reports |
+| `remediation` | create rollback checkpoint, analyze, apply safe fixes, verify, and report |
+| `analyze-remediation` | run analysis and remediation as one workflow |
+| `backup-namespace` | create a rollback bundle for a namespace |
+| `restore-namespace` | restore from a rollback bundle |
+| `self-test` | validate catalog, scoring, alias handling, and internal consistency |
+
+### Useful flags
+
+| Flag | Purpose |
+| --- | --- |
+| `--app-mode default` | runs deterministic mode |
+| `--cluster <context>` | uses a Kubernetes context for this run |
+| `--kubeconfig <path>` | uses a specific kubeconfig |
+| `--namespace <name>` or `-n <name>` | target namespace |
+| `--target-pod <name>` | override target pod selection |
+| `--action <action>` | workflow action |
+| `--timeout <seconds>` | per-probe `kubectl exec` timeout |
+| `--dry-run` | validate catalog and target selection without running probes |
+| `--out <path>` | write main JSON report to a specific path |
+| `--md-out <path>` | write main Markdown report to a specific path |
+| `--headline-alpha <value>` | set headline score blend weight, default `0.6` |
+| `--backup-parent-dir <dir>` | choose where rollback bundles are written |
+| `--create-backup` | opt into a backup for analyze-only runs |
+| `--omit-secrets-backup` | omit Secret objects from rollback checkpoints |
+| `--velero-backup` | also request a Velero namespace backup when Velero is installed |
+| `--allow-node-runtime-remediation` | allow operator-approved node/runtime hardening when applicable |
+
+`--no-backup` is rejected for `remediation` and `analyze-remediation`. Those actions require a rollback checkpoint before mutation.
 
 ### Default mode examples
 
-Analyze only:
+Analyze:
 
 ```bash
-python3 agentfence.py --app-mode default --cluster kubernetes --namespace sandbox-cua --action analyze
-```
-
-Analyze a specific workload:
-
-```bash
-python3 agentfence.py --app-mode default --cluster kubernetes --namespace sandbox-cua --action analyze --workload-name target-cua
-```
-
-Run backup / restore workflow:
-
-```bash
-python3 agentfence.py --app-mode default --cluster kubernetes --namespace sandbox-cua --action backup-restore
+python3 agentfence.py --app-mode default --action analyze --namespace sandbox-cua-fresh
 ```
 
 Run remediation:
 
 ```bash
-python3 agentfence.py --app-mode default --cluster kubernetes --namespace sandbox-cua --action remediation
+python3 agentfence.py --app-mode default --action remediation --namespace sandbox-cua-fresh
 ```
 
 Run analyze and remediation together:
 
 ```bash
-python3 agentfence.py --app-mode default --cluster kubernetes --namespace sandbox-cua --action analyze-remediation
+python3 agentfence.py --app-mode default --action analyze-remediation --namespace sandbox-cua-fresh
 ```
 
-Restore from a specific bundle:
+Create a namespace rollback bundle:
 
 ```bash
-python3 agentfence.py --app-mode default --cluster kubernetes --namespace sandbox-cua --action backup-restore --restore-bundle-dir generated_outputs/rollback_bundle_sandbox-cua_target-cua_<timestamp>
+python3 agentfence.py --app-mode default --action backup-namespace --namespace sandbox-cua-fresh
 ```
 
-### What default mode produces
+Restore from a rollback bundle:
 
-Depending on action, default mode can produce:
-
-- analyze JSON
-- analyze Markdown
-- remediation JSON
-- remediation Markdown
-- rollback bundle
-- manifest YAML recommendation
-- post-fix revalidation data
+```bash
+python3 agentfence.py --app-mode default --action restore-namespace --bundle-dir generated_outputs/rollback_bundle_<namespace>_<target>_<timestamp>
+```
 
 ## AI mode
 
-AI mode is chat-first and interactive.
+AI mode is interactive and guided.
 
 Launch:
 
@@ -253,61 +321,39 @@ Launch:
 python3 agentfence.py --app-mode ai
 ```
 
-Typical session:
+Expected flow:
+
+1. `AgentFence AI` discovers available Kubernetes contexts through `kubectl`.
+2. The operator selects a cluster/context.
+3. `AgentFence AI` lists namespaces.
+4. The operator selects a namespace.
+5. `AgentFence AI` offers Analyze, Remediation, Analyze&Remediation, Backup, and Restore.
+6. After a run, `AgentFence AI` loads the latest report context so the operator can ask follow-up questions.
+
+Interactive commands include:
 
 ```text
-choose kubernetes
-choose sandbox-cua
+list clusters
+use cluster <name-or-number>
+list namespaces
+use namespace <name-or-number>
 analyze
 remediate
+analyze-remediation
+backup
 restore
+status
+help
 exit
 ```
 
-Common chat inputs:
-
-- `list clusters`
-- `choose kubernetes`
-- `choose sandbox-cua`
-- `analyze`
-- `backup`
-- `remediate`
-- `analyze and remediate`
-- `restore`
-- `show manifest`
-- `status`
-- `exit`
-
-AI mode automatically:
-
-- walks the user through cluster and namespace selection
-- auto-selects the workload when only one candidate exists
-- generates analyze artifacts and manifest YAML
-- creates a backup before remediation
-- shows recalculated risk after remediation
+Where supported, `cancel` returns to the main prompt and `exit` quits the app.
 
 ## What appears on screen
 
-After `analyze`, AI mode shows only:
+AI mode keeps command output concise. Restore prints a summary of success or failure rather than dumping full object patches. Analyze and remediation runs write detailed reports to `generated_outputs/`, then load the latest report context for follow-up questions.
 
-1. `Summary`
-2. `Downloadable artifacts`
-3. `Recommended next step`
-
-After `remediate` or `analyze and remediate`, AI mode shows only:
-
-1. `Summary`
-2. `Downloadable artifacts`
-3. `Recommended next step`
-
-The remediation summary includes:
-
-- remediation status
-- number of applied steps
-- recalculated risk score after remediation
-- post-fix health status
-
-## Downloadable artifacts
+## Generated artifacts
 
 Generated files are written to:
 
@@ -315,95 +361,146 @@ Generated files are written to:
 generated_outputs/
 ```
 
-A deeper explanation of how these outputs are created and how to interpret them across `CUA`, `gVisor`, and `Kata` is available in [SANDBOX_ARCHITECTURE_AND_RESULTS.md](SANDBOX_ARCHITECTURE_AND_RESULTS.md).
+Current artifact names use the `agentfence_*` prefix. Older `guided_*` artifacts in this repository are legacy examples from earlier versions.
 
-Common artifacts:
+Typical current artifacts:
+
+```text
+agentfence_<action>_<namespace>_<timestamp>.json
+agentfence_<action>_<namespace>_<timestamp>.md
+agentfence_f1_f5_<action>_<namespace>_<timestamp>.json
+agentfence_f1_f5_<action>_<namespace>_<timestamp>.md
+rollback_bundle_<namespace>_<target>_<timestamp>/
+```
+
+Common artifact types:
 
 | Artifact | Purpose |
 | --- | --- |
-| analyze JSON | raw audit output |
-| analyze Markdown | human-readable audit report |
-| remediation JSON | fix execution details |
-| remediation Markdown | human-readable remediation report |
-| manifest YAML | permanent source-of-truth fix recommendation |
-| rollback bundle | restore point before live changes |
+| main JSON report | machine-readable probe evidence, scoring, remediation plan, before/after deltas |
+| main Markdown report | human-readable finding explanations, fixed probes, residual findings, manual recommendations |
+| evaluation-factor JSON/Markdown | workload context, analyze summary, remediation effectiveness, artifact consistency, recoverability |
+| rollback bundle | local restore checkpoint generated before mutation |
 
-## Example outputs
+## Scoring
 
-After `analyze`, artifacts typically include:
+Probe status meanings:
 
-- analyze JSON
-- analyze Markdown
-- manifest recommendation YAML
+- `pass`: unsafe condition observed.
+- `fail`: unsafe condition not observed.
+- `skip`: probe could not be assessed.
 
-After `remediate` or `analyze and remediate`, artifacts typically include:
+Scored unsafe probes receive fixed severity weights:
 
-- analyze JSON
-- analyze Markdown
-- remediation JSON
-- remediation Markdown
-- manifest recommendation YAML
-- rollback bundle manifest
-- rollback bundle directory
+- critical: `5.0`
+- high: `3.0`
+- medium: `1.0`
+- low: `0.5`
 
-## Example workflows
+`AgentFence AI` reports raw weighted score, TBE raw and normalized score, ELE raw and normalized score, and headline score. TBE and ELE are disjoint so raw score mass is not double-counted.
 
-### Example
-
-```bash
-python3 agentfence.py --app-mode ai
-```
-
-Then:
+The headline score is:
 
 ```text
-choose kubernetes
-choose sandbox-cua
-analyze
-remediate
-restore
+headline = alpha * TBE_normalized + (1 - alpha) * ELE_normalized
 ```
 
-## Troubleshooting
+The default `alpha` is `0.6`. Lower scores are better.
 
-### AI mode cannot answer
+## Review-only reachability
 
-Check:
+`AgentFence AI` measures service reachability from an adjacent measurement pod, but unauthenticated reachability is treated as review-only communication exposure. It remains visible in reports and manual recommendations, but it does not contribute to issue count, raw score, TBE score, ELE score, headline score, or automatic remediation.
 
-- OpenAI API key is configured
-- API billing is active
-- cluster/network access is available
+This is intentional: an open service path may be required by the workload. `AgentFence AI` reports the observation and asks the operator to define expected callers, ports, authentication requirements, and least-privilege NetworkPolicy intent.
 
-### `restore` is unavailable
+## Remediation behavior
 
-Create a backup first, or remediate once so a rollback bundle exists.
+Every probe has remediation coverage as one of:
 
-### Analyze results look incomplete
+- `auto_fix`: guarded fix that `AgentFence AI` can apply and verify.
+- `hybrid`: partially automatable or environment-dependent fix requiring extra checks.
+- `manual_recommendation`: operator action required.
 
-Check:
+`AgentFence AI` applies only guarded fixes, validates the workload afterward, and records the result. Findings that require image rebuilds, workload redesign, runtime decisions, node-level changes, or communication-intent review remain visible as manual residual work.
 
-- target pod is reachable
-- `kubectl` context and namespace are correct
-- the workload has enough signals for internal and remote validation
+Node/runtime hardening is preflight-gated. Even if node/runtime remediation is allowed, `AgentFence AI` first checks whether the control is applicable and already satisfied. If it is not applicable, it is skipped.
+
+## Backup and restore
+
+`remediation` and `analyze-remediation` enforce a rollback checkpoint before any mutation. If the checkpoint fails, `AgentFence AI` exits without applying changes.
+
+Create a backup:
+
+```bash
+python3 agentfence.py --action backup-namespace --namespace YOUR_NAMESPACE
+```
+
+Restore from a backup:
+
+```bash
+python3 agentfence.py --action restore-namespace --bundle-dir generated_outputs/rollback_bundle_<namespace>_<target>_<timestamp>
+```
+
+Rollback bundles may contain:
+
+- `backup_manifest.json`
+- namespace snapshots
+- affected resource snapshots
+- cluster dependency metadata
+- checksums
+- validation metadata
+
+By default, comprehensive checkpoints include Secret objects. Use `--omit-secrets-backup` when Secret capture is not desired. Rollback bundles restore Kubernetes resources captured by `AgentFence AI`; they are not universal application-state backups for external systems or persistent data unless those resources are also captured by the operator's storage backup process.
+
+Raw rollback bundles are intentionally not included in the public repository because they can contain environment-specific and sensitive material, including image pull secrets, registry credentials, service-account metadata, internal node names, pod IPs, network CIDRs, absolute local paths, Kubernetes events, and cluster dependency snapshots. Operators should generate rollback bundles in their own environment immediately before remediation so the bundle matches the actual cluster state that may need to be restored.
 
 ## Package contents
 
 - `agentfence.py`
 - `README.md`
 - `SANDBOX_ARCHITECTURE_AND_RESULTS.md`
+- selected sanitized files under `generated_outputs/`
+
+## Troubleshooting
+
+### `kubectl` not found
+
+Install `kubectl` and confirm:
+
+```bash
+kubectl version --client
+```
+
+### No cluster or namespace appears
+
+Check:
+
+```bash
+kubectl config get-contexts
+kubectl get namespaces
+```
+
+Also confirm VPN or network access if the cluster is private.
+
+### Permission denied
+
+Confirm the current Kubernetes identity can read target resources. Remediation and restore require write permissions for affected resources.
+
+### Backup failed
+
+Remediation and analyze-remediation stop before mutation when rollback checkpoint creation fails. Check RBAC permissions and whether Secret capture is allowed.
+
+### AI mode cannot answer report questions
+
+Deterministic actions still run. Configure an AI credential through environment variables, macOS Keychain, or Python keyring.
+
+### Workload validation failed after remediation
+
+Review the generated Markdown report and rollback metadata. The report records fixed probes, rolled-back changes, verification warnings, and manual recommendations.
 
 ## Portability
 
-To move the tool to another system, copy the `AgentFence AI` folder and ensure:
-
-- `python3` is installed
-- `kubectl` is installed
-- kubeconfig access is available
-
-You do not need to copy:
-
-- old `generated_outputs/`
-- local experiment artifacts outside the package folder
+To use the tool in another Kubernetes setup, copy the repository, ensure `python3` and `kubectl` are installed, and provide kubeconfig access to the target cluster. Do not reuse raw rollback bundles across environments; generate a new bundle in the target environment immediately before remediation.
 
 ## License
 
